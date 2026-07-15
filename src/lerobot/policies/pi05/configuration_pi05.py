@@ -16,11 +16,12 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
-from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
-
-from ..rtc.configuration_rtc import RTCConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
@@ -48,13 +49,6 @@ class PI05Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
-
-    # Relative actions: converts absolute actions to relative (relative to state).
-    use_relative_actions: bool = False
-    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
-    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
-    # Populated at runtime from dataset metadata by make_policy.
-    action_feature_names: list[str] | None = None
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -94,6 +88,13 @@ class PI05Config(PreTrainedConfig):
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
 
+    # Keep the action side from learning faster than the VLM. The comparison is
+    # made using the RMS gradient over all elements in each parameter group:
+    #     rms(g) = ||g||_2 / sqrt(number of gradient elements)
+    # A ratio of 1.0 enforces action_rms <= vlm_rms.
+    clip_action_head_by_vlm: bool = True
+    action_head_grad_clip_ratio: float = 1.0
+
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
     # For example, --steps=3000 will scale warmup to 100 and decay to 3000
@@ -120,6 +121,12 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if not 0.0 < self.action_head_grad_clip_ratio <= 1.0:
+            raise ValueError(
+                "action_head_grad_clip_ratio must be in (0, 1], got "
+                f"{self.action_head_grad_clip_ratio}"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

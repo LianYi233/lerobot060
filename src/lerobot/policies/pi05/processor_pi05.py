@@ -21,9 +21,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import (
-    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -31,21 +31,32 @@ from lerobot.processor import (
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
-    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
-    policy_action_to_transition,
-    transition_to_policy_action,
 )
-from lerobot.types import EnvTransition, TransitionKey
+from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from lerobot.utils.constants import OBS_STATE
 
-from .configuration_pi05 import PI05Config
+# lerobot-train \
+#     --dataset.repo_id=libero /media/wyn/data/10-EmbodiedAI/dataset/Gay-LIBERO_v3.0/libero_10_no_noops_1.0.0_lerobot_v3.0
+#     --policy.type=pi05 --output_dir=/media/wyn/data/10-EmbodiedAI/2601-lerobot/train-libero
+#     --job_name=pi05_training-baseline-327 \
+#     --policy.repo_id=libero --policy.pretrained_path=lerobot/pi05_base \
+#     --policy.compile_model=true \
+#     --policy.gradient_checkpointing=true --wandb.enable=true \
+#     --policy.dtype=bfloat16 --policy.freeze_vision_encoder=false \
+#     --policy.train_expert_only=false \
+#     --steps=3000 \
+#     --policy.device=cuda \
+#     --batch_size=32
+
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -62,6 +73,10 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         transition = transition.copy()
 
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        # state = transition.get(TransitionKey.OBSERVATION, {}).get(observation.state.arm.position)
+        # state = transition.get(TransitionKey.OBSERVATION, {}).get(observation.robot_state.arm.position)
+        # state = transition[TransitionKey.OBSERVATION]['state']['arm']['position']
+
         if state is None:
             raise ValueError("State is required for PI05")
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
@@ -129,17 +144,10 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
-    relative_step = RelativeActionsProcessorStep(
-        enabled=config.use_relative_actions,
-        exclude_joints=getattr(config, "relative_exclude_joints", []),
-        action_names=getattr(config, "action_feature_names", None),
-    )
-
-    # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
+    # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        relative_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -149,7 +157,7 @@ def make_pi05_pre_post_processors(
         ),
         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name="/data2/wyn/models/google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",
@@ -161,7 +169,6 @@ def make_pi05_pre_post_processors(
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
-        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
 
