@@ -86,7 +86,9 @@ class PI05Config(PreTrainedConfig):
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
-    optimizer_grad_clip_norm: float = 1.0
+    # Global clipping is disabled for PI05. Its policy-specific hook clips only action-side gradients
+    # against the VLM gradient RMS and deliberately leaves VLM gradients unchanged.
+    optimizer_grad_clip_norm: float = 0.0
 
     # Keep the action side from learning faster than the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:

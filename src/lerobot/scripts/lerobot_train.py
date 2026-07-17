@@ -22,6 +22,7 @@ import dataclasses
 import logging
 import sys
 import time
+from collections.abc import Iterable
 from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -71,6 +72,47 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+@torch.no_grad()
+def _get_gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> torch.Tensor:
+    """Return the total L2 norm without modifying any gradients."""
+    gradient_norms = [
+        torch.linalg.vector_norm(parameter.grad.detach(), ord=2, dtype=torch.float32)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not gradient_norms:
+        return torch.tensor(0.0)
+    return torch.stack(gradient_norms).norm(2)
+
+
+def _clip_policy_gradients(
+    policy: PreTrainedPolicy,
+    optimizer: Optimizer,
+    grad_clip_norm: float,
+    accelerator: "Accelerator",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply policy-specific clipping, falling back to global norm clipping.
+
+    A policy-specific ``clip_gradients`` hook owns the complete clipping operation. This lets policies
+    such as PI05 clip only their action-side parameters without modifying VLM gradients.
+    """
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if has_method(unwrapped_policy, "clip_gradients"):
+        # Custom hooks inspect and modify gradients directly, so gradients must first be unscaled.
+        accelerator.unscale_gradients(optimizer)
+        grad_norm = _get_gradient_norm(policy.parameters())
+        clip_metrics = unwrapped_policy.clip_gradients(accelerator=accelerator)
+        return grad_norm, clip_metrics or {}
+
+    if grad_clip_norm > 0:
+        return accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm), {}
+
+    # Preserve gradient-norm logging without using clip_grad_norm_(..., inf), which can still write to
+    # gradients and therefore is not a true no-op for non-finite values.
+    accelerator.unscale_gradients(optimizer)
+    return _get_gradient_norm(policy.parameters()), {}
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -93,7 +135,7 @@ def update_policy(
         policy: The policy model to be trained.
         batch: A batch of training data.
         optimizer: The optimizer used to update the policy's parameters.
-        grad_clip_norm: The maximum norm for gradient clipping.
+        grad_clip_norm: The fallback maximum norm for policies without a policy-specific clipping hook.
         accelerator: The Accelerator instance for distributed training and mixed precision.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
@@ -143,13 +185,16 @@ def update_policy(
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+    grad_norm, clip_metrics = _clip_policy_gradients(
+        policy=policy,
+        optimizer=optimizer,
+        grad_clip_norm=grad_clip_norm,
+        accelerator=accelerator,
+    )
+    if clip_metrics:
+        if output_dict is None:
+            output_dict = {}
+        output_dict.update(clip_metrics)
 
     # Optimizer step
     with lock if lock is not None else nullcontext():

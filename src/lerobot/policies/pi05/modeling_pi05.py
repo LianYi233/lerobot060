@@ -80,7 +80,10 @@ def _unique_parameters_with_grad(modules: list[nn.Module]) -> list[nn.Parameter]
 
 def _gradient_l2_norm_and_numel(parameters: list[nn.Parameter]) -> tuple[Tensor | None, int]:
     """Return the group L2 gradient norm and the number of gradient elements."""
-    gradient_norms = [parameter.grad.detach().float().norm(2) for parameter in parameters]
+    gradient_norms = [
+        torch.linalg.vector_norm(parameter.grad.detach(), ord=2, dtype=torch.float32)
+        for parameter in parameters
+    ]
     if not gradient_norms:
         return None, 0
     return torch.stack(gradient_norms).norm(2), sum(parameter.grad.numel() for parameter in parameters)
@@ -1196,16 +1199,16 @@ class PI05Policy(PreTrainedPolicy):
         vlm_rms = vlm_norm_value / math.sqrt(vlm_numel)
         ratio = float(getattr(self.config, "action_head_grad_clip_ratio", 1.0))
         max_action_rms = ratio * vlm_rms
-        max_action_norm = max_action_rms * math.sqrt(action_numel)
 
         finite = math.isfinite(action_rms_before) and math.isfinite(max_action_rms)
         clip_applied = finite and action_rms_before > max_action_rms
         if clip_applied:
-            torch.nn.utils.clip_grad_norm_(
-                action_parameters,
-                max_norm=max_action_norm,
-                error_if_nonfinite=False,
-            )
+            # Scale only action-side gradients. Using the already-computed RMS ratio avoids a second
+            # norm calculation and makes the target explicit; VLM gradients are never written to.
+            action_clip_scale = max_action_rms / action_rms_before
+            for parameter in action_parameters:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(action_clip_scale)
 
         action_norm_after_tensor, _ = _gradient_l2_norm_and_numel(action_parameters)
         action_norm_after = (
