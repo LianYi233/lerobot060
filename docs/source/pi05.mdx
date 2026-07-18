@@ -81,10 +81,23 @@ lerobot-train \
 
 ### Training Parameters Explained
 
-| Parameter               | Default | Description                                 |
-| ----------------------- | ------- | ------------------------------------------- |
-| `freeze_vision_encoder` | `false` | Do not freeze the vision encoder            |
-| `train_expert_only`     | `false` | Do not freeze the VLM, train all parameters |
+Fresh π₀.₅ configurations use one AdamW learning rate for all trainable VLM and action-side
+parameters. After warmup, the learning rate follows a cosine decay from `2.5e-4` to a floor of
+`2.5e-5`. Loading or resuming a checkpoint preserves the optimizer values saved in that checkpoint.
+
+Gradient clipping is policy-specific. The action-side gradient RMS is capped at 10 times the VLM
+gradient RMS, and only action-side gradients are rescaled when that cap is exceeded. VLM gradients
+are left unchanged, and global gradient clipping is disabled.
+
+| Parameter                       | Default  | Description                                                |
+| ------------------------------- | -------- | ---------------------------------------------------------- |
+| `optimizer_lr`                  | `2.5e-4` | Unified AdamW learning rate for VLM and action parameters   |
+| `scheduler_decay_lr`            | `2.5e-5` | Learning-rate floor after cosine decay                      |
+| `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
+| `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
+| `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
+| `freeze_vision_encoder`         | `false`  | Do not freeze the vision encoder                            |
+| `train_expert_only`             | `false`  | Do not freeze the VLM; train all parameters                 |
 
 **💡 Tip**: Setting `train_expert_only=true` freezes the VLM and trains only the action expert and projections, allowing finetuning with reduced memory usage.
 

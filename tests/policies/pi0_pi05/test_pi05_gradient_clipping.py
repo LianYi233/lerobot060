@@ -30,7 +30,7 @@ def _make_module() -> nn.Module:
 
 
 def _make_policy_with_gradients(
-    *, action_gradient: float, vlm_gradient: float
+    *, action_gradient: float, vlm_gradient: float, action_head_grad_clip_ratio: float = 10.0
 ) -> tuple[SimpleNamespace, list[nn.Parameter], list[nn.Parameter]]:
     paligemma_with_expert = SimpleNamespace(
         paligemma=_make_module(),
@@ -54,7 +54,7 @@ def _make_policy_with_gradients(
         model=model,
         config=SimpleNamespace(
             clip_action_head_by_vlm=True,
-            action_head_grad_clip_ratio=1.0,
+            action_head_grad_clip_ratio=action_head_grad_clip_ratio,
         ),
     )
 
@@ -75,35 +75,44 @@ def _gradient_rms(parameters: list[nn.Parameter]) -> float:
 
 def test_pi05_uses_action_only_gradient_clipping_by_default():
     config = PI05Config()
+    optimizer_config = config.get_optimizer_preset()
+    scheduler = config.get_scheduler_preset()
+    parameters = [nn.Parameter(torch.zeros(())), nn.Parameter(torch.ones(()))]
+    optimizer = optimizer_config.build(parameters)
 
     assert config.optimizer_grad_clip_norm == 0.0
-    assert config.get_optimizer_preset().grad_clip_norm == 0.0
+    assert optimizer_config.grad_clip_norm == 0.0
+    assert optimizer_config.lr == pytest.approx(2.5e-4)
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert len(optimizer.param_groups) == 1
+    assert [id(parameter) for parameter in optimizer.param_groups[0]["params"]] == [
+        id(parameter) for parameter in parameters
+    ]
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.5e-4)
+    assert optimizer.param_groups[0]["betas"] == pytest.approx((0.9, 0.95))
+    assert optimizer.param_groups[0]["eps"] == pytest.approx(1e-8)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.01)
+    assert scheduler.peak_lr == pytest.approx(2.5e-4)
+    assert scheduler.decay_lr == pytest.approx(2.5e-5)
+    assert scheduler.num_warmup_steps == 1_000
+    assert scheduler.num_decay_steps == 30_000
     assert config.clip_action_head_by_vlm
-    assert config.action_head_grad_clip_ratio == 1.0
+    assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
 
 
-def test_pi05_clips_action_gradient_rms_to_vlm_rms_without_modifying_vlm():
+@pytest.mark.parametrize(
+    "action_head_grad_clip_ratio",
+    [0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+)
+def test_pi05_rejects_invalid_action_head_grad_clip_ratio(action_head_grad_clip_ratio: float):
+    with pytest.raises(ValueError, match="action_head_grad_clip_ratio"):
+        PI05Config(action_head_grad_clip_ratio=action_head_grad_clip_ratio)
+
+
+def test_pi05_leaves_action_gradient_below_ten_times_vlm_rms_unchanged():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
-        action_gradient=4.0,
-        vlm_gradient=2.0,
-    )
-    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
-
-    metrics = PI05Policy.clip_gradients(policy)
-
-    assert metrics["action_head_clip_applied"] == 1.0
-    assert metrics["action_head_grad_rms_before_clip"] == pytest.approx(4.0)
-    assert metrics["vlm_grad_rms"] == pytest.approx(2.0)
-    assert _gradient_rms(action_parameters) == pytest.approx(2.0, abs=1e-6)
-    assert metrics["action_head_grad_rms_after_clip"] == pytest.approx(2.0, abs=1e-6)
-    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
-        assert torch.equal(parameter.grad, gradient_before)
-
-
-def test_pi05_leaves_both_groups_unchanged_when_action_rms_is_not_larger():
-    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
-        action_gradient=1.0,
-        vlm_gradient=2.0,
+        action_gradient=6.0,
+        vlm_gradient=1.0,
     )
     action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
     vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
@@ -111,7 +120,32 @@ def test_pi05_leaves_both_groups_unchanged_when_action_rms_is_not_larger():
     metrics = PI05Policy.clip_gradients(policy)
 
     assert metrics["action_head_clip_applied"] == 0.0
+    assert metrics["action_head_grad_rms_before_clip"] == pytest.approx(6.0)
+    assert metrics["vlm_grad_rms"] == pytest.approx(1.0)
+    assert metrics["action_head_clip_threshold_rms"] == pytest.approx(10.0)
+    assert metrics["action_head_grad_rms_after_clip"] == pytest.approx(6.0)
+    assert metrics["action_head_clip_scale"] == pytest.approx(1.0)
     for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
         assert torch.equal(parameter.grad, gradient_before)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+
+def test_pi05_clips_action_gradient_to_ten_times_vlm_rms_without_modifying_vlm():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+    )
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics["action_head_clip_applied"] == 1.0
+    assert metrics["action_head_grad_rms_before_clip"] == pytest.approx(20.0)
+    assert metrics["vlm_grad_rms"] == pytest.approx(1.0)
+    assert metrics["action_head_clip_threshold_rms"] == pytest.approx(10.0)
+    assert _gradient_rms(action_parameters) == pytest.approx(10.0, abs=1e-6)
+    assert metrics["action_head_grad_rms_after_clip"] == pytest.approx(10.0, abs=1e-6)
+    assert metrics["action_head_clip_scale"] == pytest.approx(0.5, abs=1e-6)
     for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
         assert torch.equal(parameter.grad, gradient_before)

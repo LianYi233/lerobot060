@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -81,8 +82,8 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
-    # Optimizer settings: see openpi `AdamW`
-    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    # Optimizer settings. Action and VLM parameters share this single AdamW learning rate.
+    optimizer_lr: float = 2.5e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
@@ -90,19 +91,19 @@ class PI05Config(PreTrainedConfig):
     # against the VLM gradient RMS and deliberately leaves VLM gradients unchanged.
     optimizer_grad_clip_norm: float = 0.0
 
-    # Keep the action side from learning faster than the VLM. The comparison is
+    # Limit action-side gradient spikes relative to the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:
     #     rms(g) = ||g||_2 / sqrt(number of gradient elements)
-    # A ratio of 1.0 enforces action_rms <= vlm_rms.
+    # The default ratio of 10.0 enforces action_rms <= 10 * vlm_rms.
     clip_action_head_by_vlm: bool = True
-    action_head_grad_clip_ratio: float = 1.0
+    action_head_grad_clip_ratio: float = 10.0
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
     # For example, --steps=3000 will scale warmup to 100 and decay to 3000
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
-    scheduler_decay_lr: float = 2.5e-6
+    scheduler_decay_lr: float = 2.5e-5
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
@@ -124,9 +125,9 @@ class PI05Config(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
-        if not 0.0 < self.action_head_grad_clip_ratio <= 1.0:
+        if not math.isfinite(self.action_head_grad_clip_ratio) or self.action_head_grad_clip_ratio <= 0.0:
             raise ValueError(
-                "action_head_grad_clip_ratio must be in (0, 1], got "
+                "action_head_grad_clip_ratio must be greater than 0, got "
                 f"{self.action_head_grad_clip_ratio}"
             )
 
