@@ -54,6 +54,7 @@ from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
+from lerobot.optim.cabo import temporary_optimizer_group_lr_scales
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
@@ -111,6 +112,30 @@ def _clip_policy_gradients(
     # gradients and therefore is not a true no-op for non-finite values.
     accelerator.unscale_gradients(optimizer)
     return _get_gradient_norm(policy.parameters()), {}
+
+
+def _prepare_policy_optimizer_step_control(
+    policy: PreTrainedPolicy,
+    batch: Any,
+    optimizer: Optimizer,
+    accelerator: "Accelerator",
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Ask a policy for post-preconditioner optimizer-group scales, if it provides a controller."""
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
+        return {}, {}
+
+    # The main backward pass has already synchronized DDP gradients. CABO's probe gradients are
+    # local Jacobian-vector products and are reduced explicitly as two scalars, so suppress a second
+    # full gradient synchronization here.
+    no_sync = accelerator.no_sync(policy) if has_method(accelerator, "no_sync") else nullcontext()
+    with no_sync:
+        group_scales, metrics = unwrapped_policy.compute_optimizer_step_control(
+            batch=batch,
+            optimizer=optimizer,
+            accelerator=accelerator,
+        )
+    return group_scales or {}, metrics or {}
 
 
 def update_policy(
@@ -196,8 +221,22 @@ def update_policy(
             output_dict = {}
         output_dict.update(clip_metrics)
 
+    optimizer_group_scales, optimizer_control_metrics = _prepare_policy_optimizer_step_control(
+        policy=policy,
+        batch=batch,
+        optimizer=optimizer,
+        accelerator=accelerator,
+    )
+    if optimizer_control_metrics:
+        if output_dict is None:
+            output_dict = {}
+        output_dict.update(optimizer_control_metrics)
+
     # Optimizer step
-    with lock if lock is not None else nullcontext():
+    with (
+        lock if lock is not None else nullcontext(),
+        temporary_optimizer_group_lr_scales(optimizer, optimizer_group_scales),
+    ):
         optimizer.step()
 
     optimizer.zero_grad()
@@ -264,6 +303,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+        )
+
+    if getattr(cfg.trainable_config, "cabo_enabled", False) and (
+        accelerator.distributed_type == DistributedType.FSDP
+    ):
+        raise NotImplementedError(
+            "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
+            "sharding is not yet supported."
         )
 
     init_logging(accelerator=accelerator)
@@ -431,9 +478,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
         # (see load_fsdp_optimizer_state below), so skip the optimizer here and load it then.
         is_fsdp = accelerator.distributed_type == DistributedType.FSDP
-        step, optimizer, lr_scheduler = load_training_state(
-            cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
-        )
+        try:
+            step, optimizer, lr_scheduler = load_training_state(
+                cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
+            )
+        except ValueError as exc:
+            incompatible_groups = "parameter group" in str(exc).lower() or "param_groups" in str(exc).lower()
+            if getattr(cfg.trainable_config, "cabo_enabled", False) and incompatible_groups:
+                raise ValueError(
+                    "A non-CABO optimizer checkpoint cannot be resumed with CABO enabled because CABO "
+                    "uses named VLM/action parameter groups. Start a new run from the checkpoint's model "
+                    "weights, or resume a checkpoint that was already trained with CABO."
+                ) from exc
+            raise
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())

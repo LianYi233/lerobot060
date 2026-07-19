@@ -89,6 +89,25 @@ Gradient clipping is policy-specific. The action-side gradient RMS is capped at 
 gradient RMS, and only action-side gradients are rescaled when that cap is exceeded. VLM gradients
 are left unchanged, and global gradient clipping is disabled.
 
+PI0.5 also provides experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates
+how much the next VLM and action-side AdamW updates would change the predicted flow velocity, then
+scales only the action-side optimizer step to enforce a long-run functional-drift budget. It replaces
+the action-gradient clipping hook when enabled:
+
+```bash
+lerobot-train \
+    ... \
+    --policy.cabo_enabled=true \
+    --policy.cabo_action_drift_ratio=0.1 \
+    --policy.cabo_probe_interval=8 \
+    --policy.cabo_probe_batch_size=1
+```
+
+CABO currently supports single-device and DDP training, but not FSDP. It requires both the VLM and
+action side to be trainable, so it cannot be combined with `train_expert_only=true`. Because CABO
+uses two named optimizer parameter groups, enable it in a new run initialized from model weights;
+an older single-group optimizer checkpoint cannot be resumed directly with CABO enabled.
+
 | Parameter                       | Default  | Description                                                |
 | ------------------------------- | -------- | ---------------------------------------------------------- |
 | `optimizer_lr`                  | `2.5e-4` | Unified AdamW learning rate for VLM and action parameters   |
@@ -96,6 +115,10 @@ are left unchanged, and global gradient clipping is disabled.
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
 | `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
+| `cabo_enabled`                  | `false`  | Enable counterfactual action-space update budgeting         |
+| `cabo_action_drift_ratio`       | `0.1`    | Maximum action/VLM RMS functional-drift ratio               |
+| `cabo_probe_interval`           | `8`      | Steps between CABO flow-velocity probes                     |
+| `cabo_probe_batch_size`         | `1`      | Per-rank samples used by each CABO probe                    |
 | `freeze_vision_encoder`         | `false`  | Do not freeze the vision encoder                            |
 | `train_expert_only`             | `false`  | Do not freeze the VLM; train all parameters                 |
 

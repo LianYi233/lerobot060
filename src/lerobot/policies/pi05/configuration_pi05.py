@@ -98,6 +98,17 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = True
     action_head_grad_clip_ratio: float = 10.0
 
+    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates how much the
+    # next VLM and action-side AdamW updates would move the predicted flow velocity, then scales the
+    # action-side optimizer step so its RMS functional drift stays below this ratio of VLM drift.
+    cabo_enabled: bool = False
+    cabo_action_drift_ratio: float = 0.1
+    cabo_probe_interval: int = 8
+    cabo_probe_batch_size: int = 1
+    cabo_drift_ema_decay: float = 0.9
+    cabo_budget_decay: float = 0.95
+    cabo_budget_cap_windows: float = 4.0
+
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
     # For example, --steps=3000 will scale warmup to 100 and decay to 3000
@@ -127,8 +138,28 @@ class PI05Config(PreTrainedConfig):
 
         if not math.isfinite(self.action_head_grad_clip_ratio) or self.action_head_grad_clip_ratio <= 0.0:
             raise ValueError(
-                "action_head_grad_clip_ratio must be greater than 0, got "
-                f"{self.action_head_grad_clip_ratio}"
+                f"action_head_grad_clip_ratio must be greater than 0, got {self.action_head_grad_clip_ratio}"
+            )
+
+        if not 0.0 < self.cabo_action_drift_ratio <= 1.0:
+            raise ValueError(f"cabo_action_drift_ratio must be in (0, 1], got {self.cabo_action_drift_ratio}")
+        if self.cabo_probe_interval <= 0:
+            raise ValueError(f"cabo_probe_interval must be greater than 0, got {self.cabo_probe_interval}")
+        if self.cabo_probe_batch_size <= 0:
+            raise ValueError(
+                f"cabo_probe_batch_size must be greater than 0, got {self.cabo_probe_batch_size}"
+            )
+        if not 0.0 <= self.cabo_drift_ema_decay < 1.0:
+            raise ValueError(f"cabo_drift_ema_decay must be in [0, 1), got {self.cabo_drift_ema_decay}")
+        if not 0.0 <= self.cabo_budget_decay < 1.0:
+            raise ValueError(f"cabo_budget_decay must be in [0, 1), got {self.cabo_budget_decay}")
+        if not math.isfinite(self.cabo_budget_cap_windows) or self.cabo_budget_cap_windows < 1.0:
+            raise ValueError(
+                f"cabo_budget_cap_windows must be finite and at least 1, got {self.cabo_budget_cap_windows}"
+            )
+        if self.cabo_enabled and self.train_expert_only:
+            raise ValueError(
+                "CABO requires trainable VLM parameters and is incompatible with train_expert_only=True"
             )
 
     def validate_features(self) -> None:

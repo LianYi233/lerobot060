@@ -98,6 +98,10 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert scheduler.num_decay_steps == 30_000
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
+    assert not config.cabo_enabled
+    assert config.cabo_action_drift_ratio == pytest.approx(0.1)
+    assert config.cabo_probe_interval == 8
+    assert config.cabo_probe_batch_size == 1
 
 
 @pytest.mark.parametrize(
@@ -107,6 +111,36 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
 def test_pi05_rejects_invalid_action_head_grad_clip_ratio(action_head_grad_clip_ratio: float):
     with pytest.raises(ValueError, match="action_head_grad_clip_ratio"):
         PI05Config(action_head_grad_clip_ratio=action_head_grad_clip_ratio)
+
+
+@pytest.mark.parametrize("cabo_action_drift_ratio", [0.0, -1.0, 1.1])
+def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: float):
+    with pytest.raises(ValueError, match="cabo_action_drift_ratio"):
+        PI05Config(cabo_action_drift_ratio=cabo_action_drift_ratio)
+
+
+def test_pi05_rejects_cabo_with_expert_only_training():
+    with pytest.raises(ValueError, match="train_expert_only"):
+        PI05Config(cabo_enabled=True, train_expert_only=True)
+
+
+def test_pi05_cabo_disables_gradient_clipping_hook():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+    )
+    policy.config.cabo_enabled = True
+    action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics["action_head_clip_applied"] == 0.0
+    assert metrics["cabo/gradient_clip_disabled"] == 1.0
+    for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
 
 
 def test_pi05_leaves_action_gradient_below_ten_times_vlm_rms_unchanged():

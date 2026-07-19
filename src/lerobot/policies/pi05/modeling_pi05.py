@@ -47,6 +47,15 @@ else:
     layernorm_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.optim.cabo import (
+    CABO_ACTION_GROUP,
+    CABO_GROUP_NAME,
+    CABO_VLM_GROUP,
+    candidate_update_projection,
+    get_named_param_group,
+    require_adamw,
+    update_cabo_budget,
+)
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -72,6 +81,20 @@ def _unique_parameters_with_grad(modules: list[nn.Module]) -> list[nn.Parameter]
         for parameter in module.parameters():
             parameter_id = id(parameter)
             if parameter_id in seen or not parameter.requires_grad or parameter.grad is None:
+                continue
+            seen.add(parameter_id)
+            parameters.append(parameter)
+    return parameters
+
+
+def _unique_trainable_parameters(modules: list[nn.Module]) -> list[nn.Parameter]:
+    """Collect unique trainable parameters without requiring an existing gradient."""
+    parameters = []
+    seen = set()
+    for module in modules:
+        for parameter in module.parameters():
+            parameter_id = id(parameter)
+            if parameter_id in seen or not parameter.requires_grad:
                 continue
             seen.add(parameter_id)
             parameters.append(parameter)
@@ -752,18 +775,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+    def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
+        """Predict flow velocity for explicit noisy actions and timesteps.
 
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
+        Keeping this entry point eager gives CABO a deterministic differentiable probe even when the
+        regular training ``forward`` is wrapped with ``torch.compile``.
+        """
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
@@ -803,7 +820,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
+
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+        """Do a full training forward pass and compute the loss."""
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        v_t = self.predict_velocity(images, img_masks, tokens, masks, x_t, time)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -1035,7 +1065,9 @@ class PI05Policy(PreTrainedPolicy):
                 ) from e
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)    # ✓ Remapped 812 state dict keys
+            fixed_state_dict = model._fix_pytorch_state_dict_keys(
+                original_state_dict, model.config
+            )  # ✓ Remapped 812 state dict keys
 
             # Then add "model." prefix for all keys that don't already have it
             remapped_state_dict = {}
@@ -1147,8 +1179,171 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def _vlm_modules(self) -> list[nn.Module]:
+        return [self.model.paligemma_with_expert.paligemma]
+
+    def _action_modules(self) -> list[nn.Module]:
+        return [
+            self.model.paligemma_with_expert.gemma_expert,
+            self.model.action_in_proj,
+            self.model.action_out_proj,
+            self.model.time_mlp_in,
+            self.model.time_mlp_out,
+        ]
+
+    def _cabo_parameter_groups(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        vlm_parameters = _unique_trainable_parameters(self._vlm_modules())
+        action_parameters = _unique_trainable_parameters(self._action_modules())
+        vlm_ids = {id(parameter) for parameter in vlm_parameters}
+        action_ids = {id(parameter) for parameter in action_parameters}
+        if vlm_ids & action_ids:
+            raise ValueError("CABO VLM and action parameter groups must be disjoint")
+
+        all_trainable = {id(parameter) for parameter in self.parameters() if parameter.requires_grad}
+        grouped = vlm_ids | action_ids
+        if grouped != all_trainable:
+            missing = len(all_trainable - grouped)
+            extra = len(grouped - all_trainable)
+            raise ValueError(
+                "CABO parameter grouping must cover every trainable PI0.5 parameter exactly once; "
+                f"missing={missing}, extra={extra}"
+            )
+        if not vlm_parameters or not action_parameters:
+            raise ValueError(
+                "CABO requires non-empty trainable VLM and action parameter groups; "
+                f"vlm={len(vlm_parameters)}, action={len(action_parameters)}"
+            )
+        return vlm_parameters, action_parameters
+
+    def get_optim_params(self):
+        if not self.config.cabo_enabled:
+            return self.parameters()
+        vlm_parameters, action_parameters = self._cabo_parameter_groups()
+        return [
+            {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_GROUP},
+            {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP},
+        ]
+
+    def _cabo_probe_velocity(self, batch: dict[str, Tensor], *, step: int) -> Tensor:
+        probe_batch_size = min(self.config.cabo_probe_batch_size, batch[ACTION].shape[0])
+        probe_batch = {
+            key: value[:probe_batch_size] if isinstance(value, Tensor) and value.ndim > 0 else value
+            for key, value in batch.items()
+        }
+        images, img_masks = self._preprocess_images(probe_batch)
+        tokens = probe_batch[f"{OBS_LANGUAGE_TOKENS}"]
+        masks = probe_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        actions = self.prepare_action(probe_batch)
+
+        device = actions.device
+        fork_devices = []
+        if device.type == "cuda":
+            fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=fork_devices):
+            # A private deterministic RNG stream keeps CABO from changing the stochastic training
+            # trajectory merely by being probed. Different DDP ranks still see different batch shards.
+            probe_seed = 17_071 + step
+            torch.manual_seed(probe_seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed(probe_seed)
+            noise = self.model.sample_noise(actions.shape, device)
+            sample_time = self.model.sample_time(actions.shape[0], device)
+            expanded_time = sample_time[:, None, None]
+            x_t = expanded_time * noise + (1.0 - expanded_time) * actions
+            velocity = self.model.predict_velocity(images, img_masks, tokens, masks, x_t, sample_time)
+
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            velocity = velocity[:, :, :original_action_dim]
+            projection = torch.empty_like(velocity).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+        return torch.sum(velocity * projection) / math.sqrt(velocity.numel())
+
+    def compute_optimizer_step_control(
+        self,
+        batch: dict[str, Tensor],
+        optimizer,
+        accelerator,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """Estimate counterfactual action-space drift and return named optimizer group scales."""
+        if not self.config.cabo_enabled:
+            return {}, {}
+
+        adamw = require_adamw(optimizer)
+        vlm_group = get_named_param_group(adamw, CABO_VLM_GROUP)
+        action_group = get_named_param_group(adamw, CABO_ACTION_GROUP)
+        step = int(action_group.get("cabo_step", 0))
+        action_scale = float(action_group.get("cabo_action_scale", 1.0))
+
+        if step % self.config.cabo_probe_interval != 0:
+            action_group["cabo_step"] = step + 1
+            return {CABO_ACTION_GROUP: action_scale}, {
+                "cabo/action_scale": action_scale,
+                "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
+                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                "cabo/probe_applied": 0.0,
+            }
+
+        device = batch[ACTION].device
+        projections = {
+            CABO_VLM_GROUP: torch.zeros((), dtype=torch.float32, device=device),
+            CABO_ACTION_GROUP: torch.zeros((), dtype=torch.float32, device=device),
+        }
+        handles = []
+
+        def register_group_hooks(group_name: str, param_group: dict) -> None:
+            for parameter in param_group["params"]:
+                if parameter.grad is None or not parameter.requires_grad:
+                    continue
+
+                def accumulate_projection(probe_gradient, *, parameter=parameter, group=param_group):
+                    contribution = candidate_update_projection(
+                        probe_gradient,
+                        parameter,
+                        group,
+                        adamw.state.get(parameter, {}),
+                    )
+                    projections[group_name].add_(contribution.to(dtype=torch.float32))
+                    # Preserve the already-computed training gradient exactly. Returning zero makes
+                    # AccumulateGrad add nothing when the differentiable CABO probe is backpropagated.
+                    return torch.zeros_like(probe_gradient)
+
+                handles.append(parameter.register_hook(accumulate_projection))
+
+        register_group_hooks(CABO_VLM_GROUP, vlm_group)
+        register_group_hooks(CABO_ACTION_GROUP, action_group)
+        try:
+            with torch.enable_grad(), accelerator.autocast():
+                probe_scalar = self._cabo_probe_velocity(batch, step=step)
+            probe_scalar.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        drift = torch.stack(
+            [
+                projections[CABO_VLM_GROUP].square(),
+                projections[CABO_ACTION_GROUP].square(),
+            ]
+        )
+        drift = accelerator.reduce(drift, reduction="mean")
+        vlm_drift, action_drift = (float(value.item()) for value in drift)
+        action_scale, metrics = update_cabo_budget(
+            action_group,
+            vlm_drift=vlm_drift,
+            action_drift=action_drift,
+            action_drift_ratio=self.config.cabo_action_drift_ratio,
+            probe_interval=self.config.cabo_probe_interval,
+            ema_decay=self.config.cabo_drift_ema_decay,
+            budget_decay=self.config.cabo_budget_decay,
+            budget_cap_windows=self.config.cabo_budget_cap_windows,
+        )
+        action_group["cabo_step"] = step + 1
+        metrics.update(
+            {
+                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                "cabo/probe_applied": 1.0,
+            }
+        )
+        return {CABO_ACTION_GROUP: action_scale}, metrics
 
     @torch.no_grad()
     def clip_gradients(self, accelerator=None) -> dict[str, float]:
@@ -1167,20 +1362,18 @@ class PI05Policy(PreTrainedPolicy):
         clipping interface.
         """
         _ = accelerator
+        if getattr(self.config, "cabo_enabled", False):
+            return {
+                "action_head_clip_applied": 0.0,
+                "cabo/gradient_clip_disabled": 1.0,
+            }
         if not getattr(self.config, "clip_action_head_by_vlm", True):
             return {}
 
-        model = self.model
-        action_parameters = _unique_parameters_with_grad(
-            [
-                model.paligemma_with_expert.gemma_expert,
-                model.action_in_proj,
-                model.action_out_proj,
-                model.time_mlp_in,
-                model.time_mlp_out,
-            ]
-        )
-        vlm_parameters = _unique_parameters_with_grad([model.paligemma_with_expert.paligemma])
+        # Call the class helpers explicitly so the lightweight policy stand-ins used by optimizer
+        # tests need only provide ``model`` and ``config``.
+        action_parameters = _unique_parameters_with_grad(PI05Policy._action_modules(self))
+        vlm_parameters = _unique_parameters_with_grad(PI05Policy._vlm_modules(self))
 
         action_norm, action_numel = _gradient_l2_norm_and_numel(action_parameters)
         vlm_norm, vlm_numel = _gradient_l2_norm_and_numel(vlm_parameters)
@@ -1212,9 +1405,7 @@ class PI05Policy(PreTrainedPolicy):
 
         action_norm_after_tensor, _ = _gradient_l2_norm_and_numel(action_parameters)
         action_norm_after = (
-            float(action_norm_after_tensor.item())
-            if action_norm_after_tensor is not None
-            else float("nan")
+            float(action_norm_after_tensor.item()) if action_norm_after_tensor is not None else float("nan")
         )
         action_rms_after = action_norm_after / math.sqrt(action_numel)
         clip_scale = action_norm_after / action_norm_before if action_norm_before > 0.0 else 1.0

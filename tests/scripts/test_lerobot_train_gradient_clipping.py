@@ -50,10 +50,27 @@ class _PolicyWithoutCustomGradientClipping(nn.Module):
         self.weight = nn.Parameter(torch.tensor(0.0))
 
 
+class _PolicyWithOptimizerStepControl(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vlm_weight = nn.Parameter(torch.tensor(0.0))
+        self.action_weight = nn.Parameter(torch.tensor(0.0))
+        self.control_calls = 0
+
+    def forward(self, batch):
+        return (self.vlm_weight + self.action_weight) * batch, {}
+
+    def compute_optimizer_step_control(self, batch, optimizer, accelerator):
+        _ = batch, optimizer, accelerator
+        self.control_calls += 1
+        return {"action": 0.25}, {"cabo/action_scale": 0.25}
+
+
 class _FakeAccelerator:
     def __init__(self):
         self.unscale_calls = 0
         self.global_clip_calls = 0
+        self.no_sync_calls = 0
         self.events = []
 
     def autocast(self):
@@ -76,6 +93,11 @@ class _FakeAccelerator:
         self.global_clip_calls += 1
         self.events.append("global_clip")
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+    def no_sync(self, policy):
+        _ = policy
+        self.no_sync_calls += 1
+        return nullcontext()
 
 
 def test_policy_specific_hook_replaces_global_gradient_clipping():
@@ -140,3 +162,32 @@ def test_update_policy_calls_custom_hook_and_merges_clipping_metrics():
     assert accelerator.global_clip_calls == 0
     assert train_metrics.grad_norm == pytest.approx(4.0)
     assert output_dict == {"forward_metric": 2.0, "custom_clip_applied": 1.0}
+
+
+def test_update_policy_applies_post_preconditioner_group_scale_and_restores_lr():
+    policy = _PolicyWithOptimizerStepControl()
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [policy.vlm_weight], "lr": 0.1, "name": "vlm"},
+            {"params": [policy.action_weight], "lr": 0.1, "name": "action"},
+        ]
+    )
+    accelerator = _FakeAccelerator()
+    train_metrics = SimpleNamespace()
+
+    _, output_dict = update_policy(
+        train_metrics=train_metrics,
+        policy=policy,
+        batch=torch.tensor(1.0),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=accelerator,
+    )
+
+    assert policy.vlm_weight.item() == pytest.approx(-0.1)
+    assert policy.action_weight.item() == pytest.approx(-0.025)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
+    assert policy.control_calls == 1
+    assert accelerator.no_sync_calls == 1
+    assert output_dict == {"cabo/action_scale": 0.25}
