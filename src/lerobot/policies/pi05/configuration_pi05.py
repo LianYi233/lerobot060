@@ -98,13 +98,20 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = True
     action_head_grad_clip_ratio: float = 10.0
 
-    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates how much the
-    # next VLM and action-side AdamW updates would move the predicted flow velocity, then scales the
-    # action-side optimizer step so its RMS functional drift stays below this ratio of VLM drift.
+    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the joint
+    # flow-velocity drift of the next VLM and action-side AdamW updates, including their cross term,
+    # then scales only the action-side optimizer step to stay inside a leaky functional budget.
     cabo_enabled: bool = False
     cabo_action_drift_ratio: float = 0.1
     cabo_probe_interval: int = 8
     cabo_probe_batch_size: int = 1
+    cabo_num_projections: int = 4
+    # Dimensionless action-only allowance. When VLM drift is zero, this grants approximately this
+    # fraction of the full candidate action step instead of starving the action side completely.
+    cabo_base_action_scale: float = 0.1
+    # Positive cross drift is charged fully. Negative (cancelling) cross drift receives only this
+    # fraction of its measured credit to avoid trusting noisy cancellation estimates too strongly.
+    cabo_negative_cross_discount: float = 0.5
     cabo_drift_ema_decay: float = 0.9
     cabo_budget_decay: float = 0.95
     cabo_budget_cap_windows: float = 4.0
@@ -148,6 +155,17 @@ class PI05Config(PreTrainedConfig):
         if self.cabo_probe_batch_size <= 0:
             raise ValueError(
                 f"cabo_probe_batch_size must be greater than 0, got {self.cabo_probe_batch_size}"
+            )
+        if self.cabo_num_projections < 2:
+            raise ValueError(
+                "cabo_num_projections must be at least 2 to estimate cross drift, "
+                f"got {self.cabo_num_projections}"
+            )
+        if not 0.0 <= self.cabo_base_action_scale <= 1.0:
+            raise ValueError(f"cabo_base_action_scale must be in [0, 1], got {self.cabo_base_action_scale}")
+        if not 0.0 <= self.cabo_negative_cross_discount <= 1.0:
+            raise ValueError(
+                f"cabo_negative_cross_discount must be in [0, 1], got {self.cabo_negative_cross_discount}"
             )
         if not 0.0 <= self.cabo_drift_ema_decay < 1.0:
             raise ValueError(f"cabo_drift_ema_decay must be in [0, 1), got {self.cabo_drift_ema_decay}")

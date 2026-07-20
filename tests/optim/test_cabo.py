@@ -83,20 +83,85 @@ def test_cabo_budget_enforces_rms_drift_ratio_and_persists_state():
         action_group,
         vlm_drift=4.0,
         action_drift=9.0,
+        cross_drift=6.0,
         action_drift_ratio=0.1,
+        base_action_scale=0.0,
+        negative_cross_discount=0.5,
         probe_interval=8,
         ema_decay=0.9,
         budget_decay=0.95,
         budget_cap_windows=4.0,
     )
 
-    # scale^2 * Da == ratio^2 * Dv on the first probe because no prior budget exists.
+    # Perfectly aligned updates recover the old worst-case marginal ratio.
     assert scale == pytest.approx(0.1 * (4.0 / 9.0) ** 0.5)
-    assert scale**2 * metrics["cabo/action_drift_ema"] == pytest.approx(
-        0.1**2 * metrics["cabo/vlm_drift_ema"]
-    )
+    assert metrics["cabo/total_drift_ema"] == pytest.approx((1.0 + 0.1) ** 2 * metrics["cabo/vlm_drift_ema"])
+    assert metrics["cabo/cross_correlation_ema"] == pytest.approx(1.0)
     assert action_group["cabo_action_scale"] == pytest.approx(scale)
     assert action_group["cabo_ema_initialized"] is True
+
+
+def test_cabo_joint_budget_uses_cross_drift_geometry():
+    common = {
+        "vlm_drift": 1.0,
+        "action_drift": 9.0,
+        "action_drift_ratio": 0.1,
+        "base_action_scale": 0.0,
+        "negative_cross_discount": 1.0,
+        "probe_interval": 1,
+        "ema_decay": 0.0,
+        "budget_decay": 0.0,
+        "budget_cap_windows": 1.0,
+    }
+
+    aligned_scale, _ = update_cabo_budget({}, cross_drift=3.0, **common)
+    orthogonal_scale, _ = update_cabo_budget({}, cross_drift=0.0, **common)
+    cancelling_scale, cancelling_metrics = update_cabo_budget({}, cross_drift=-3.0, **common)
+
+    assert aligned_scale == pytest.approx(1.0 / 30.0)
+    assert orthogonal_scale == pytest.approx((0.21 / 9.0) ** 0.5)
+    assert cancelling_scale == pytest.approx(0.7)
+    assert aligned_scale < orthogonal_scale < cancelling_scale
+    assert cancelling_metrics["cabo/total_drift_ema"] == pytest.approx(1.21)
+
+
+def test_cabo_base_action_scale_prevents_stationary_vlm_from_starving_action():
+    scale, metrics = update_cabo_budget(
+        {},
+        vlm_drift=0.0,
+        action_drift=9.0,
+        cross_drift=0.0,
+        action_drift_ratio=0.1,
+        base_action_scale=0.2,
+        negative_cross_discount=0.5,
+        probe_interval=8,
+        ema_decay=0.9,
+        budget_decay=0.95,
+        budget_cap_windows=4.0,
+    )
+
+    assert scale == pytest.approx(0.2)
+    assert metrics["cabo/base_action_allowance"] == pytest.approx(0.2**2 * 9.0)
+
+
+def test_cabo_discounts_negative_cross_drift_credit():
+    common = {
+        "vlm_drift": 1.0,
+        "action_drift": 4.0,
+        "cross_drift": -2.0,
+        "action_drift_ratio": 0.1,
+        "base_action_scale": 0.0,
+        "probe_interval": 1,
+        "ema_decay": 0.0,
+        "budget_decay": 0.0,
+        "budget_cap_windows": 1.0,
+    }
+
+    full_credit_scale, _ = update_cabo_budget({}, negative_cross_discount=1.0, **common)
+    discounted_scale, metrics = update_cabo_budget({}, negative_cross_discount=0.5, **common)
+
+    assert discounted_scale < full_credit_scale
+    assert metrics["cabo/effective_cross_drift_ema"] == pytest.approx(-1.0)
 
 
 def test_cabo_budget_freezes_action_on_nonfinite_probe():
@@ -106,7 +171,10 @@ def test_cabo_budget_freezes_action_on_nonfinite_probe():
         action_group,
         vlm_drift=float("nan"),
         action_drift=1.0,
+        cross_drift=0.0,
         action_drift_ratio=0.1,
+        base_action_scale=0.1,
+        negative_cross_discount=0.5,
         probe_interval=8,
         ema_decay=0.9,
         budget_decay=0.95,

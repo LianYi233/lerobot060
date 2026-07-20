@@ -147,19 +147,35 @@ def update_cabo_budget(
     *,
     vlm_drift: float,
     action_drift: float,
+    cross_drift: float,
     action_drift_ratio: float,
+    base_action_scale: float,
+    negative_cross_discount: float,
     probe_interval: int,
     ema_decay: float,
     budget_decay: float,
     budget_cap_windows: float,
 ) -> tuple[float, dict[str, float]]:
-    """Update CABO's leaky functional-drift budget and return the next action scale."""
-    finite = math.isfinite(vlm_drift) and math.isfinite(action_drift)
+    """Update CABO's leaky joint-drift budget and return the next action scale.
+
+    Let ``dv`` and ``da`` be the first-order flow-velocity changes induced by the full VLM and
+    action-side AdamW candidate updates. Scaling only the action update by ``s`` gives
+
+        mean(||dv + s * da||^2) = Dv + 2 * s * Cva + s^2 * Da.
+
+    The relative allowance preserves the old worst-case guarantee that total RMS drift is at most
+    ``1 + action_drift_ratio`` times the VLM-only RMS drift, but uses the measured cross term instead
+    of assuming that both updates are perfectly aligned. ``base_action_scale`` additionally grants
+    an action-only allowance of ``base_action_scale^2 * Da`` so a stationary VLM cannot starve the
+    action side completely.
+    """
+    finite = math.isfinite(vlm_drift) and math.isfinite(action_drift) and math.isfinite(cross_drift)
     if not finite or vlm_drift < 0.0 or action_drift < 0.0:
         action_group["cabo_action_scale"] = 0.0
         return 0.0, {
             "cabo/vlm_drift": vlm_drift,
             "cabo/action_drift": action_drift,
+            "cabo/cross_drift": cross_drift,
             "cabo/action_scale": 0.0,
             "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
             "cabo/probe_nonfinite": 1.0,
@@ -171,12 +187,29 @@ def update_cabo_budget(
         action_ema = (
             ema_decay * float(action_group["cabo_action_drift_ema"]) + (1.0 - ema_decay) * action_drift
         )
+        cross_ema = (
+            ema_decay * float(action_group.get("cabo_cross_drift_ema", cross_drift))
+            + (1.0 - ema_decay) * cross_drift
+        )
     else:
         vlm_ema = vlm_drift
         action_ema = action_drift
+        cross_ema = cross_drift
+
+    # These three statistics form an EMA Gram matrix. Clamp only round-off violations of its
+    # Cauchy-Schwarz bound; a materially invalid value would otherwise make the quadratic controller
+    # grant a fictitious cancellation credit.
+    cross_limit = math.sqrt(max(vlm_ema * action_ema, 0.0))
+    cross_ema = min(max(cross_ema, -cross_limit), cross_limit)
+    effective_cross = cross_ema if cross_ema >= 0.0 else negative_cross_discount * cross_ema
 
     interval = float(probe_interval)
-    credit = interval * action_drift_ratio**2 * vlm_ema
+    # If the old marginal constraint s * sqrt(Da) <= rho * sqrt(Dv) is interpreted as a
+    # worst-case bound, it guarantees total RMS drift <= (1 + rho) * sqrt(Dv). The exact joint
+    # quadratic therefore has an incremental squared-drift allowance of (2*rho + rho^2) * Dv.
+    relative_allowance = (2.0 * action_drift_ratio + action_drift_ratio**2) * vlm_ema
+    base_allowance = base_action_scale**2 * action_ema
+    credit = interval * (relative_allowance + base_allowance)
     old_budget = float(action_group.get("cabo_budget", 0.0))
     budget = budget_decay * old_budget + credit
     # Express the cap in windows of current EMA credit. A tiny floor keeps the state finite when
@@ -185,20 +218,28 @@ def update_cabo_budget(
     budget_cap = budget_cap_windows * max(credit, credit_floor)
     budget = min(budget, budget_cap)
 
-    full_action_cost = interval * action_ema
-    if full_action_cost <= 0.0:
+    allowance = max(budget, 0.0) / interval
+    if action_ema <= 0.0:
         action_scale = 1.0
-        spent = 0.0
     else:
-        action_scale = min(1.0, math.sqrt(max(budget, 0.0) / full_action_cost))
-        spent = action_scale**2 * full_action_cost
+        discriminant = effective_cross**2 + action_ema * allowance
+        action_scale = min(1.0, (-effective_cross + math.sqrt(max(discriminant, 0.0))) / action_ema)
+
+    # Negative incremental drift means the action update cancels part of the VLM update. It may
+    # spend no budget, but it must never mint new budget from that cancellation.
+    incremental_cost = 2.0 * action_scale * effective_cross + action_scale**2 * action_ema
+    spent = interval * max(0.0, incremental_cost)
     budget = max(0.0, budget - spent)
+
+    total_drift_ema = vlm_ema + 2.0 * action_scale * cross_ema + action_scale**2 * action_ema
+    cross_correlation = cross_ema / cross_limit if cross_limit > 0.0 else 0.0
 
     action_group.update(
         {
             "cabo_ema_initialized": True,
             "cabo_vlm_drift_ema": vlm_ema,
             "cabo_action_drift_ema": action_ema,
+            "cabo_cross_drift_ema": cross_ema,
             "cabo_budget": budget,
             "cabo_action_scale": action_scale,
         }
@@ -206,11 +247,18 @@ def update_cabo_budget(
     return action_scale, {
         "cabo/vlm_drift": vlm_drift,
         "cabo/action_drift": action_drift,
+        "cabo/cross_drift": cross_drift,
         "cabo/vlm_drift_ema": vlm_ema,
         "cabo/action_drift_ema": action_ema,
+        "cabo/cross_drift_ema": cross_ema,
+        "cabo/effective_cross_drift_ema": effective_cross,
+        "cabo/cross_correlation_ema": cross_correlation,
+        "cabo/total_drift_ema": total_drift_ema,
         "cabo/action_scale": action_scale,
         "cabo/budget": budget,
         "cabo/credit": credit,
+        "cabo/relative_allowance": relative_allowance,
+        "cabo/base_action_allowance": base_allowance,
         "cabo/planned_action_cost": spent,
         "cabo/probe_nonfinite": 0.0,
     }

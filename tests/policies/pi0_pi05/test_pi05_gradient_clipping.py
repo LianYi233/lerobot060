@@ -102,6 +102,9 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert config.cabo_action_drift_ratio == pytest.approx(0.1)
     assert config.cabo_probe_interval == 8
     assert config.cabo_probe_batch_size == 1
+    assert config.cabo_num_projections == 4
+    assert config.cabo_base_action_scale == pytest.approx(0.1)
+    assert config.cabo_negative_cross_discount == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +120,24 @@ def test_pi05_rejects_invalid_action_head_grad_clip_ratio(action_head_grad_clip_
 def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: float):
     with pytest.raises(ValueError, match="cabo_action_drift_ratio"):
         PI05Config(cabo_action_drift_ratio=cabo_action_drift_ratio)
+
+
+@pytest.mark.parametrize("cabo_num_projections", [0, 1, -1])
+def test_pi05_rejects_too_few_cabo_projections(cabo_num_projections: int):
+    with pytest.raises(ValueError, match="cabo_num_projections"):
+        PI05Config(cabo_num_projections=cabo_num_projections)
+
+
+@pytest.mark.parametrize("cabo_base_action_scale", [-0.1, 1.1])
+def test_pi05_rejects_invalid_cabo_base_action_scale(cabo_base_action_scale: float):
+    with pytest.raises(ValueError, match="cabo_base_action_scale"):
+        PI05Config(cabo_base_action_scale=cabo_base_action_scale)
+
+
+@pytest.mark.parametrize("cabo_negative_cross_discount", [-0.1, 1.1])
+def test_pi05_rejects_invalid_cabo_negative_cross_discount(cabo_negative_cross_discount: float):
+    with pytest.raises(ValueError, match="cabo_negative_cross_discount"):
+        PI05Config(cabo_negative_cross_discount=cabo_negative_cross_discount)
 
 
 def test_pi05_rejects_cabo_with_expert_only_training():

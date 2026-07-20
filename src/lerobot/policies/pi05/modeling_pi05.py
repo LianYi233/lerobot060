@@ -1224,10 +1224,29 @@ class PI05Policy(PreTrainedPolicy):
             {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP},
         ]
 
-    def _cabo_probe_velocity(self, batch: dict[str, Tensor], *, step: int) -> Tensor:
-        probe_batch_size = min(self.config.cabo_probe_batch_size, batch[ACTION].shape[0])
+    def _cabo_probe_velocity(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        step: int,
+        process_index: int = 0,
+    ) -> Tensor | None:
+        batch_size = batch[ACTION].shape[0]
+        action_padding = batch.get(f"{ACTION}_is_pad")
+        if isinstance(action_padding, Tensor):
+            valid_rows = ~action_padding.to(dtype=torch.bool).reshape(batch_size, -1).any(dim=1)
+            selected_indices = torch.nonzero(valid_rows, as_tuple=False).flatten()
+        else:
+            selected_indices = torch.arange(batch_size, device=batch[ACTION].device)
+
+        selected_indices = selected_indices[: self.config.cabo_probe_batch_size]
+        if selected_indices.numel() == 0:
+            return None
+
         probe_batch = {
-            key: value[:probe_batch_size] if isinstance(value, Tensor) and value.ndim > 0 else value
+            key: value.index_select(0, selected_indices.to(device=value.device))
+            if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
+            else value
             for key, value in batch.items()
         }
         images, img_masks = self._preprocess_images(probe_batch)
@@ -1241,8 +1260,9 @@ class PI05Policy(PreTrainedPolicy):
             fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
         with torch.random.fork_rng(devices=fork_devices):
             # A private deterministic RNG stream keeps CABO from changing the stochastic training
-            # trajectory merely by being probed. Different DDP ranks still see different batch shards.
-            probe_seed = 17_071 + step
+            # trajectory merely by being probed. Include the rank so DDP also contributes independent
+            # Hutchinson directions instead of repeating the same projection on every shard.
+            probe_seed = 17_071 + step + 1_000_003 * process_index
             torch.manual_seed(probe_seed)
             if device.type == "cuda":
                 torch.cuda.manual_seed(probe_seed)
@@ -1254,8 +1274,19 @@ class PI05Policy(PreTrainedPolicy):
 
             original_action_dim = self.config.output_features[ACTION].shape[0]
             velocity = velocity[:, :, :original_action_dim]
-            projection = torch.empty_like(velocity).bernoulli_(0.5).mul_(2.0).sub_(1.0)
-        return torch.sum(velocity * projection) / math.sqrt(velocity.numel())
+            projections = (
+                torch.empty(
+                    (self.config.cabo_num_projections, *velocity.shape),
+                    dtype=velocity.dtype,
+                    device=velocity.device,
+                )
+                .bernoulli_(0.5)
+                .mul_(2.0)
+                .sub_(1.0)
+            )
+        return torch.sum(
+            velocity.unsqueeze(0) * projections, dim=tuple(range(1, projections.ndim))
+        ) / math.sqrt(velocity.numel())
 
     def compute_optimizer_step_control(
         self,
@@ -1283,10 +1314,24 @@ class PI05Policy(PreTrainedPolicy):
             }
 
         device = batch[ACTION].device
-        projections = {
-            CABO_VLM_GROUP: torch.zeros((), dtype=torch.float32, device=device),
-            CABO_ACTION_GROUP: torch.zeros((), dtype=torch.float32, device=device),
-        }
+        process_index = int(getattr(accelerator, "process_index", 0))
+        with torch.enable_grad(), accelerator.autocast():
+            probe_scalars = self._cabo_probe_velocity(batch, step=step, process_index=process_index)
+
+        if probe_scalars is None:
+            action_group["cabo_step"] = step + 1
+            return {CABO_ACTION_GROUP: action_scale}, {
+                "cabo/action_scale": action_scale,
+                "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
+                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                "cabo/probe_applied": 0.0,
+                "cabo/probe_skipped_padding": 1.0,
+            }
+
+        probe_scalars = probe_scalars.reshape(-1)
+        projection_values = torch.zeros((probe_scalars.numel(), 2), dtype=torch.float32, device=device)
+        group_indices = {CABO_VLM_GROUP: 0, CABO_ACTION_GROUP: 1}
+        projection_index = 0
         handles = []
 
         def register_group_hooks(group_name: str, param_group: dict) -> None:
@@ -1301,7 +1346,9 @@ class PI05Policy(PreTrainedPolicy):
                         group,
                         adamw.state.get(parameter, {}),
                     )
-                    projections[group_name].add_(contribution.to(dtype=torch.float32))
+                    projection_values[projection_index, group_indices[group_name]].add_(
+                        contribution.to(dtype=torch.float32)
+                    )
                     # Preserve the already-computed training gradient exactly. Returning zero makes
                     # AccumulateGrad add nothing when the differentiable CABO probe is backpropagated.
                     return torch.zeros_like(probe_gradient)
@@ -1311,26 +1358,29 @@ class PI05Policy(PreTrainedPolicy):
         register_group_hooks(CABO_VLM_GROUP, vlm_group)
         register_group_hooks(CABO_ACTION_GROUP, action_group)
         try:
-            with torch.enable_grad(), accelerator.autocast():
-                probe_scalar = self._cabo_probe_velocity(batch, step=step)
-            probe_scalar.backward()
+            for projection_index, probe_scalar in enumerate(probe_scalars):
+                probe_scalar.backward(retain_graph=projection_index + 1 < probe_scalars.numel())
         finally:
             for handle in handles:
                 handle.remove()
 
-        drift = torch.stack(
+        probe_moments = torch.stack(
             [
-                projections[CABO_VLM_GROUP].square(),
-                projections[CABO_ACTION_GROUP].square(),
+                projection_values[:, 0].square().mean(),
+                projection_values[:, 1].square().mean(),
+                (projection_values[:, 0] * projection_values[:, 1]).mean(),
             ]
         )
-        drift = accelerator.reduce(drift, reduction="mean")
-        vlm_drift, action_drift = (float(value.item()) for value in drift)
+        probe_moments = accelerator.reduce(probe_moments, reduction="mean")
+        vlm_drift, action_drift, cross_drift = (float(value.item()) for value in probe_moments)
         action_scale, metrics = update_cabo_budget(
             action_group,
             vlm_drift=vlm_drift,
             action_drift=action_drift,
+            cross_drift=cross_drift,
             action_drift_ratio=self.config.cabo_action_drift_ratio,
+            base_action_scale=self.config.cabo_base_action_scale,
+            negative_cross_discount=self.config.cabo_negative_cross_discount,
             probe_interval=self.config.cabo_probe_interval,
             ema_decay=self.config.cabo_drift_ema_decay,
             budget_decay=self.config.cabo_budget_decay,
@@ -1341,6 +1391,8 @@ class PI05Policy(PreTrainedPolicy):
             {
                 "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
                 "cabo/probe_applied": 1.0,
+                "cabo/probe_skipped_padding": 0.0,
+                "cabo/num_projections": float(probe_scalars.numel()),
             }
         )
         return {CABO_ACTION_GROUP: action_scale}, metrics
