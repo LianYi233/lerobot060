@@ -28,9 +28,10 @@ from lerobot.optim.cabo import (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 @pytest.mark.parametrize("existing_steps", [0, 2])
-def test_adamw_candidate_delta_matches_real_optimizer_step(existing_steps: int):
-    parameter = nn.Parameter(torch.tensor([1.5, -0.75], dtype=torch.float64))
+def test_adamw_candidate_delta_matches_real_optimizer_step(existing_steps: int, dtype: torch.dtype):
+    parameter = nn.Parameter(torch.tensor([1.5, -0.75], dtype=dtype))
     optimizer = torch.optim.AdamW(
         [{"params": [parameter], CABO_GROUP_NAME: CABO_ACTION_GROUP}],
         lr=3e-3,
@@ -41,18 +42,19 @@ def test_adamw_candidate_delta_matches_real_optimizer_step(existing_steps: int):
     )
 
     for index in range(existing_steps):
-        parameter.grad = torch.tensor([0.2 + index, -0.4 - index], dtype=torch.float64)
+        parameter.grad = torch.tensor([0.2 + index, -0.4 - index], dtype=dtype)
         optimizer.step()
         optimizer.zero_grad()
 
-    parameter.grad = torch.tensor([0.7, -1.1], dtype=torch.float64)
+    parameter.grad = torch.tensor([0.7, -1.1], dtype=dtype)
     group = get_named_param_group(optimizer, CABO_ACTION_GROUP)
     expected_delta = adamw_candidate_parameter_delta(parameter, group, optimizer.state.get(parameter, {}))
     before = parameter.detach().clone()
 
     optimizer.step()
 
-    torch.testing.assert_close(parameter.detach() - before, expected_delta, rtol=1e-12, atol=1e-12)
+    actual_delta = parameter.detach().to(dtype=expected_delta.dtype) - before.to(dtype=expected_delta.dtype)
+    torch.testing.assert_close(actual_delta, expected_delta, rtol=0.0, atol=0.0)
 
 
 def test_temporary_group_lr_scale_scales_complete_adamw_step_and_restores_lr():
@@ -164,7 +166,7 @@ def test_cabo_discounts_negative_cross_drift_credit():
     assert metrics["cabo/effective_cross_drift_ema"] == pytest.approx(-1.0)
 
 
-def test_cabo_budget_freezes_action_on_nonfinite_probe():
+def test_cabo_budget_preserves_state_on_nonfinite_probe():
     action_group = {"cabo_action_scale": 0.5, "cabo_budget": 2.0}
 
     scale, metrics = update_cabo_budget(
@@ -181,6 +183,19 @@ def test_cabo_budget_freezes_action_on_nonfinite_probe():
         budget_cap_windows=4.0,
     )
 
-    assert scale == 0.0
-    assert action_group["cabo_action_scale"] == 0.0
+    assert scale == 0.5
+    assert action_group["cabo_action_scale"] == 0.5
+    assert action_group["cabo_budget"] == 2.0
     assert metrics["cabo/probe_nonfinite"] == 1.0
+
+
+@pytest.mark.parametrize("mode", ["foreach", "fused", "capturable", "differentiable"])
+def test_adamw_candidate_delta_rejects_unsupported_optimizer_modes(mode: str):
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.tensor([0.5])
+    optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+    group = optimizer.param_groups[0]
+    group[mode] = True
+
+    with pytest.raises(RuntimeError, match=mode):
+        adamw_candidate_parameter_delta(parameter, group, optimizer.state.get(parameter, {}))

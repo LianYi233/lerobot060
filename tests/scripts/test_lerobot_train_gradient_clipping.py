@@ -23,6 +23,7 @@ from torch import nn
 
 pytest.importorskip("datasets")
 
+from lerobot.optim.cabo import OptimizerStepControl  # noqa: E402
 from lerobot.scripts.lerobot_train import _clip_policy_gradients, update_policy  # noqa: E402
 
 
@@ -49,6 +50,9 @@ class _PolicyWithoutCustomGradientClipping(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.tensor(0.0))
 
+    def forward(self, batch):
+        return self.weight * batch, {}
+
 
 class _PolicyWithOptimizerStepControl(nn.Module):
     def __init__(self):
@@ -66,8 +70,45 @@ class _PolicyWithOptimizerStepControl(nn.Module):
         return {"action": 0.25}, {"cabo/action_scale": 0.25}
 
 
+class _PolicyWithSkippingOptimizerStep(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.0))
+        self.update_calls = 0
+
+    def forward(self, batch):
+        return self.weight * batch, {}
+
+    def compute_optimizer_step_control(self, batch, optimizer, accelerator):
+        _ = batch, optimizer, accelerator
+        return OptimizerStepControl(
+            metrics={"optimizer_step/skipped": 1.0},
+            skip_optimizer_step=True,
+        )
+
+    def update(self):
+        self.update_calls += 1
+
+
+class _CountingScheduler:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self):
+        self.step_calls += 1
+
+
+class _CountingGradScaler:
+    def __init__(self):
+        self.update_calls = 0
+
+    def update(self):
+        self.update_calls += 1
+
+
 class _FakeAccelerator:
     def __init__(self):
+        self.num_processes = 1
         self.unscale_calls = 0
         self.global_clip_calls = 0
         self.no_sync_calls = 0
@@ -191,3 +232,94 @@ def test_update_policy_applies_post_preconditioner_group_scale_and_restores_lr()
     assert policy.control_calls == 1
     assert accelerator.no_sync_calls == 1
     assert output_dict == {"cabo/action_scale": 0.25}
+
+
+def test_update_policy_structured_control_skips_optimizer_scheduler_and_policy_update():
+    policy = _PolicyWithSkippingOptimizerStep()
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=0.1)
+    policy.weight.grad = torch.tensor(1.0)
+    optimizer.step()
+    optimizer.zero_grad()
+    parameter_before = policy.weight.detach().clone()
+    state_before = {
+        key: value.detach().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in optimizer.state[policy.weight].items()
+    }
+    scheduler = _CountingScheduler()
+    accelerator = _FakeAccelerator()
+    accelerator.scaler = _CountingGradScaler()
+    train_metrics = SimpleNamespace()
+
+    _, output_dict = update_policy(
+        train_metrics=train_metrics,
+        policy=policy,
+        batch=torch.tensor(2.0),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=accelerator,
+        lr_scheduler=scheduler,
+    )
+
+    torch.testing.assert_close(policy.weight, parameter_before)
+    for key, value_before in state_before.items():
+        value_after = optimizer.state[policy.weight][key]
+        if isinstance(value_before, torch.Tensor):
+            torch.testing.assert_close(value_after, value_before)
+        else:
+            assert value_after == value_before
+    assert policy.weight.grad is None
+    assert scheduler.step_calls == 0
+    assert accelerator.scaler.update_calls == 1
+    assert policy.update_calls == 0
+    assert output_dict == {"optimizer_step/skipped": 1.0}
+
+
+def test_update_policy_skips_before_controller_when_training_gradient_is_nonfinite():
+    policy = _PolicyWithOptimizerStepControl()
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=0.1)
+    scheduler = _CountingScheduler()
+    accelerator = _FakeAccelerator()
+    train_metrics = SimpleNamespace()
+
+    _, output_dict = update_policy(
+        train_metrics=train_metrics,
+        policy=policy,
+        batch=torch.tensor(float("inf")),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=accelerator,
+        lr_scheduler=scheduler,
+    )
+
+    assert policy.control_calls == 0
+    assert policy.vlm_weight.item() == pytest.approx(0.0)
+    assert policy.action_weight.item() == pytest.approx(0.0)
+    assert optimizer.state == {}
+    assert scheduler.step_calls == 0
+    assert output_dict["optimizer_step/skipped"] == 1.0
+    assert output_dict["optimizer_step/nonfinite_gradients"] == 1.0
+
+
+def test_update_policy_skips_nonfinite_gradient_without_controller_hook():
+    policy = _PolicyWithoutCustomGradientClipping()
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=0.1)
+    scheduler = _CountingScheduler()
+    accelerator = _FakeAccelerator()
+    train_metrics = SimpleNamespace()
+
+    _, output_dict = update_policy(
+        train_metrics=train_metrics,
+        policy=policy,
+        batch=torch.tensor(float("inf")),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=accelerator,
+        lr_scheduler=scheduler,
+    )
+
+    assert policy.weight.item() == pytest.approx(0.0)
+    assert policy.weight.grad is None
+    assert optimizer.state == {}
+    assert scheduler.step_calls == 0
+    assert output_dict["optimizer_step/skipped"] == 1.0
+    assert output_dict["optimizer_step/nonfinite_gradients"] == 1.0

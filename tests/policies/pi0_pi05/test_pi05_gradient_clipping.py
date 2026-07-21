@@ -22,6 +22,8 @@ from torch import nn
 
 pytest.importorskip("transformers")
 
+from lerobot.configs.default import DatasetConfig  # noqa: E402
+from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
 from lerobot.policies.pi05 import PI05Config, PI05Policy  # noqa: E402
 
 
@@ -143,6 +145,21 @@ def test_pi05_rejects_invalid_cabo_negative_cross_discount(cabo_negative_cross_d
 def test_pi05_rejects_cabo_with_expert_only_training():
     with pytest.raises(ValueError, match="train_expert_only"):
         PI05Config(cabo_enabled=True, train_expert_only=True)
+
+
+def test_pi05_cabo_requires_policy_training_preset(tmp_path):
+    policy_config = PI05Config(cabo_enabled=True, push_to_hub=False)
+    config = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo"),
+        policy=policy_config,
+        output_dir=tmp_path / "new-output",
+        use_policy_training_preset=False,
+        optimizer=policy_config.get_optimizer_preset(),
+        scheduler=policy_config.get_scheduler_preset(),
+    )
+
+    with pytest.raises(ValueError, match="use_policy_training_preset"):
+        config.validate()
 
 
 def test_pi05_cabo_disables_gradient_clipping_hook():

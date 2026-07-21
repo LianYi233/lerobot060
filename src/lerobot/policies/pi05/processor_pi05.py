@@ -26,6 +26,7 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    EnvTransition,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
@@ -33,16 +34,15 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
+    TransitionKey,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-from lerobot.utils.constants import OBS_STATE
 
 # lerobot-train \
 #     --dataset.repo_id=libero /media/wyn/data/10-EmbodiedAI/dataset/Gay-LIBERO_v3.0/libero_10_no_noops_1.0.0_lerobot_v3.0
@@ -56,7 +56,6 @@ from lerobot.utils.constants import OBS_STATE
 #     --steps=3000 \
 #     --policy.device=cuda \
 #     --batch_size=32
-
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")

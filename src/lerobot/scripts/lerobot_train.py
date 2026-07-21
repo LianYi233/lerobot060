@@ -54,7 +54,7 @@ from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
-from lerobot.optim.cabo import temporary_optimizer_group_lr_scales
+from lerobot.optim.cabo import OptimizerStepControl, temporary_optimizer_group_lr_scales
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
@@ -76,13 +76,17 @@ from .lerobot_eval import eval_policy_all
 @torch.no_grad()
 def _get_gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> torch.Tensor:
     """Return the total L2 norm without modifying any gradients."""
-    gradient_norms = [
-        torch.linalg.vector_norm(parameter.grad.detach(), ord=2, dtype=torch.float32)
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
+    gradient_norms = []
+    parameter_device = None
+    for parameter in parameters:
+        if parameter_device is None:
+            parameter_device = parameter.device
+        if parameter.grad is not None:
+            gradient_norms.append(
+                torch.linalg.vector_norm(parameter.grad.detach(), ord=2, dtype=torch.float32)
+            )
     if not gradient_norms:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=parameter_device)
     return torch.stack(gradient_norms).norm(2)
 
 
@@ -119,23 +123,42 @@ def _prepare_policy_optimizer_step_control(
     batch: Any,
     optimizer: Optimizer,
     accelerator: "Accelerator",
-) -> tuple[dict[str, float], dict[str, float]]:
+    grad_norm: torch.Tensor,
+) -> OptimizerStepControl:
     """Ask a policy for post-preconditioner optimizer-group scales, if it provides a controller."""
+    gradients_finite = torch.isfinite(grad_norm).to(dtype=torch.int64)
+    num_processes = int(getattr(accelerator, "num_processes", 1))
+    if num_processes > 1:
+        gradients_finite = accelerator.reduce(gradients_finite, reduction="sum")
+    if int(gradients_finite.item()) != num_processes:
+        return OptimizerStepControl(
+            metrics={
+                "optimizer_step/skipped": 1.0,
+                "optimizer_step/nonfinite_gradients": 1.0,
+            },
+            skip_optimizer_step=True,
+        )
+
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
     if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
-        return {}, {}
+        return OptimizerStepControl()
 
     # The main backward pass has already synchronized DDP gradients. CABO's probe gradients are
     # local Jacobian-vector products and are reduced explicitly as two scalars, so suppress a second
     # full gradient synchronization here.
     no_sync = accelerator.no_sync(policy) if has_method(accelerator, "no_sync") else nullcontext()
     with no_sync:
-        group_scales, metrics = unwrapped_policy.compute_optimizer_step_control(
+        result = unwrapped_policy.compute_optimizer_step_control(
             batch=batch,
             optimizer=optimizer,
             accelerator=accelerator,
         )
-    return group_scales or {}, metrics or {}
+    if isinstance(result, OptimizerStepControl):
+        return result
+
+    # Backward compatibility for external policies using the original undocumented two-tuple hook.
+    group_scales, metrics = result
+    return OptimizerStepControl(group_scales=group_scales or {}, metrics=metrics or {})
 
 
 def update_policy(
@@ -221,32 +244,43 @@ def update_policy(
             output_dict = {}
         output_dict.update(clip_metrics)
 
-    optimizer_group_scales, optimizer_control_metrics = _prepare_policy_optimizer_step_control(
+    optimizer_step_control = _prepare_policy_optimizer_step_control(
         policy=policy,
         batch=batch,
         optimizer=optimizer,
         accelerator=accelerator,
+        grad_norm=grad_norm,
     )
-    if optimizer_control_metrics:
+    if optimizer_step_control.metrics:
         if output_dict is None:
             output_dict = {}
-        output_dict.update(optimizer_control_metrics)
+        output_dict.update(optimizer_step_control.metrics)
 
-    # Optimizer step
-    with (
-        lock if lock is not None else nullcontext(),
-        temporary_optimizer_group_lr_scales(optimizer, optimizer_group_scales),
-    ):
-        optimizer.step()
+    if not optimizer_step_control.skip_optimizer_step:
+        # Optimizer step
+        with (
+            lock if lock is not None else nullcontext(),
+            temporary_optimizer_group_lr_scales(optimizer, optimizer_step_control.group_scales),
+        ):
+            optimizer.step()
+    else:
+        # FP16 unscaling creates per-optimizer GradScaler state that is normally finalized by
+        # AcceleratedOptimizer.step(). The controller deliberately skips that call, so finalize the
+        # scaler explicitly; otherwise the next iteration's unscale_ reports that it was already called.
+        scaler = getattr(accelerator, "scaler", None)
+        if scaler is not None:
+            scaler.update()
 
     optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and not optimizer_step_control.skip_optimizer_step:
         lr_scheduler.step()
 
     # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+    if not optimizer_step_control.skip_optimizer_step and has_method(
+        accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
+    ):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     train_metrics.loss = loss.item()
@@ -491,6 +525,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     "weights, or resume a checkpoint that was already trained with CABO."
                 ) from exc
             raise
+
+    if has_method(policy, "validate_optimizer_step_control"):
+        policy.validate_optimizer_step_control(optimizer)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())

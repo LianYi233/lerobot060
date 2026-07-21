@@ -51,10 +51,12 @@ from lerobot.optim.cabo import (
     CABO_ACTION_GROUP,
     CABO_GROUP_NAME,
     CABO_VLM_GROUP,
+    OptimizerStepControl,
     candidate_update_projection,
     get_named_param_group,
     require_adamw,
     update_cabo_budget,
+    validate_adamw_param_group,
 )
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
@@ -1224,37 +1226,78 @@ class PI05Policy(PreTrainedPolicy):
             {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP},
         ]
 
+    def validate_optimizer_step_control(self, optimizer) -> None:
+        """Validate CABO's optimizer contract before the first training backward pass."""
+        if not self.config.cabo_enabled:
+            return
+
+        adamw = require_adamw(optimizer)
+        if len(adamw.param_groups) != 2:
+            raise ValueError(
+                f"CABO requires exactly two named AdamW parameter groups, got {len(adamw.param_groups)}"
+            )
+        expected_vlm, expected_action = self._cabo_parameter_groups()
+        expected_groups = {
+            CABO_VLM_GROUP: {id(parameter) for parameter in expected_vlm},
+            CABO_ACTION_GROUP: {id(parameter) for parameter in expected_action},
+        }
+        for name, expected_ids in expected_groups.items():
+            group = get_named_param_group(adamw, name)
+            # torch AdamW may automatically select foreach on CUDA when this is left as None. CABO's
+            # candidate simulator follows the single-tensor implementation, so make that execution
+            # path explicit before the first optimizer step.
+            if group.get("foreach") is None:
+                group["foreach"] = False
+            if group.get("fused") is None:
+                group["fused"] = False
+            validate_adamw_param_group(group)
+            actual_parameters = list(group["params"])
+            actual_ids = {id(parameter) for parameter in actual_parameters}
+            if len(actual_ids) != len(actual_parameters) or actual_ids != expected_ids:
+                raise ValueError(
+                    f"CABO optimizer group {name!r} does not match PI0.5's parameter partition: "
+                    f"expected={len(expected_ids)}, actual={len(actual_ids)}"
+                )
+
+        all_optimizer_parameters = [
+            parameter for group in adamw.param_groups for parameter in group["params"]
+        ]
+        all_optimizer_ids = {id(parameter) for parameter in all_optimizer_parameters}
+        expected_all_ids = expected_groups[CABO_VLM_GROUP] | expected_groups[CABO_ACTION_GROUP]
+        if len(all_optimizer_ids) != len(all_optimizer_parameters) or all_optimizer_ids != expected_all_ids:
+            raise ValueError(
+                "CABO optimizer parameter groups must cover every trainable PI0.5 parameter exactly once"
+            )
+
     def _cabo_probe_velocity(
         self,
         batch: dict[str, Tensor],
         *,
         step: int,
         process_index: int = 0,
-    ) -> Tensor | None:
+    ) -> tuple[Tensor | None, int]:
         batch_size = batch[ACTION].shape[0]
+        action_horizon = batch[ACTION].shape[1]
         action_padding = batch.get(f"{ACTION}_is_pad")
         if isinstance(action_padding, Tensor):
-            valid_rows = ~action_padding.to(dtype=torch.bool).reshape(batch_size, -1).any(dim=1)
-            selected_indices = torch.nonzero(valid_rows, as_tuple=False).flatten()
+            if action_padding.numel() % (batch_size * action_horizon) != 0:
+                raise ValueError(
+                    f"{ACTION}_is_pad must align with the action horizon; "
+                    f"got action shape={tuple(batch[ACTION].shape)}, "
+                    f"padding shape={tuple(action_padding.shape)}"
+                )
+            padded_steps = (
+                action_padding.to(device=batch[ACTION].device, dtype=torch.bool)
+                .reshape(batch_size, action_horizon, -1)
+                .any(dim=-1)
+            )
         else:
-            selected_indices = torch.arange(batch_size, device=batch[ACTION].device)
+            padded_steps = torch.zeros(
+                (batch_size, action_horizon), dtype=torch.bool, device=batch[ACTION].device
+            )
+        valid_steps = ~padded_steps
 
-        selected_indices = selected_indices[: self.config.cabo_probe_batch_size]
-        if selected_indices.numel() == 0:
-            return None
-
-        probe_batch = {
-            key: value.index_select(0, selected_indices.to(device=value.device))
-            if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
-            else value
-            for key, value in batch.items()
-        }
-        images, img_masks = self._preprocess_images(probe_batch)
-        tokens = probe_batch[f"{OBS_LANGUAGE_TOKENS}"]
-        masks = probe_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        actions = self.prepare_action(probe_batch)
-
-        device = actions.device
+        device = batch[ACTION].device
         fork_devices = []
         if device.type == "cuda":
             fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
@@ -1266,6 +1309,24 @@ class PI05Policy(PreTrainedPolicy):
             torch.manual_seed(probe_seed)
             if device.type == "cuda":
                 torch.cuda.manual_seed(probe_seed)
+
+            candidate_indices = torch.nonzero(valid_steps.any(dim=1), as_tuple=False).flatten()
+            if candidate_indices.numel() == 0:
+                return None, 0
+            permutation = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)
+            selected_indices = candidate_indices[permutation[: self.config.cabo_probe_batch_size]]
+            selected_valid_steps = valid_steps.index_select(0, selected_indices)
+
+            probe_batch = {
+                key: value.index_select(0, selected_indices.to(device=value.device))
+                if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
+                else value
+                for key, value in batch.items()
+            }
+            images, img_masks = self._preprocess_images(probe_batch)
+            tokens = probe_batch[f"{OBS_LANGUAGE_TOKENS}"]
+            masks = probe_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+            actions = self.prepare_action(probe_batch)
             noise = self.model.sample_noise(actions.shape, device)
             sample_time = self.model.sample_time(actions.shape[0], device)
             expanded_time = sample_time[:, None, None]
@@ -1274,6 +1335,10 @@ class PI05Policy(PreTrainedPolicy):
 
             original_action_dim = self.config.output_features[ACTION].shape[0]
             velocity = velocity[:, :, :original_action_dim]
+            valid_outputs = selected_valid_steps[:, :, None].expand_as(velocity)
+            valid_output_elements = int(valid_outputs.sum().item())
+            if valid_output_elements == 0:
+                return None, 0
             projections = (
                 torch.empty(
                     (self.config.cabo_num_projections, *velocity.shape),
@@ -1284,19 +1349,22 @@ class PI05Policy(PreTrainedPolicy):
                 .mul_(2.0)
                 .sub_(1.0)
             )
-        return torch.sum(
-            velocity.unsqueeze(0) * projections, dim=tuple(range(1, projections.ndim))
-        ) / math.sqrt(velocity.numel())
+        projected_velocity = velocity.unsqueeze(0) * projections
+        projected_velocity = projected_velocity * valid_outputs.unsqueeze(0)
+        probe_scalars = torch.sum(projected_velocity, dim=tuple(range(1, projections.ndim))) / math.sqrt(
+            valid_output_elements
+        )
+        return probe_scalars, valid_output_elements
 
     def compute_optimizer_step_control(
         self,
         batch: dict[str, Tensor],
         optimizer,
         accelerator,
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> OptimizerStepControl:
         """Estimate counterfactual action-space drift and return named optimizer group scales."""
         if not self.config.cabo_enabled:
-            return {}, {}
+            return OptimizerStepControl()
 
         adamw = require_adamw(optimizer)
         vlm_group = get_named_param_group(adamw, CABO_VLM_GROUP)
@@ -1306,47 +1374,52 @@ class PI05Policy(PreTrainedPolicy):
 
         if step % self.config.cabo_probe_interval != 0:
             action_group["cabo_step"] = step + 1
-            return {CABO_ACTION_GROUP: action_scale}, {
-                "cabo/action_scale": action_scale,
-                "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
-                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                "cabo/probe_applied": 0.0,
-            }
+            return OptimizerStepControl(
+                group_scales={CABO_ACTION_GROUP: action_scale},
+                metrics={
+                    "cabo/action_scale": action_scale,
+                    "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
+                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                    "cabo/probe_applied": 0.0,
+                },
+            )
 
         device = batch[ACTION].device
         process_index = int(getattr(accelerator, "process_index", 0))
         with torch.enable_grad(), accelerator.autocast():
-            probe_scalars = self._cabo_probe_velocity(batch, step=step, process_index=process_index)
+            probe_scalars, local_valid_elements = self._cabo_probe_velocity(
+                batch, step=step, process_index=process_index
+            )
 
-        if probe_scalars is None:
-            action_group["cabo_step"] = step + 1
-            return {CABO_ACTION_GROUP: action_scale}, {
-                "cabo/action_scale": action_scale,
-                "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
-                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                "cabo/probe_applied": 0.0,
-                "cabo/probe_skipped_padding": 1.0,
-            }
-
-        probe_scalars = probe_scalars.reshape(-1)
-        projection_values = torch.zeros((probe_scalars.numel(), 2), dtype=torch.float32, device=device)
+        projection_values = torch.zeros(
+            (self.config.cabo_num_projections, 2), dtype=torch.float32, device=device
+        )
         group_indices = {CABO_VLM_GROUP: 0, CABO_ACTION_GROUP: 1}
         projection_index = 0
         handles = []
+        parameters_without_training_grad = []
 
         def register_group_hooks(group_name: str, param_group: dict) -> None:
             for parameter in param_group["params"]:
-                if parameter.grad is None or not parameter.requires_grad:
+                if not parameter.requires_grad:
                     continue
+                if parameter.grad is None:
+                    parameters_without_training_grad.append(parameter)
 
-                def accumulate_projection(probe_gradient, *, parameter=parameter, group=param_group):
+                def accumulate_projection(
+                    probe_gradient,
+                    *,
+                    parameter=parameter,
+                    group=param_group,
+                    group_index=group_indices[group_name],
+                ):
                     contribution = candidate_update_projection(
                         probe_gradient,
                         parameter,
                         group,
                         adamw.state.get(parameter, {}),
                     )
-                    projection_values[projection_index, group_indices[group_name]].add_(
+                    projection_values[projection_index, group_index].add_(
                         contribution.to(dtype=torch.float32)
                     )
                     # Preserve the already-computed training gradient exactly. Returning zero makes
@@ -1355,23 +1428,53 @@ class PI05Policy(PreTrainedPolicy):
 
                 handles.append(parameter.register_hook(accumulate_projection))
 
-        register_group_hooks(CABO_VLM_GROUP, vlm_group)
-        register_group_hooks(CABO_ACTION_GROUP, action_group)
-        try:
-            for projection_index, probe_scalar in enumerate(probe_scalars):
-                probe_scalar.backward(retain_graph=projection_index + 1 < probe_scalars.numel())
-        finally:
-            for handle in handles:
-                handle.remove()
+        if probe_scalars is not None:
+            probe_scalars = probe_scalars.reshape(-1)
+            register_group_hooks(CABO_VLM_GROUP, vlm_group)
+            register_group_hooks(CABO_ACTION_GROUP, action_group)
+            try:
+                for projection_index, probe_scalar in enumerate(probe_scalars):
+                    probe_scalar.backward(retain_graph=projection_index + 1 < probe_scalars.numel())
+            finally:
+                for handle in handles:
+                    handle.remove()
+                # A zero-returning leaf hook prevents the probe value from being accumulated, but
+                # AccumulateGrad still materializes a zero ``.grad`` tensor. Restore the exact main
+                # backward state so AdamW continues to skip parameters that had no training gradient.
+                for parameter in parameters_without_training_grad:
+                    parameter.grad = None
 
-        probe_moments = torch.stack(
+        local_probe_moments = torch.stack(
             [
                 projection_values[:, 0].square().mean(),
                 projection_values[:, 1].square().mean(),
                 (projection_values[:, 0] * projection_values[:, 1]).mean(),
             ]
         )
-        probe_moments = accelerator.reduce(probe_moments, reduction="mean")
+        weighted_probe_statistics = torch.cat(
+            [
+                local_probe_moments * float(local_valid_elements),
+                torch.tensor([float(local_valid_elements)], dtype=torch.float32, device=device),
+            ]
+        )
+        weighted_probe_statistics = accelerator.reduce(weighted_probe_statistics, reduction="sum")
+        global_valid_elements = float(weighted_probe_statistics[3].item())
+        if global_valid_elements <= 0.0:
+            # Keep the controller step unchanged so the next batch retries the scheduled probe.
+            return OptimizerStepControl(
+                group_scales={CABO_ACTION_GROUP: action_scale},
+                metrics={
+                    "cabo/action_scale": action_scale,
+                    "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
+                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                    "cabo/probe_applied": 0.0,
+                    "cabo/probe_skipped_padding": 1.0,
+                    "cabo/probe_valid_elements": 0.0,
+                    "cabo/probe_retry_next_step": 1.0,
+                },
+            )
+
+        probe_moments = weighted_probe_statistics[:3] / global_valid_elements
         vlm_drift, action_drift, cross_drift = (float(value.item()) for value in probe_moments)
         action_scale, metrics = update_cabo_budget(
             action_group,
@@ -1386,16 +1489,34 @@ class PI05Policy(PreTrainedPolicy):
             budget_decay=self.config.cabo_budget_decay,
             budget_cap_windows=self.config.cabo_budget_cap_windows,
         )
+        if metrics["cabo/probe_nonfinite"]:
+            metrics.update(
+                {
+                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                    "cabo/probe_applied": 1.0,
+                    "cabo/probe_skipped_padding": 0.0,
+                    "cabo/probe_valid_elements": global_valid_elements,
+                    "cabo/num_projections": float(self.config.cabo_num_projections),
+                    "optimizer_step/skipped": 1.0,
+                    "optimizer_step/nonfinite_probe": 1.0,
+                }
+            )
+            return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
+
         action_group["cabo_step"] = step + 1
         metrics.update(
             {
                 "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
                 "cabo/probe_applied": 1.0,
                 "cabo/probe_skipped_padding": 0.0,
-                "cabo/num_projections": float(probe_scalars.numel()),
+                "cabo/probe_valid_elements": global_valid_elements,
+                "cabo/num_projections": float(self.config.cabo_num_projections),
             }
         )
-        return {CABO_ACTION_GROUP: action_scale}, metrics
+        return OptimizerStepControl(
+            group_scales={CABO_ACTION_GROUP: action_scale},
+            metrics=metrics,
+        )
 
     @torch.no_grad()
     def clip_gradients(self, accelerator=None) -> dict[str, float]:

@@ -98,16 +98,17 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = True
     action_head_grad_clip_ratio: float = 10.0
 
-    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the joint
+    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the linearized
     # flow-velocity drift of the next VLM and action-side AdamW updates, including their cross term,
-    # then scales only the action-side optimizer step to stay inside a leaky functional budget.
+    # then scales only the action-side optimizer step using a leaky budget relative to VLM drift.
     cabo_enabled: bool = False
     cabo_action_drift_ratio: float = 0.1
     cabo_probe_interval: int = 8
     cabo_probe_batch_size: int = 1
     cabo_num_projections: int = 4
     # Dimensionless action-only allowance. When VLM drift is zero, this grants approximately this
-    # fraction of the full candidate action step instead of starving the action side completely.
+    # fraction of the full candidate action step instead of starving the action side completely. A
+    # positive value deliberately relaxes the pure relative-drift bound.
     cabo_base_action_scale: float = 0.1
     # Positive cross drift is charged fully. Negative (cancelling) cross drift receives only this
     # fraction of its measured credit to avoid trusting noisy cancellation estimates too strongly.

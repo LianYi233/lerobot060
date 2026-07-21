@@ -252,6 +252,12 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
+        if getattr(active_cfg, "cabo_enabled", False) and not self.use_policy_training_preset:
+            raise ValueError(
+                "PI0.5 CABO requires use_policy_training_preset=True so its named VLM/action "
+                "optimizer parameter groups are constructed correctly."
+            )
+
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
 

@@ -19,6 +19,7 @@
 import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -28,6 +29,19 @@ from torch.optim import AdamW, Optimizer
 CABO_VLM_GROUP = "vlm"
 CABO_ACTION_GROUP = "action"
 CABO_GROUP_NAME = "name"
+
+
+@dataclass
+class OptimizerStepControl:
+    """Policy-provided controls for one optimizer step.
+
+    ``skip_optimizer_step`` is deliberately separate from setting a learning rate to zero: AdamW
+    still advances its moments and step counter when its learning rate is zero.
+    """
+
+    group_scales: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
+    skip_optimizer_step: bool = False
 
 
 def unwrap_optimizer(optimizer: Optimizer) -> Optimizer:
@@ -66,6 +80,18 @@ def get_named_param_group(optimizer: Optimizer, name: str) -> dict[str, Any]:
     return matches[0]
 
 
+def validate_adamw_param_group(param_group: Mapping[str, Any]) -> None:
+    """Reject AdamW execution modes that the native-dtype CABO simulator cannot reproduce."""
+    unsupported_modes = [
+        name
+        for name in ("differentiable", "fused", "capturable", "foreach")
+        if bool(param_group.get(name, False))
+    ]
+    if unsupported_modes:
+        modes = ", ".join(unsupported_modes)
+        raise RuntimeError(f"CABO does not support these AdamW modes: {modes}")
+
+
 @torch.no_grad()
 def adamw_candidate_parameter_delta(
     parameter: nn.Parameter,
@@ -75,7 +101,10 @@ def adamw_candidate_parameter_delta(
     """Compute the next AdamW parameter delta without mutating parameters or optimizer state.
 
     The result includes decoupled weight decay and is evaluated at the group's current, unscaled
-    learning rate. Scaling that learning rate by ``s`` therefore scales this complete delta by ``s``.
+    learning rate. Optimizer-state math and the candidate parameter write use their native dtypes,
+    so bf16/fp16 quantization is represented at scale 1. CABO still treats learning-rate scaling as
+    linear after this point; parameter quantization means that approximation is not exact for scales
+    other than 1.
     """
     gradient = parameter.grad
     if gradient is None:
@@ -84,8 +113,7 @@ def adamw_candidate_parameter_delta(
         raise RuntimeError("CABO does not support sparse AdamW gradients")
     if torch.is_complex(parameter) or torch.is_complex(gradient):
         raise RuntimeError("CABO does not support complex AdamW parameters")
-    if param_group.get("differentiable", False):
-        raise RuntimeError("CABO does not support differentiable AdamW steps")
+    validate_adamw_param_group(param_group)
 
     beta1, beta2 = param_group["betas"]
     eps = float(param_group["eps"])
@@ -94,22 +122,24 @@ def adamw_candidate_parameter_delta(
     maximize = bool(param_group.get("maximize", False))
     amsgrad = bool(param_group.get("amsgrad", False))
 
-    # Accumulate the estimator in float32 for fp16/bf16 parameters. Keeping float64 parameters in
-    # float64 makes the helper precise enough for optimizer-equivalence tests.
-    compute_dtype = torch.float64 if parameter.dtype == torch.float64 else torch.float32
-    grad = gradient.detach().to(dtype=compute_dtype)
+    grad = gradient.detach()
     if maximize:
         grad = -grad
 
     exp_avg = state.get("exp_avg")
     exp_avg_sq = state.get("exp_avg_sq")
-    exp_avg_value = torch.zeros_like(grad) if exp_avg is None else exp_avg.detach().to(dtype=compute_dtype)
-    exp_avg_sq_value = (
-        torch.zeros_like(grad) if exp_avg_sq is None else exp_avg_sq.detach().to(dtype=compute_dtype)
-    )
+    next_exp_avg = torch.zeros_like(parameter) if exp_avg is None else exp_avg.detach().clone()
+    next_exp_avg_sq = torch.zeros_like(parameter) if exp_avg_sq is None else exp_avg_sq.detach().clone()
+    if grad.dtype != next_exp_avg.dtype:
+        raise RuntimeError(
+            "CABO requires AdamW gradients and optimizer moments to share a dtype, "
+            f"got gradient={grad.dtype}, exp_avg={next_exp_avg.dtype}"
+        )
 
-    next_exp_avg = exp_avg_value.mul(beta1).add(grad, alpha=1.0 - beta1)
-    next_exp_avg_sq = exp_avg_sq_value.mul(beta2).addcmul(grad, grad, value=1.0 - beta2)
+    # Match torch AdamW's native-dtype single-tensor update, including its use of lerp for the first
+    # moment. This matters for bf16/fp16 rounding.
+    next_exp_avg.lerp_(grad, 1.0 - beta1)
+    next_exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
     raw_step = state.get("step", 0)
     current_step = int(raw_step.item()) if isinstance(raw_step, Tensor) else int(raw_step)
@@ -120,13 +150,21 @@ def adamw_candidate_parameter_delta(
     variance = next_exp_avg_sq
     if amsgrad:
         max_exp_avg_sq = state.get("max_exp_avg_sq")
-        if max_exp_avg_sq is not None:
-            variance = torch.maximum(max_exp_avg_sq.detach().to(dtype=compute_dtype), variance)
+        previous_max = (
+            torch.zeros_like(parameter) if max_exp_avg_sq is None else max_exp_avg_sq.detach().clone()
+        )
+        variance = torch.maximum(previous_max, variance)
 
-    denominator = variance.sqrt().div(math.sqrt(bias_correction2)).add(eps)
-    adaptive_update = next_exp_avg.div(bias_correction1).div(denominator)
-    delta = adaptive_update.add(parameter.detach().to(dtype=compute_dtype), alpha=weight_decay)
-    return delta.mul(-learning_rate)
+    denominator = variance.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+    candidate = parameter.detach().clone()
+    candidate.mul_(1.0 - learning_rate * weight_decay)
+    candidate.addcdiv_(next_exp_avg, denominator, value=-learning_rate / bias_correction1)
+
+    # The candidate has already been quantized by the native-dtype parameter write. Subtract its
+    # representable value from the old representable value in a wider dtype so the returned delta
+    # does not undergo an additional low-precision rounding.
+    result_dtype = torch.float64 if parameter.dtype == torch.float64 else torch.float32
+    return candidate.to(dtype=result_dtype).sub(parameter.detach().to(dtype=result_dtype))
 
 
 def candidate_update_projection(
@@ -163,20 +201,24 @@ def update_cabo_budget(
 
         mean(||dv + s * da||^2) = Dv + 2 * s * Cva + s^2 * Da.
 
-    The relative allowance preserves the old worst-case guarantee that total RMS drift is at most
-    ``1 + action_drift_ratio`` times the VLM-only RMS drift, but uses the measured cross term instead
-    of assuming that both updates are perfectly aligned. ``base_action_scale`` additionally grants
+    With ``base_action_scale=0``, the relative allowance preserves the old linearized worst-case
+    guarantee that total RMS drift is at most ``1 + action_drift_ratio`` times the VLM-only RMS
+    drift, but uses the measured cross term instead of assuming that both updates are perfectly
+    aligned. A positive ``base_action_scale`` deliberately relaxes that relative bound by granting
     an action-only allowance of ``base_action_scale^2 * Da`` so a stationary VLM cannot starve the
     action side completely.
     """
     finite = math.isfinite(vlm_drift) and math.isfinite(action_drift) and math.isfinite(cross_drift)
     if not finite or vlm_drift < 0.0 or action_drift < 0.0:
-        action_group["cabo_action_scale"] = 0.0
-        return 0.0, {
+        # Do not mutate controller state. The caller must skip the complete optimizer step; setting
+        # only the action learning rate to zero would still advance AdamW state and leave the VLM
+        # update unprotected.
+        previous_scale = float(action_group.get("cabo_action_scale", 1.0))
+        return previous_scale, {
             "cabo/vlm_drift": vlm_drift,
             "cabo/action_drift": action_drift,
             "cabo/cross_drift": cross_drift,
-            "cabo/action_scale": 0.0,
+            "cabo/action_scale": previous_scale,
             "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
             "cabo/probe_nonfinite": 1.0,
         }

@@ -89,12 +89,12 @@ Gradient clipping is policy-specific. The action-side gradient RMS is capped at 
 gradient RMS, and only action-side gradients are rescaled when that cap is exceeded. VLM gradients
 are left unchanged, and global gradient clipping is disabled.
 
-PI0.5 also provides experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates
-how much the next VLM and action-side AdamW updates would jointly change the predicted flow velocity,
+PI0.5 also provides experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the
+linearized change in predicted flow velocity from the next VLM and action-side AdamW updates,
 including whether their functional changes align or cancel. It then scales only the action-side
-optimizer step to enforce a long-run functional-drift budget. A small action-only allowance prevents
-a stationary VLM from starving action learning. CABO replaces the action-gradient clipping hook when
-enabled:
+optimizer step using a leaky budget relative to VLM drift. A small action-only allowance prevents a
+stationary VLM from starving action learning, while deliberately relaxing the pure relative-drift
+bound. CABO replaces the action-gradient clipping hook when enabled:
 
 ```bash
 lerobot-train \
@@ -108,15 +108,26 @@ lerobot-train \
 ```
 
 CABO estimates the VLM drift `Dv`, full action drift `Da`, and cross drift `Cva` with multiple shared
-Rademacher projections. For action scale `s`, the linearized joint drift is
+Rademacher projections. For action scale `s`, its linearized joint-drift model is
 `Dv + 2 * s * Cva + s^2 * Da`. Positive cross drift is charged fully, while negative cross drift is
-discounted before it can grant cancellation credit. Probe samples containing padded action horizons
-are skipped rather than treating repeated terminal padding as a real trajectory.
+discounted before it can grant cancellation credit. Padded action timesteps are masked out of the
+probe and its normalization; partially padded trajectories still contribute their valid timesteps.
+Probe rows are sampled through a deterministic private RNG, so enabling CABO does not consume the
+training RNG stream.
 
-CABO currently supports single-device and DDP training, but not FSDP. It requires both the VLM and
-action side to be trainable, so it cannot be combined with `train_expert_only=true`. Because CABO
-uses two named optimizer parameter groups, enable it in a new run initialized from model weights;
-an older single-group optimizer checkpoint cannot be resumed directly with CABO enabled.
+The controller reuses its latest action scale between probes. Its guarantee is therefore relative,
+sampled, and first-order rather than a bound on the exact post-update network or final denoised action
+chunk. With bfloat16 parameters, CABO simulates native-dtype AdamW moments and the full-scale
+representable parameter write, but scaling that quantized update is still treated as linear.
+
+CABO currently supports single-device and DDP training, but not FSDP. In DDP, every rank participates
+in each scheduled probe collective, and statistics are weighted by the number of valid action output
+elements on that rank. It requires both the VLM and action side to be trainable, so it cannot be
+combined with `train_expert_only=true`. CABO also requires the policy training preset and its two
+named AdamW parameter groups. Enable it in a new run initialized from model weights; an older
+single-group optimizer checkpoint cannot be resumed directly with CABO enabled. A non-finite training
+gradient or probe causes all ranks to skip the complete optimizer and scheduler step without advancing
+the CABO budget.
 
 | Parameter                       | Default  | Description                                                |
 | ------------------------------- | -------- | ---------------------------------------------------------- |
@@ -126,11 +137,11 @@ an older single-group optimizer checkpoint cannot be resumed directly with CABO 
 | `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
 | `cabo_enabled`                  | `false`  | Enable counterfactual action-space update budgeting                |
-| `cabo_action_drift_ratio`       | `0.1`    | Relative increase allowed over VLM-only RMS drift                  |
+| `cabo_action_drift_ratio`       | `0.1`    | Relative linearized allowance over VLM-only RMS drift              |
 | `cabo_probe_interval`           | `8`      | Steps between CABO flow-velocity probes                            |
-| `cabo_probe_batch_size`         | `1`      | Per-rank non-padded samples used by each CABO probe                |
+| `cabo_probe_batch_size`         | `1`      | Per-rank rows with valid timesteps used by each CABO probe          |
 | `cabo_num_projections`          | `4`      | Shared random projections used to estimate drift and its cross term |
-| `cabo_base_action_scale`        | `0.1`    | Action-only allowance when VLM functional drift is zero            |
+| `cabo_base_action_scale`        | `0.1`    | Action-only allowance that relaxes the pure relative bound          |
 | `cabo_negative_cross_discount`  | `0.5`    | Fraction of measured cancellation credit trusted by the controller |
 | `freeze_vision_encoder`         | `false`  | Do not freeze the vision encoder                            |
 | `train_expert_only`             | `false`  | Do not freeze the VLM; train all parameters                 |
