@@ -90,11 +90,11 @@ gradient RMS, and only action-side gradients are rescaled when that cap is excee
 are left unchanged, and global gradient clipping is disabled.
 
 PI0.5 also provides experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the
-linearized change in predicted flow velocity from the next VLM and action-side AdamW updates,
-including whether their functional changes align or cancel. It then scales only the action-side
-optimizer step using a leaky budget relative to VLM drift. A small action-only allowance prevents a
-stationary VLM from starving action learning, while deliberately relaxing the pure relative-drift
-bound. CABO replaces the action-gradient clipping hook when enabled:
+linearized change in predicted flow velocity from the next VLM and action-side AdamW updates. Its
+default `budget` mode includes whether their functional changes align or cancel, then scales only the
+action-side optimizer step using a leaky budget relative to VLM drift. A small action-only allowance
+prevents a stationary VLM from starving action learning, while deliberately relaxing the pure
+relative-drift bound. CABO replaces the action-gradient clipping hook when enabled:
 
 ```bash
 lerobot-train \
@@ -107,6 +107,26 @@ lerobot-train \
     --policy.cabo_base_action_scale=0.1
 ```
 
+The optional `balance` mode ignores the direction of the two marginal functional changes and makes
+their RMS magnitudes equal. It applies reciprocal, log-symmetric multipliers: the weaker side is
+amplified while the stronger side is attenuated. For full-scale squared drifts `Dv` and `Da`, the
+VLM multiplier is `(Da / Dv)^(1/4)` and the action multiplier is its reciprocal. Amplification is
+bounded by `cabo_balance_max_scale`; exact equality is therefore approached rather than reached when
+one drift is zero or the required multiplier exceeds that bound. Probe every step for the strongest
+per-step constraint:
+
+```bash
+lerobot-train \
+    ... \
+    --policy.cabo_enabled=true \
+    --policy.cabo_control_mode=balance \
+    --policy.cabo_balance_max_scale=2.0 \
+    --policy.cabo_probe_interval=1 \
+    --policy.cabo_probe_batch_size=4 \
+    --policy.cabo_num_projections=16 \
+    --policy.cabo_drift_ema_decay=0.0
+```
+
 CABO estimates the VLM drift `Dv`, full action drift `Da`, and cross drift `Cva` with multiple shared
 Rademacher projections. For action scale `s`, its linearized joint-drift model is
 `Dv + 2 * s * Cva + s^2 * Da`. Positive cross drift is charged fully, while negative cross drift is
@@ -115,7 +135,7 @@ probe and its normalization; partially padded trajectories still contribute thei
 Probe rows are sampled through a deterministic private RNG, so enabling CABO does not consume the
 training RNG stream.
 
-The controller reuses its latest action scale between probes. Its guarantee is therefore relative,
+The controller reuses its latest scale or scales between probes. Its guarantee is therefore relative,
 sampled, and first-order rather than a bound on the exact post-update network or final denoised action
 chunk. With bfloat16 parameters, CABO simulates native-dtype AdamW moments and the full-scale
 representable parameter write, but scaling that quantized update is still treated as linear.
@@ -136,7 +156,9 @@ the CABO budget.
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
 | `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
-| `cabo_enabled`                  | `false`  | Enable counterfactual action-space update budgeting                |
+| `cabo_enabled`                  | `false`  | Enable counterfactual action-space update control                  |
+| `cabo_control_mode`             | `budget` | Use action budgeting (`budget`) or symmetric marginal balancing (`balance`) |
+| `cabo_balance_max_scale`        | `2.0`    | Maximum amplification in balance mode; minimum scale is its reciprocal     |
 | `cabo_action_drift_ratio`       | `0.1`    | Relative linearized allowance over VLM-only RMS drift              |
 | `cabo_probe_interval`           | `8`      | Steps between CABO flow-velocity probes                            |
 | `cabo_probe_batch_size`         | `1`      | Per-rank rows with valid timesteps used by each CABO probe          |

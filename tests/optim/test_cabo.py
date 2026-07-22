@@ -21,10 +21,12 @@ from torch import nn
 from lerobot.optim.cabo import (
     CABO_ACTION_GROUP,
     CABO_GROUP_NAME,
+    CABO_VLM_GROUP,
     adamw_candidate_parameter_delta,
     get_named_param_group,
     temporary_optimizer_group_lr_scales,
     update_cabo_budget,
+    update_cabo_influence_balance,
 )
 
 
@@ -76,6 +78,116 @@ def test_temporary_group_lr_scale_scales_complete_adamw_step_and_restores_lr():
 
     torch.testing.assert_close(parameter.detach() - before, full_delta * 0.25)
     assert group["lr"] == pytest.approx(0.1)
+
+
+def test_temporary_group_lr_scales_can_amplify_one_group_and_attenuate_another():
+    vlm_parameter = nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+    action_parameter = nn.Parameter(torch.tensor([3.0], dtype=torch.float64))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [vlm_parameter], CABO_GROUP_NAME: CABO_VLM_GROUP},
+            {"params": [action_parameter], CABO_GROUP_NAME: CABO_ACTION_GROUP},
+        ],
+        lr=0.1,
+        betas=(0.0, 0.0),
+        weight_decay=0.0,
+    )
+    vlm_parameter.grad = torch.tensor([1.0], dtype=torch.float64)
+    action_parameter.grad = torch.tensor([1.0], dtype=torch.float64)
+    vlm_before = vlm_parameter.detach().clone()
+    action_before = action_parameter.detach().clone()
+
+    with temporary_optimizer_group_lr_scales(
+        optimizer,
+        {CABO_VLM_GROUP: 2.0, CABO_ACTION_GROUP: 0.5},
+    ) as effective_lrs:
+        assert effective_lrs == pytest.approx({CABO_VLM_GROUP: 0.2, CABO_ACTION_GROUP: 0.05})
+        optimizer.step()
+
+    torch.testing.assert_close(
+        vlm_parameter.detach() - vlm_before,
+        torch.tensor([-0.2], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        action_parameter.detach() - action_before,
+        torch.tensor([-0.05], dtype=torch.float64),
+    )
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
+
+
+def test_cabo_influence_balance_symmetrically_equalizes_marginal_drift():
+    controller_group = {}
+
+    vlm_scale, action_scale, metrics = update_cabo_influence_balance(
+        controller_group,
+        vlm_drift=1.0,
+        action_drift=16.0,
+        cross_drift=-2.0,
+        ema_decay=0.0,
+        max_scale=4.0,
+    )
+
+    assert vlm_scale == pytest.approx(2.0)
+    assert action_scale == pytest.approx(0.5)
+    assert vlm_scale * action_scale == pytest.approx(1.0)
+    assert metrics["cabo/balanced_vlm_drift_ema"] == pytest.approx(4.0)
+    assert metrics["cabo/balanced_action_drift_ema"] == pytest.approx(4.0)
+    assert metrics["cabo/balanced_influence_ratio"] == pytest.approx(1.0)
+    assert metrics["cabo/balance_clamped"] == 0.0
+    assert controller_group["cabo_vlm_scale"] == pytest.approx(2.0)
+    assert controller_group["cabo_action_scale"] == pytest.approx(0.5)
+
+
+def test_cabo_influence_balance_is_symmetric_when_vlm_is_stronger():
+    vlm_scale, action_scale, metrics = update_cabo_influence_balance(
+        {},
+        vlm_drift=16.0,
+        action_drift=1.0,
+        cross_drift=0.0,
+        ema_decay=0.0,
+        max_scale=4.0,
+    )
+
+    assert vlm_scale == pytest.approx(0.5)
+    assert action_scale == pytest.approx(2.0)
+    assert metrics["cabo/balanced_vlm_drift_ema"] == pytest.approx(4.0)
+    assert metrics["cabo/balanced_action_drift_ema"] == pytest.approx(4.0)
+
+
+def test_cabo_influence_balance_caps_zero_drift_without_dividing_by_zero():
+    vlm_scale, action_scale, metrics = update_cabo_influence_balance(
+        {},
+        vlm_drift=0.0,
+        action_drift=9.0,
+        cross_drift=0.0,
+        ema_decay=0.0,
+        max_scale=2.0,
+    )
+
+    assert vlm_scale == pytest.approx(2.0)
+    assert action_scale == pytest.approx(0.5)
+    assert metrics["cabo/balance_clamped"] == 1.0
+    assert metrics["cabo/balanced_vlm_drift_ema"] == pytest.approx(0.0)
+    assert metrics["cabo/balanced_action_drift_ema"] == pytest.approx(2.25)
+
+
+def test_cabo_influence_balance_preserves_state_on_nonfinite_probe():
+    controller_group = {"cabo_vlm_scale": 2.0, "cabo_action_scale": 0.5}
+
+    vlm_scale, action_scale, metrics = update_cabo_influence_balance(
+        controller_group,
+        vlm_drift=float("nan"),
+        action_drift=1.0,
+        cross_drift=0.0,
+        ema_decay=0.0,
+        max_scale=2.0,
+    )
+
+    assert vlm_scale == 2.0
+    assert action_scale == 0.5
+    assert controller_group == {"cabo_vlm_scale": 2.0, "cabo_action_scale": 0.5}
+    assert metrics["cabo/probe_nonfinite"] == 1.0
 
 
 def test_cabo_budget_enforces_rms_drift_ratio_and_persists_state():

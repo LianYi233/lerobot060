@@ -101,6 +101,8 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
     assert not config.cabo_enabled
+    assert config.cabo_control_mode == "budget"
+    assert config.cabo_balance_max_scale == pytest.approx(2.0)
     assert config.cabo_action_drift_ratio == pytest.approx(0.1)
     assert config.cabo_probe_interval == 8
     assert config.cabo_probe_batch_size == 1
@@ -122,6 +124,20 @@ def test_pi05_rejects_invalid_action_head_grad_clip_ratio(action_head_grad_clip_
 def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: float):
     with pytest.raises(ValueError, match="cabo_action_drift_ratio"):
         PI05Config(cabo_action_drift_ratio=cabo_action_drift_ratio)
+
+
+def test_pi05_rejects_invalid_cabo_control_mode():
+    with pytest.raises(ValueError, match="cabo_control_mode"):
+        PI05Config(cabo_control_mode="unknown")
+
+
+@pytest.mark.parametrize(
+    "cabo_balance_max_scale",
+    [0.0, 0.5, float("nan"), float("inf"), float("-inf")],
+)
+def test_pi05_rejects_invalid_cabo_balance_max_scale(cabo_balance_max_scale: float):
+    with pytest.raises(ValueError, match="cabo_balance_max_scale"):
+        PI05Config(cabo_balance_max_scale=cabo_balance_max_scale)
 
 
 @pytest.mark.parametrize("cabo_num_projections", [0, 1, -1])

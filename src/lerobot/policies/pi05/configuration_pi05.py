@@ -16,6 +16,7 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -99,9 +100,13 @@ class PI05Config(PreTrainedConfig):
     action_head_grad_clip_ratio: float = 10.0
 
     # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the linearized
-    # flow-velocity drift of the next VLM and action-side AdamW updates, including their cross term,
-    # then scales only the action-side optimizer step using a leaky budget relative to VLM drift.
+    # flow-velocity drift of the next VLM and action-side AdamW updates. ``budget`` limits only the
+    # action-side update using a leaky joint-drift budget. ``balance`` ignores update direction and
+    # symmetrically amplifies the weaker marginal influence while attenuating the stronger one.
     cabo_enabled: bool = False
+    cabo_control_mode: Literal["budget", "balance"] = "budget"
+    # Maximum multiplier in balance mode; attenuation is bounded by its reciprocal.
+    cabo_balance_max_scale: float = 2.0
     cabo_action_drift_ratio: float = 0.1
     cabo_probe_interval: int = 8
     cabo_probe_batch_size: int = 1
@@ -149,6 +154,14 @@ class PI05Config(PreTrainedConfig):
                 f"action_head_grad_clip_ratio must be greater than 0, got {self.action_head_grad_clip_ratio}"
             )
 
+        if self.cabo_control_mode not in ("budget", "balance"):
+            raise ValueError(
+                f"cabo_control_mode must be 'budget' or 'balance', got {self.cabo_control_mode!r}"
+            )
+        if not math.isfinite(self.cabo_balance_max_scale) or self.cabo_balance_max_scale < 1.0:
+            raise ValueError(
+                f"cabo_balance_max_scale must be finite and at least 1, got {self.cabo_balance_max_scale}"
+            )
         if not 0.0 < self.cabo_action_drift_ratio <= 1.0:
             raise ValueError(f"cabo_action_drift_ratio must be in (0, 1], got {self.cabo_action_drift_ratio}")
         if self.cabo_probe_interval <= 0:

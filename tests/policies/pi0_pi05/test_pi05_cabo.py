@@ -56,6 +56,8 @@ class _TinyCABOPolicy(nn.Module):
         self.action_weight = nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
         self.config = SimpleNamespace(
             cabo_enabled=True,
+            cabo_control_mode="budget",
+            cabo_balance_max_scale=2.0,
             cabo_probe_interval=8,
             cabo_action_drift_ratio=0.1,
             cabo_num_projections=4,
@@ -213,6 +215,49 @@ def test_pi05_cabo_probe_preserves_training_gradients_and_reuses_scale():
 
     reused_control = policy.compute_optimizer_step_control(batch, optimizer, _FakeAccelerator())
     assert reused_control.group_scales == scales
+    assert reused_control.metrics["cabo/probe_applied"] == 0.0
+
+
+def test_pi05_cabo_balance_mode_scales_both_groups_and_reuses_scales():
+    policy = _TinyCABOPolicy()
+    policy.config.cabo_control_mode = "balance"
+    policy.config.cabo_balance_max_scale = 4.0
+    policy.config.cabo_drift_ema_decay = 0.0
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [policy.vlm_weight], "name": CABO_VLM_GROUP},
+            {"params": [policy.action_weight], "name": CABO_ACTION_GROUP},
+        ],
+        lr=0.1,
+        betas=(0.0, 0.0),
+        eps=1e-12,
+        weight_decay=0.0,
+    )
+    policy.vlm_weight.grad = torch.tensor(1.0, dtype=torch.float64)
+    policy.action_weight.grad = torch.tensor(1.0, dtype=torch.float64)
+    gradients_before = [parameter.grad.clone() for parameter in policy.parameters()]
+    batch = {ACTION: torch.ones(1, 1, 1)}
+
+    control = policy.compute_optimizer_step_control(batch, optimizer, _FakeAccelerator())
+
+    expected_vlm_scale = 2.0**0.5
+    expected_action_scale = 1.0 / expected_vlm_scale
+    assert control.group_scales == pytest.approx(
+        {
+            CABO_VLM_GROUP: expected_vlm_scale,
+            CABO_ACTION_GROUP: expected_action_scale,
+        }
+    )
+    assert control.metrics["cabo/balanced_vlm_drift_ema"] == pytest.approx(0.02)
+    assert control.metrics["cabo/balanced_action_drift_ema"] == pytest.approx(0.02)
+    assert control.metrics["cabo/balanced_influence_ratio"] == pytest.approx(1.0)
+    assert control.metrics["cabo/effective_vlm_lr"] == pytest.approx(0.1 * expected_vlm_scale)
+    assert control.metrics["cabo/effective_action_lr"] == pytest.approx(0.1 * expected_action_scale)
+    for parameter, gradient_before in zip(policy.parameters(), gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+    reused_control = policy.compute_optimizer_step_control(batch, optimizer, _FakeAccelerator())
+    assert reused_control.group_scales == pytest.approx(control.group_scales)
     assert reused_control.metrics["cabo/probe_applied"] == 0.0
 
 

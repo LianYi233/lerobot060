@@ -306,6 +306,128 @@ def update_cabo_budget(
     }
 
 
+def update_cabo_influence_balance(
+    controller_group: dict[str, Any],
+    *,
+    vlm_drift: float,
+    action_drift: float,
+    cross_drift: float,
+    ema_decay: float,
+    max_scale: float,
+) -> tuple[float, float, dict[str, float]]:
+    """Balance direction-agnostic VLM and action influence in action space.
+
+    ``vlm_drift`` and ``action_drift`` estimate the mean squared flow-velocity changes caused by
+    the next full AdamW update for each parameter group. Let ``sv`` and ``sa`` scale the VLM and
+    action updates. The log-symmetric scales
+
+        sv = (Da / Dv) ** 1/4
+        sa = (Dv / Da) ** 1/4
+
+    satisfy ``sv**2 * Dv == sa**2 * Da`` while preserving ``sv * sa == 1``. Thus the weaker group
+    is amplified by the reciprocal of the attenuation applied to the stronger group. The cross
+    drift is deliberately excluded from the controller because this mode balances marginal
+    magnitudes regardless of whether the two functional updates align or cancel; it is retained for
+    diagnostics and total-drift reporting.
+
+    ``max_scale`` bounds amplification and implies a reciprocal lower bound for attenuation. Exact
+    equality is impossible with a finite scale when either marginal drift is zero, so the controller
+    moves as far toward equality as this bound permits.
+    """
+    if not math.isfinite(max_scale) or max_scale < 1.0:
+        raise ValueError(f"CABO balance max_scale must be finite and at least 1, got {max_scale}")
+
+    finite = math.isfinite(vlm_drift) and math.isfinite(action_drift) and math.isfinite(cross_drift)
+    previous_vlm_scale = float(controller_group.get("cabo_vlm_scale", 1.0))
+    previous_action_scale = float(controller_group.get("cabo_action_scale", 1.0))
+    if not finite or vlm_drift < 0.0 or action_drift < 0.0:
+        return (
+            previous_vlm_scale,
+            previous_action_scale,
+            {
+                "cabo/vlm_drift": vlm_drift,
+                "cabo/action_drift": action_drift,
+                "cabo/cross_drift": cross_drift,
+                "cabo/vlm_scale": previous_vlm_scale,
+                "cabo/action_scale": previous_action_scale,
+                "cabo/probe_nonfinite": 1.0,
+            },
+        )
+
+    initialized = bool(controller_group.get("cabo_ema_initialized", False))
+    if initialized:
+        vlm_ema = ema_decay * float(controller_group["cabo_vlm_drift_ema"]) + (1.0 - ema_decay) * vlm_drift
+        action_ema = (
+            ema_decay * float(controller_group["cabo_action_drift_ema"]) + (1.0 - ema_decay) * action_drift
+        )
+        cross_ema = (
+            ema_decay * float(controller_group.get("cabo_cross_drift_ema", cross_drift))
+            + (1.0 - ema_decay) * cross_drift
+        )
+    else:
+        vlm_ema = vlm_drift
+        action_ema = action_drift
+        cross_ema = cross_drift
+
+    cross_limit = math.sqrt(max(vlm_ema * action_ema, 0.0))
+    cross_ema = min(max(cross_ema, -cross_limit), cross_limit)
+
+    max_log_scale = math.log(max_scale)
+    if vlm_ema == 0.0 and action_ema == 0.0:
+        raw_log_vlm_scale = 0.0
+    elif vlm_ema == 0.0:
+        raw_log_vlm_scale = math.inf
+    elif action_ema == 0.0:
+        raw_log_vlm_scale = -math.inf
+    else:
+        # One quarter appears because the measured drifts are squared influence magnitudes.
+        raw_log_vlm_scale = 0.25 * (math.log(action_ema) - math.log(vlm_ema))
+
+    log_vlm_scale = min(max(raw_log_vlm_scale, -max_log_scale), max_log_scale)
+    vlm_scale = math.exp(log_vlm_scale)
+    action_scale = math.exp(-log_vlm_scale)
+
+    balanced_vlm_drift = vlm_scale**2 * vlm_ema
+    balanced_action_drift = action_scale**2 * action_ema
+    tiny = torch.finfo(torch.float64).tiny
+    balanced_influence_ratio = math.sqrt((balanced_action_drift + tiny) / (balanced_vlm_drift + tiny))
+    total_drift_ema = balanced_vlm_drift + 2.0 * vlm_scale * action_scale * cross_ema + balanced_action_drift
+    cross_correlation = cross_ema / cross_limit if cross_limit > 0.0 else 0.0
+    balance_clamped = abs(raw_log_vlm_scale) > max_log_scale
+
+    controller_group.update(
+        {
+            "cabo_ema_initialized": True,
+            "cabo_vlm_drift_ema": vlm_ema,
+            "cabo_action_drift_ema": action_ema,
+            "cabo_cross_drift_ema": cross_ema,
+            "cabo_vlm_scale": vlm_scale,
+            "cabo_action_scale": action_scale,
+        }
+    )
+    return (
+        vlm_scale,
+        action_scale,
+        {
+            "cabo/vlm_drift": vlm_drift,
+            "cabo/action_drift": action_drift,
+            "cabo/cross_drift": cross_drift,
+            "cabo/vlm_drift_ema": vlm_ema,
+            "cabo/action_drift_ema": action_ema,
+            "cabo/cross_drift_ema": cross_ema,
+            "cabo/cross_correlation_ema": cross_correlation,
+            "cabo/balanced_vlm_drift_ema": balanced_vlm_drift,
+            "cabo/balanced_action_drift_ema": balanced_action_drift,
+            "cabo/balanced_influence_ratio": balanced_influence_ratio,
+            "cabo/total_drift_ema": total_drift_ema,
+            "cabo/vlm_scale": vlm_scale,
+            "cabo/action_scale": action_scale,
+            "cabo/balance_clamped": float(balance_clamped),
+            "cabo/probe_nonfinite": 0.0,
+        },
+    )
+
+
 @contextmanager
 def temporary_optimizer_group_lr_scales(
     optimizer: Optimizer,
@@ -321,8 +443,10 @@ def temporary_optimizer_group_lr_scales(
     effective_lrs: dict[str, float] = {}
     try:
         for name, scale in group_scales.items():
-            if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
-                raise ValueError(f"CABO optimizer group scale must be in [0, 1], got {scale} for {name!r}")
+            if not math.isfinite(scale) or scale < 0.0:
+                raise ValueError(
+                    f"CABO optimizer group scale must be finite and non-negative, got {scale} for {name!r}"
+                )
             group = get_named_param_group(unwrapped, name)
             original_lrs[name] = group["lr"]
             group["lr"] = group["lr"] * scale

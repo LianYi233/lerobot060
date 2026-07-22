@@ -56,6 +56,7 @@ from lerobot.optim.cabo import (
     get_named_param_group,
     require_adamw,
     update_cabo_budget,
+    update_cabo_influence_balance,
     validate_adamw_param_group,
 )
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
@@ -1369,19 +1370,45 @@ class PI05Policy(PreTrainedPolicy):
         adamw = require_adamw(optimizer)
         vlm_group = get_named_param_group(adamw, CABO_VLM_GROUP)
         action_group = get_named_param_group(adamw, CABO_ACTION_GROUP)
+        control_mode = getattr(self.config, "cabo_control_mode", "budget")
+        if control_mode not in ("budget", "balance"):
+            raise ValueError(f"Unsupported CABO control mode: {control_mode!r}")
         step = int(action_group.get("cabo_step", 0))
+        vlm_scale = float(action_group.get("cabo_vlm_scale", 1.0))
         action_scale = float(action_group.get("cabo_action_scale", 1.0))
+
+        def current_group_scales() -> dict[str, float]:
+            if control_mode == "balance":
+                return {
+                    CABO_VLM_GROUP: vlm_scale,
+                    CABO_ACTION_GROUP: action_scale,
+                }
+            return {CABO_ACTION_GROUP: action_scale}
+
+        def current_scale_metrics() -> dict[str, float]:
+            metrics = {
+                "cabo/action_scale": action_scale,
+                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                "cabo/control_mode_balance": float(control_mode == "balance"),
+            }
+            if control_mode == "balance":
+                metrics.update(
+                    {
+                        "cabo/vlm_scale": vlm_scale,
+                        "cabo/effective_vlm_lr": float(vlm_group["lr"]) * vlm_scale,
+                    }
+                )
+            else:
+                metrics["cabo/budget"] = float(action_group.get("cabo_budget", 0.0))
+            return metrics
 
         if step % self.config.cabo_probe_interval != 0:
             action_group["cabo_step"] = step + 1
+            metrics = current_scale_metrics()
+            metrics["cabo/probe_applied"] = 0.0
             return OptimizerStepControl(
-                group_scales={CABO_ACTION_GROUP: action_scale},
-                metrics={
-                    "cabo/action_scale": action_scale,
-                    "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
-                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                    "cabo/probe_applied": 0.0,
-                },
+                group_scales=current_group_scales(),
+                metrics=metrics,
             )
 
         device = batch[ACTION].device
@@ -1461,38 +1488,50 @@ class PI05Policy(PreTrainedPolicy):
         global_valid_elements = float(weighted_probe_statistics[3].item())
         if global_valid_elements <= 0.0:
             # Keep the controller step unchanged so the next batch retries the scheduled probe.
-            return OptimizerStepControl(
-                group_scales={CABO_ACTION_GROUP: action_scale},
-                metrics={
-                    "cabo/action_scale": action_scale,
-                    "cabo/budget": float(action_group.get("cabo_budget", 0.0)),
-                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+            metrics = current_scale_metrics()
+            metrics.update(
+                {
                     "cabo/probe_applied": 0.0,
                     "cabo/probe_skipped_padding": 1.0,
                     "cabo/probe_valid_elements": 0.0,
                     "cabo/probe_retry_next_step": 1.0,
-                },
+                }
+            )
+            return OptimizerStepControl(
+                group_scales=current_group_scales(),
+                metrics=metrics,
             )
 
         probe_moments = weighted_probe_statistics[:3] / global_valid_elements
         vlm_drift, action_drift, cross_drift = (float(value.item()) for value in probe_moments)
-        action_scale, metrics = update_cabo_budget(
-            action_group,
-            vlm_drift=vlm_drift,
-            action_drift=action_drift,
-            cross_drift=cross_drift,
-            action_drift_ratio=self.config.cabo_action_drift_ratio,
-            base_action_scale=self.config.cabo_base_action_scale,
-            negative_cross_discount=self.config.cabo_negative_cross_discount,
-            probe_interval=self.config.cabo_probe_interval,
-            ema_decay=self.config.cabo_drift_ema_decay,
-            budget_decay=self.config.cabo_budget_decay,
-            budget_cap_windows=self.config.cabo_budget_cap_windows,
-        )
+        if control_mode == "balance":
+            vlm_scale, action_scale, metrics = update_cabo_influence_balance(
+                action_group,
+                vlm_drift=vlm_drift,
+                action_drift=action_drift,
+                cross_drift=cross_drift,
+                ema_decay=self.config.cabo_drift_ema_decay,
+                max_scale=self.config.cabo_balance_max_scale,
+            )
+        else:
+            action_scale, metrics = update_cabo_budget(
+                action_group,
+                vlm_drift=vlm_drift,
+                action_drift=action_drift,
+                cross_drift=cross_drift,
+                action_drift_ratio=self.config.cabo_action_drift_ratio,
+                base_action_scale=self.config.cabo_base_action_scale,
+                negative_cross_discount=self.config.cabo_negative_cross_discount,
+                probe_interval=self.config.cabo_probe_interval,
+                ema_decay=self.config.cabo_drift_ema_decay,
+                budget_decay=self.config.cabo_budget_decay,
+                budget_cap_windows=self.config.cabo_budget_cap_windows,
+            )
         if metrics["cabo/probe_nonfinite"]:
             metrics.update(
                 {
                     "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                    "cabo/control_mode_balance": float(control_mode == "balance"),
                     "cabo/probe_applied": 1.0,
                     "cabo/probe_skipped_padding": 0.0,
                     "cabo/probe_valid_elements": global_valid_elements,
@@ -1501,20 +1540,25 @@ class PI05Policy(PreTrainedPolicy):
                     "optimizer_step/nonfinite_probe": 1.0,
                 }
             )
+            if control_mode == "balance":
+                metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
             return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
 
         action_group["cabo_step"] = step + 1
         metrics.update(
             {
                 "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
+                "cabo/control_mode_balance": float(control_mode == "balance"),
                 "cabo/probe_applied": 1.0,
                 "cabo/probe_skipped_padding": 0.0,
                 "cabo/probe_valid_elements": global_valid_elements,
                 "cabo/num_projections": float(self.config.cabo_num_projections),
             }
         )
+        if control_mode == "balance":
+            metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
         return OptimizerStepControl(
-            group_scales={CABO_ACTION_GROUP: action_scale},
+            group_scales=current_group_scales(),
             metrics=metrics,
         )
 
