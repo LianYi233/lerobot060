@@ -16,6 +16,7 @@
 
 from types import SimpleNamespace
 
+import draccus
 import pytest
 import torch
 from torch import nn
@@ -129,6 +130,20 @@ def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: f
 def test_pi05_rejects_invalid_cabo_control_mode():
     with pytest.raises(ValueError, match="cabo_control_mode"):
         PI05Config(cabo_control_mode="unknown")
+
+
+def test_pi05_cabo_control_mode_decodes_from_nested_cli_argument():
+    config = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id=user/repo",
+            "--policy.type=pi05",
+            "--policy.cabo_control_mode=balance",
+        ],
+    )
+
+    assert isinstance(config.policy, PI05Config)
+    assert config.policy.cabo_control_mode == "balance"
 
 
 @pytest.mark.parametrize(

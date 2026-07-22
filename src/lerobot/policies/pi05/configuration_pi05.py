@@ -16,7 +16,6 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -104,7 +103,9 @@ class PI05Config(PreTrainedConfig):
     # action-side update using a leaky joint-drift budget. ``balance`` ignores update direction and
     # symmetrically amplifies the weaker marginal influence while attenuating the stronger one.
     cabo_enabled: bool = False
-    cabo_control_mode: Literal["budget", "balance"] = "budget"
+    # Keep this as ``str`` rather than ``Literal``: draccus 0.10 cannot decode Literal fields from CLI.
+    # ``__post_init__`` enforces the supported values below.
+    cabo_control_mode: str = "budget"
     # Maximum multiplier in balance mode; attenuation is bounded by its reciprocal.
     cabo_balance_max_scale: float = 2.0
     cabo_action_drift_ratio: float = 0.1
