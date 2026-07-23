@@ -96,26 +96,27 @@ def _clip_policy_gradients(
     grad_clip_norm: float,
     accelerator: "Accelerator",
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Apply policy-specific clipping, falling back to global norm clipping.
+    """Apply global clipping followed by any policy-specific clipping.
 
-    A policy-specific ``clip_gradients`` hook owns the complete clipping operation. This lets policies
-    such as PI05 clip only their action-side parameters without modifying VLM gradients.
+    Global clipping remains a model-wide safety bound. A policy hook may impose an additional
+    structural constraint, such as PI05's action-to-VLM gradient-RMS ratio, after gradients have
+    been unscaled and globally clipped.
     """
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    if has_method(unwrapped_policy, "clip_gradients"):
-        # Custom hooks inspect and modify gradients directly, so gradients must first be unscaled.
+
+    if grad_clip_norm > 0:
+        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    else:
+        # Preserve gradient-norm logging without using clip_grad_norm_(..., inf), which can still write
+        # to gradients and therefore is not a true no-op for non-finite values.
         accelerator.unscale_gradients(optimizer)
         grad_norm = _get_gradient_norm(policy.parameters())
+
+    if has_method(unwrapped_policy, "clip_gradients"):
         clip_metrics = unwrapped_policy.clip_gradients(accelerator=accelerator)
         return grad_norm, clip_metrics or {}
 
-    if grad_clip_norm > 0:
-        return accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm), {}
-
-    # Preserve gradient-norm logging without using clip_grad_norm_(..., inf), which can still write to
-    # gradients and therefore is not a true no-op for non-finite values.
-    accelerator.unscale_gradients(optimizer)
-    return _get_gradient_norm(policy.parameters()), {}
+    return grad_norm, {}
 
 
 def _prepare_policy_optimizer_step_control(
