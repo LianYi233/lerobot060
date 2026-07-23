@@ -85,20 +85,20 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     parameters = [nn.Parameter(torch.zeros(())), nn.Parameter(torch.ones(()))]
     optimizer = optimizer_config.build(parameters)
 
-    assert config.optimizer_grad_clip_norm == 0.0
-    assert optimizer_config.grad_clip_norm == 0.0
-    assert optimizer_config.lr == pytest.approx(2.5e-4)
+    assert config.optimizer_grad_clip_norm == 1.0
+    assert optimizer_config.grad_clip_norm == 1.0
+    assert optimizer_config.lr == pytest.approx(2.5e-5)
     assert isinstance(optimizer, torch.optim.AdamW)
     assert len(optimizer.param_groups) == 1
     assert [id(parameter) for parameter in optimizer.param_groups[0]["params"]] == [
         id(parameter) for parameter in parameters
     ]
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.5e-4)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.5e-5)
     assert optimizer.param_groups[0]["betas"] == pytest.approx((0.9, 0.95))
     assert optimizer.param_groups[0]["eps"] == pytest.approx(1e-8)
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.01)
-    assert scheduler.peak_lr == pytest.approx(2.5e-4)
-    assert scheduler.decay_lr == pytest.approx(2.5e-5)
+    assert scheduler.peak_lr == pytest.approx(2.5e-5)
+    assert scheduler.decay_lr == pytest.approx(2.5e-6)
     assert scheduler.num_warmup_steps == 1_000
     assert scheduler.num_decay_steps == 30_000
     assert config.clip_action_head_by_vlm
@@ -106,7 +106,11 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert not config.cabo_enabled
     assert config.cabo_control_mode == "residual"
     assert config.cabo_residual_regularization == pytest.approx(0.1)
+    assert config.cabo_residual_vlm_min_scale == pytest.approx(0.0)
     assert config.cabo_residual_vlm_max_scale == pytest.approx(1.0)
+    assert config.cabo_vlm_optimizer_lr is None
+    assert config.cabo_action_optimizer_lr is None
+    assert config.cabo_warmup_steps == 0
     assert config.cabo_balance_max_scale == pytest.approx(2.0)
     assert config.cabo_action_drift_ratio == pytest.approx(0.1)
     assert config.cabo_probe_interval == 8
@@ -149,6 +153,36 @@ def test_pi05_rejects_invalid_cabo_residual_regularization(cabo_residual_regular
 def test_pi05_rejects_invalid_cabo_residual_vlm_max_scale(cabo_residual_vlm_max_scale: float):
     with pytest.raises(ValueError, match="cabo_residual_vlm_max_scale"):
         PI05Config(cabo_residual_vlm_max_scale=cabo_residual_vlm_max_scale)
+
+
+@pytest.mark.parametrize("cabo_residual_vlm_min_scale", [-0.1, float("nan"), float("inf")])
+def test_pi05_rejects_invalid_cabo_residual_vlm_min_scale(cabo_residual_vlm_min_scale: float):
+    with pytest.raises(ValueError, match="cabo_residual_vlm_min_scale"):
+        PI05Config(cabo_residual_vlm_min_scale=cabo_residual_vlm_min_scale)
+
+
+def test_pi05_rejects_residual_vlm_scale_floor_above_cap():
+    with pytest.raises(ValueError, match="cannot exceed"):
+        PI05Config(cabo_residual_vlm_min_scale=0.5, cabo_residual_vlm_max_scale=0.25)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cabo_vlm_optimizer_lr", 0.0),
+        ("cabo_vlm_optimizer_lr", float("nan")),
+        ("cabo_action_optimizer_lr", -1.0),
+        ("cabo_action_optimizer_lr", float("inf")),
+    ],
+)
+def test_pi05_rejects_invalid_cabo_group_learning_rates(field: str, value: float):
+    with pytest.raises(ValueError, match=field):
+        PI05Config(**{field: value})
+
+
+def test_pi05_rejects_negative_cabo_warmup():
+    with pytest.raises(ValueError, match="cabo_warmup_steps"):
+        PI05Config(cabo_warmup_steps=-1)
 
 
 def test_pi05_cabo_control_mode_decodes_from_nested_cli_argument():
