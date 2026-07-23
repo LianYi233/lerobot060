@@ -141,7 +141,7 @@ class _FakeAccelerator:
         return nullcontext()
 
 
-def test_policy_specific_hook_replaces_global_gradient_clipping():
+def test_policy_specific_hook_runs_after_global_gradient_clipping():
     policy = _PolicyWithCustomGradientClipping()
     policy.weight.grad = torch.tensor(4.0)
     optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
@@ -155,12 +155,12 @@ def test_policy_specific_hook_replaces_global_gradient_clipping():
     )
 
     assert grad_norm.item() == pytest.approx(4.0)
-    assert policy.weight.grad.item() == pytest.approx(1.0)
+    assert policy.weight.grad.item() == pytest.approx(0.25)
     assert metrics == {"custom_clip_applied": 1.0}
     assert policy.clip_calls == 1
-    assert accelerator.unscale_calls == 1
-    assert accelerator.global_clip_calls == 0
-    assert accelerator.events == ["unscale", "custom_clip"]
+    assert accelerator.unscale_calls == 0
+    assert accelerator.global_clip_calls == 1
+    assert accelerator.events == ["global_clip", "custom_clip"]
 
 
 def test_policy_without_custom_hook_keeps_global_gradient_clipping():
@@ -199,8 +199,8 @@ def test_update_policy_calls_custom_hook_and_merges_clipping_metrics():
     )
 
     assert policy.clip_calls == 1
-    assert accelerator.events == ["backward", "unscale", "custom_clip"]
-    assert accelerator.global_clip_calls == 0
+    assert accelerator.events == ["backward", "global_clip", "custom_clip"]
+    assert accelerator.global_clip_calls == 1
     assert train_metrics.grad_norm == pytest.approx(4.0)
     assert output_dict == {"forward_metric": 2.0, "custom_clip_applied": 1.0}
 
