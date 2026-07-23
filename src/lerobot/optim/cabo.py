@@ -318,6 +318,7 @@ def update_cabo_residual_compensation(
     ema_decay: float,
     regularization: float,
     max_vlm_scale: float,
+    min_vlm_scale: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """Scale the VLM update to reduce the residual left by a full action-side update.
 
@@ -331,9 +332,11 @@ def update_cabo_residual_compensation(
 
         s = -mean(<e + da, dv>) / ((1 + regularization) * mean(||dv||^2)).
 
-    Clamping to ``[0, max_vlm_scale]`` means the VLM is updated only when its candidate step is
-    predicted to improve the action-side residual. Unlike magnitude balancing, a weak or large VLM
-    influence receives no reward unless it points in a useful direction.
+    By default, clamping to ``[0, max_vlm_scale]`` means the VLM is updated only when its candidate
+    step is predicted to improve the action-side residual. ``min_vlm_scale`` can retain a small
+    representation-learning floor when the sampled one-step estimate is too noisy to be trusted as
+    a hard gate. Unlike magnitude balancing, a weak or large VLM influence receives no amplification
+    unless it points in a useful direction.
     """
     if not math.isfinite(regularization) or regularization < 0.0:
         raise ValueError(
@@ -341,6 +344,13 @@ def update_cabo_residual_compensation(
         )
     if not math.isfinite(max_vlm_scale) or max_vlm_scale < 0.0:
         raise ValueError(f"CABO residual max VLM scale must be finite and non-negative, got {max_vlm_scale}")
+    if not math.isfinite(min_vlm_scale) or min_vlm_scale < 0.0:
+        raise ValueError(f"CABO residual min VLM scale must be finite and non-negative, got {min_vlm_scale}")
+    if min_vlm_scale > max_vlm_scale:
+        raise ValueError(
+            "CABO residual min VLM scale cannot exceed max VLM scale, "
+            f"got min={min_vlm_scale}, max={max_vlm_scale}"
+        )
 
     statistics = (
         vlm_drift,
@@ -397,7 +407,7 @@ def update_cabo_residual_compensation(
 
     post_action_vlm_alignment = residual_vlm_alignment_ema + cross_ema
     raw_vlm_scale = 0.0 if vlm_ema <= 0.0 else -post_action_vlm_alignment / ((1.0 + regularization) * vlm_ema)
-    vlm_scale = min(max(raw_vlm_scale, 0.0), max_vlm_scale)
+    vlm_scale = min(max(raw_vlm_scale, min_vlm_scale), max_vlm_scale)
 
     predicted_action_only_residual = max(
         residual_energy_ema + 2.0 * residual_action_alignment_ema + action_ema,
@@ -447,6 +457,7 @@ def update_cabo_residual_compensation(
         "cabo/predicted_vlm_improvement_ema": predicted_vlm_improvement,
         "cabo/vlm_scale": vlm_scale,
         "cabo/action_scale": 1.0,
+        "cabo/residual_scale_at_floor": float(vlm_scale == min_vlm_scale and raw_vlm_scale < min_vlm_scale),
         "cabo/residual_scale_clamped": float(vlm_scale != raw_vlm_scale),
         "cabo/probe_nonfinite": 0.0,
     }
