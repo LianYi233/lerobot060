@@ -116,6 +116,59 @@ def _gradient_l2_norm_and_numel(parameters: list[nn.Parameter]) -> tuple[Tensor 
     return torch.stack(gradient_norms).norm(2), sum(parameter.grad.numel() for parameter in parameters)
 
 
+def _valid_action_steps(batch: dict[str, Tensor]) -> Tensor:
+    """Return a ``(batch, horizon)`` mask shared by training loss and CABO probes."""
+    actions = batch[ACTION]
+    if actions.ndim < 2:
+        raise ValueError(f"{ACTION} must include batch and horizon dimensions, got {tuple(actions.shape)}")
+
+    batch_size, action_horizon = actions.shape[:2]
+    action_padding = batch.get(f"{ACTION}_is_pad")
+    if not isinstance(action_padding, Tensor):
+        return torch.ones((batch_size, action_horizon), dtype=torch.bool, device=actions.device)
+    if action_padding.numel() % (batch_size * action_horizon) != 0:
+        raise ValueError(
+            f"{ACTION}_is_pad must align with the action horizon; "
+            f"got action shape={tuple(actions.shape)}, padding shape={tuple(action_padding.shape)}"
+        )
+
+    padded_steps = (
+        action_padding.to(device=actions.device, dtype=torch.bool)
+        .reshape(batch_size, action_horizon, -1)
+        .any(dim=-1)
+    )
+    return ~padded_steps
+
+
+def _reduce_action_losses(
+    losses: Tensor,
+    valid_steps: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reduce elementwise action losses without training on padded episode tails."""
+    if losses.ndim != 3:
+        raise ValueError(f"PI0.5 losses must have shape (batch, horizon, action_dim), got {tuple(losses.shape)}")
+    if valid_steps.shape != losses.shape[:2]:
+        raise ValueError(
+            "PI0.5 valid-step mask must match the loss batch and horizon dimensions; "
+            f"got loss shape={tuple(losses.shape)}, mask shape={tuple(valid_steps.shape)}"
+        )
+
+    valid = valid_steps.to(device=losses.device, dtype=losses.dtype).unsqueeze(-1)
+    masked_losses = losses * valid
+    action_dim = losses.shape[-1]
+
+    valid_steps_per_sample = valid.sum(dim=(1, 2))
+    per_sample_denominator = (valid_steps_per_sample * action_dim).clamp_min(1.0)
+    per_sample_loss = masked_losses.sum(dim=(1, 2)) / per_sample_denominator
+
+    total_denominator = (valid.sum() * action_dim).clamp_min(1.0)
+    scalar_loss = masked_losses.sum() / total_denominator
+
+    per_dim_denominator = valid.sum(dim=(0, 1)).clamp_min(1.0)
+    loss_per_dim = masked_losses.sum(dim=(0, 1)) / per_dim_denominator
+    return scalar_loss, per_sample_loss, loss_per_dim
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -1223,10 +1276,15 @@ class PI05Policy(PreTrainedPolicy):
         if not self.config.cabo_enabled:
             return self.parameters()
         vlm_parameters, action_parameters = self._cabo_parameter_groups()
-        return [
-            {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_GROUP},
-            {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP},
-        ]
+        vlm_group = {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_GROUP}
+        action_group = {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP}
+        vlm_lr = getattr(self.config, "cabo_vlm_optimizer_lr", None)
+        action_lr = getattr(self.config, "cabo_action_optimizer_lr", None)
+        if vlm_lr is not None:
+            vlm_group["lr"] = vlm_lr
+        if action_lr is not None:
+            action_group["lr"] = action_lr
+        return [vlm_group, action_group]
 
     def validate_optimizer_step_control(self, optimizer) -> None:
         """Validate CABO's optimizer contract before the first training backward pass."""
@@ -1279,25 +1337,7 @@ class PI05Policy(PreTrainedPolicy):
         process_index: int = 0,
     ) -> tuple[Tensor | None, Tensor | None, int]:
         batch_size = batch[ACTION].shape[0]
-        action_horizon = batch[ACTION].shape[1]
-        action_padding = batch.get(f"{ACTION}_is_pad")
-        if isinstance(action_padding, Tensor):
-            if action_padding.numel() % (batch_size * action_horizon) != 0:
-                raise ValueError(
-                    f"{ACTION}_is_pad must align with the action horizon; "
-                    f"got action shape={tuple(batch[ACTION].shape)}, "
-                    f"padding shape={tuple(action_padding.shape)}"
-                )
-            padded_steps = (
-                action_padding.to(device=batch[ACTION].device, dtype=torch.bool)
-                .reshape(batch_size, action_horizon, -1)
-                .any(dim=-1)
-            )
-        else:
-            padded_steps = torch.zeros(
-                (batch_size, action_horizon), dtype=torch.bool, device=batch[ACTION].device
-            )
-        valid_steps = ~padded_steps
+        valid_steps = _valid_action_steps(batch)
 
         device = batch[ACTION].device
         fork_devices = []
@@ -1418,10 +1458,27 @@ class PI05Policy(PreTrainedPolicy):
                 metrics["cabo/budget"] = float(action_group.get("cabo_budget", 0.0))
             return metrics
 
+        warmup_steps = int(getattr(self.config, "cabo_warmup_steps", 0))
+        if step < warmup_steps:
+            action_group["cabo_step"] = step + 1
+            metrics = current_scale_metrics()
+            metrics.update(
+                {
+                    "cabo/probe_applied": 0.0,
+                    "cabo/warmup_active": 1.0,
+                    "cabo/warmup_remaining_steps": float(warmup_steps - step),
+                }
+            )
+            return OptimizerStepControl(
+                group_scales=current_group_scales(),
+                metrics=metrics,
+            )
+
         if step % self.config.cabo_probe_interval != 0:
             action_group["cabo_step"] = step + 1
             metrics = current_scale_metrics()
             metrics["cabo/probe_applied"] = 0.0
+            metrics["cabo/warmup_active"] = 0.0
             return OptimizerStepControl(
                 group_scales=current_group_scales(),
                 metrics=metrics,
@@ -1546,6 +1603,7 @@ class PI05Policy(PreTrainedPolicy):
                 residual_action_alignment=residual_action_alignment,
                 ema_decay=self.config.cabo_drift_ema_decay,
                 regularization=self.config.cabo_residual_regularization,
+                min_vlm_scale=getattr(self.config, "cabo_residual_vlm_min_scale", 0.0),
                 max_vlm_scale=self.config.cabo_residual_vlm_max_scale,
             )
             action_scale = 1.0
@@ -1600,6 +1658,7 @@ class PI05Policy(PreTrainedPolicy):
                 "cabo/probe_skipped_padding": 0.0,
                 "cabo/probe_valid_elements": global_valid_elements,
                 "cabo/num_projections": float(self.config.cabo_num_projections),
+                "cabo/warmup_active": 0.0,
             }
         )
         if control_mode in ("residual", "balance"):
@@ -1864,19 +1923,19 @@ class PI05Policy(PreTrainedPolicy):
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        valid_steps = _valid_action_steps(batch)
+        loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, valid_steps)
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
+            "valid_action_fraction": valid_steps.float().mean().item(),
+            "all_padding_samples": float((~valid_steps.any(dim=1)).sum().item()),
         }
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
