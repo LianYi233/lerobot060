@@ -58,6 +58,8 @@ def _make_policy_with_gradients(
         config=SimpleNamespace(
             clip_action_head_by_vlm=True,
             action_head_grad_clip_ratio=action_head_grad_clip_ratio,
+            cabo_enabled=False,
+            cabo_control_mode="residual",
         ),
     )
 
@@ -102,7 +104,9 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
     assert not config.cabo_enabled
-    assert config.cabo_control_mode == "budget"
+    assert config.cabo_control_mode == "residual"
+    assert config.cabo_residual_regularization == pytest.approx(0.1)
+    assert config.cabo_residual_vlm_max_scale == pytest.approx(1.0)
     assert config.cabo_balance_max_scale == pytest.approx(2.0)
     assert config.cabo_action_drift_ratio == pytest.approx(0.1)
     assert config.cabo_probe_interval == 8
@@ -130,6 +134,21 @@ def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: f
 def test_pi05_rejects_invalid_cabo_control_mode():
     with pytest.raises(ValueError, match="cabo_control_mode"):
         PI05Config(cabo_control_mode="unknown")
+
+
+@pytest.mark.parametrize("cabo_residual_regularization", [-0.1, float("nan"), float("inf")])
+def test_pi05_rejects_invalid_cabo_residual_regularization(cabo_residual_regularization: float):
+    with pytest.raises(ValueError, match="cabo_residual_regularization"):
+        PI05Config(cabo_residual_regularization=cabo_residual_regularization)
+
+
+@pytest.mark.parametrize(
+    "cabo_residual_vlm_max_scale",
+    [0.0, -0.1, float("nan"), float("inf")],
+)
+def test_pi05_rejects_invalid_cabo_residual_vlm_max_scale(cabo_residual_vlm_max_scale: float):
+    with pytest.raises(ValueError, match="cabo_residual_vlm_max_scale"):
+        PI05Config(cabo_residual_vlm_max_scale=cabo_residual_vlm_max_scale)
 
 
 def test_pi05_cabo_control_mode_decodes_from_nested_cli_argument():
@@ -193,12 +212,29 @@ def test_pi05_cabo_requires_policy_training_preset(tmp_path):
         config.validate()
 
 
-def test_pi05_cabo_disables_gradient_clipping_hook():
+def test_pi05_cabo_residual_mode_keeps_action_gradient_clipping():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
         action_gradient=20.0,
         vlm_gradient=1.0,
     )
     policy.config.cabo_enabled = True
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics["action_head_clip_applied"] == 1.0
+    assert _gradient_rms(action_parameters) == pytest.approx(10.0, abs=1e-6)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+
+def test_pi05_cabo_legacy_budget_mode_disables_gradient_clipping_hook():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+    )
+    policy.config.cabo_enabled = True
+    policy.config.cabo_control_mode = "budget"
     action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
     vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
 

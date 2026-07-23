@@ -57,6 +57,8 @@ class _TinyCABOPolicy(nn.Module):
         self.config = SimpleNamespace(
             cabo_enabled=True,
             cabo_control_mode="budget",
+            cabo_residual_regularization=0.0,
+            cabo_residual_vlm_max_scale=1.0,
             cabo_balance_max_scale=2.0,
             cabo_probe_interval=8,
             cabo_action_drift_ratio=0.1,
@@ -72,7 +74,9 @@ class _TinyCABOPolicy(nn.Module):
         _ = batch, step, process_index
         # Both branches affect the same scalar action output, with action twice as sensitive.
         velocity = self.vlm_weight + 2.0 * self.action_weight
-        return torch.stack([velocity, -velocity, velocity, -velocity]), 1
+        probe_scalars = torch.stack([velocity, -velocity, velocity, -velocity])
+        residual_projections = torch.tensor([0.25, -0.25, 0.25, -0.25])
+        return probe_scalars, residual_projections, 1
 
     def forward(self, value):
         return value * (self.vlm_weight + self.action_weight)
@@ -84,7 +88,7 @@ class _TinyCABOPolicy(nn.Module):
 class _RankSparseCABOPolicy(_TinyCABOPolicy):
     def _cabo_probe_velocity(self, batch, *, step, process_index=0):
         if process_index == 0:
-            return None, 0
+            return None, None, 0
         return super()._cabo_probe_velocity(batch, step=step, process_index=process_index)
 
 
@@ -218,6 +222,46 @@ def test_pi05_cabo_probe_preserves_training_gradients_and_reuses_scale():
     assert reused_control.metrics["cabo/probe_applied"] == 0.0
 
 
+def test_pi05_cabo_residual_mode_keeps_action_full_and_scales_vlm_to_remaining_error():
+    policy = _TinyCABOPolicy()
+    policy.config.cabo_control_mode = "residual"
+    policy.config.cabo_drift_ema_decay = 0.0
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [policy.vlm_weight], "name": CABO_VLM_GROUP},
+            {"params": [policy.action_weight], "name": CABO_ACTION_GROUP},
+        ],
+        lr=0.1,
+        betas=(0.0, 0.0),
+        eps=1e-12,
+        weight_decay=0.0,
+    )
+    policy.vlm_weight.grad = torch.tensor(1.0, dtype=torch.float64)
+    policy.action_weight.grad = torch.tensor(1.0, dtype=torch.float64)
+    gradients_before = [parameter.grad.clone() for parameter in policy.parameters()]
+    batch = {ACTION: torch.ones(1, 1, 1)}
+
+    control = policy.compute_optimizer_step_control(batch, optimizer, _FakeAccelerator())
+
+    # q_e alternates +/-0.25, while the VLM and action candidate projections are -/+0.1
+    # and -/+0.2. Thus Bv=-0.025, Cva=0.02, Dv=0.01 and the residual-optimal VLM
+    # scale is -(-0.025 + 0.02) / 0.01 = 0.5. The action group remains unscaled.
+    assert control.group_scales == pytest.approx({CABO_VLM_GROUP: 0.5})
+    assert control.metrics["cabo/action_scale"] == pytest.approx(1.0)
+    assert control.metrics["cabo/vlm_scale"] == pytest.approx(0.5)
+    assert control.metrics["cabo/residual_vlm_alignment"] == pytest.approx(-0.025)
+    assert control.metrics["cabo/post_action_vlm_alignment_ema"] == pytest.approx(-0.005)
+    assert control.metrics["cabo/predicted_vlm_improvement_ema"] > 0.0
+    assert control.metrics["cabo/effective_action_lr"] == pytest.approx(0.1)
+    assert control.metrics["cabo/effective_vlm_lr"] == pytest.approx(0.05)
+    for parameter, gradient_before in zip(policy.parameters(), gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+    reused_control = policy.compute_optimizer_step_control(batch, optimizer, _FakeAccelerator())
+    assert reused_control.group_scales == pytest.approx({CABO_VLM_GROUP: 0.5})
+    assert reused_control.metrics["cabo/probe_applied"] == 0.0
+
+
 def test_pi05_cabo_balance_mode_scales_both_groups_and_reuses_scales():
     policy = _TinyCABOPolicy()
     policy.config.cabo_control_mode = "balance"
@@ -270,10 +314,15 @@ def test_pi05_cabo_probe_masks_padded_action_steps_without_excluding_partial_row
         OBS_LANGUAGE_ATTENTION_MASK: torch.ones(3, 2, dtype=torch.bool),
     }
 
-    probe_scalars, valid_output_elements = policy._cabo_probe_velocity(batch, step=0)
+    probe_scalars, residual_projections, valid_output_elements = policy._cabo_probe_velocity(batch, step=0)
 
     assert probe_scalars is not None
+    assert residual_projections is not None
     assert probe_scalars.shape == (4,)
+    assert residual_projections.shape == (4,)
+    # The fake probe predicts 0.5 * action while the flow target is -action, so its
+    # prediction-minus-target residual is exactly three times the predicted velocity.
+    torch.testing.assert_close(residual_projections, 3.0 * probe_scalars.detach())
     assert valid_output_elements == 5
     assert sorted(policy.selected_actions[:, 0, 0].tolist()) == [1.0, 2.0, 4.0]
 
@@ -285,9 +334,10 @@ def test_pi05_cabo_probe_skips_an_all_padding_batch():
         f"{ACTION}_is_pad": torch.ones(2, 3, dtype=torch.bool),
     }
 
-    probe_scalars, valid_output_elements = policy._cabo_probe_velocity(batch, step=0)
+    probe_scalars, residual_projections, valid_output_elements = policy._cabo_probe_velocity(batch, step=0)
 
     assert probe_scalars is None
+    assert residual_projections is None
     assert valid_output_elements == 0
     assert policy.selected_actions is None
 
@@ -304,12 +354,15 @@ def test_pi05_cabo_probe_sampling_is_reproducible_for_step_and_rank():
     second.config.cabo_probe_batch_size = 2
 
     training_rng_state = torch.random.get_rng_state()
-    first_scalars, first_count = first._cabo_probe_velocity(batch, step=7, process_index=1)
+    first_scalars, first_residuals, first_count = first._cabo_probe_velocity(batch, step=7, process_index=1)
     assert torch.equal(torch.random.get_rng_state(), training_rng_state)
-    second_scalars, second_count = second._cabo_probe_velocity(batch, step=7, process_index=1)
+    second_scalars, second_residuals, second_count = second._cabo_probe_velocity(
+        batch, step=7, process_index=1
+    )
 
     torch.testing.assert_close(first.selected_actions, second.selected_actions)
     torch.testing.assert_close(first_scalars, second_scalars)
+    torch.testing.assert_close(first_residuals, second_residuals)
     assert first_count == second_count == 4
 
 
@@ -343,7 +396,7 @@ def test_pi05_cabo_nonfinite_probe_skips_without_mutating_controller_state():
     def nonfinite_probe(batch, *, step, process_index=0):
         _ = batch, step, process_index
         scalar = policy.vlm_weight * torch.tensor(float("nan"), dtype=torch.float64)
-        return torch.stack([scalar, scalar, scalar, scalar]), 1
+        return torch.stack([scalar, scalar, scalar, scalar]), torch.zeros(4), 1
 
     policy._cabo_probe_velocity = nonfinite_probe
     optimizer = torch.optim.AdamW(

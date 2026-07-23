@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optimizer-side helpers for Counterfactual Action-Budget Optimization (CABO)."""
+"""Optimizer-side helpers for counterfactual action-space update control (CABO)."""
 
 import math
 from collections.abc import Iterator, Mapping
@@ -302,6 +302,152 @@ def update_cabo_budget(
         "cabo/relative_allowance": relative_allowance,
         "cabo/base_action_allowance": base_allowance,
         "cabo/planned_action_cost": spent,
+        "cabo/probe_nonfinite": 0.0,
+    }
+
+
+def update_cabo_residual_compensation(
+    controller_group: dict[str, Any],
+    *,
+    vlm_drift: float,
+    action_drift: float,
+    cross_drift: float,
+    residual_energy: float,
+    residual_vlm_alignment: float,
+    residual_action_alignment: float,
+    ema_decay: float,
+    regularization: float,
+    max_vlm_scale: float,
+) -> tuple[float, dict[str, float]]:
+    """Scale the VLM update to reduce the residual left by a full action-side update.
+
+    Let ``e = predicted_velocity - target_velocity`` and let ``dv`` and ``da`` be the
+    linearized velocity changes induced by the next VLM and action-side AdamW updates. CABO keeps
+    the action-side update at full scale and chooses a non-negative VLM scale ``s`` by minimizing
+
+        mean(||e + da + s * dv||^2) + regularization * s^2 * mean(||dv||^2).
+
+    The closed-form unconstrained minimizer is
+
+        s = -mean(<e + da, dv>) / ((1 + regularization) * mean(||dv||^2)).
+
+    Clamping to ``[0, max_vlm_scale]`` means the VLM is updated only when its candidate step is
+    predicted to improve the action-side residual. Unlike magnitude balancing, a weak or large VLM
+    influence receives no reward unless it points in a useful direction.
+    """
+    if not math.isfinite(regularization) or regularization < 0.0:
+        raise ValueError(
+            f"CABO residual regularization must be finite and non-negative, got {regularization}"
+        )
+    if not math.isfinite(max_vlm_scale) or max_vlm_scale < 0.0:
+        raise ValueError(f"CABO residual max VLM scale must be finite and non-negative, got {max_vlm_scale}")
+
+    statistics = (
+        vlm_drift,
+        action_drift,
+        cross_drift,
+        residual_energy,
+        residual_vlm_alignment,
+        residual_action_alignment,
+    )
+    finite = all(math.isfinite(value) for value in statistics)
+    valid_nonnegative_moments = vlm_drift >= 0.0 and action_drift >= 0.0 and residual_energy >= 0.0
+    previous_vlm_scale = float(controller_group.get("cabo_vlm_scale", 1.0))
+    if not finite or not valid_nonnegative_moments:
+        return previous_vlm_scale, {
+            "cabo/vlm_drift": vlm_drift,
+            "cabo/action_drift": action_drift,
+            "cabo/cross_drift": cross_drift,
+            "cabo/residual_energy": residual_energy,
+            "cabo/residual_vlm_alignment": residual_vlm_alignment,
+            "cabo/residual_action_alignment": residual_action_alignment,
+            "cabo/vlm_scale": previous_vlm_scale,
+            "cabo/action_scale": 1.0,
+            "cabo/probe_nonfinite": 1.0,
+        }
+
+    # Use a mode-specific initialization bit. Legacy budget/balance checkpoints may already have
+    # ``cabo_ema_initialized`` without the residual-alignment moments introduced here.
+    initialized = bool(controller_group.get("cabo_residual_ema_initialized", False))
+
+    def update_ema(key: str, value: float) -> float:
+        if not initialized:
+            return value
+        return ema_decay * float(controller_group[key]) + (1.0 - ema_decay) * value
+
+    vlm_ema = update_ema("cabo_vlm_drift_ema", vlm_drift)
+    action_ema = update_ema("cabo_action_drift_ema", action_drift)
+    cross_ema = update_ema("cabo_cross_drift_ema", cross_drift)
+    residual_energy_ema = update_ema("cabo_residual_energy_ema", residual_energy)
+    residual_vlm_alignment_ema = update_ema("cabo_residual_vlm_alignment_ema", residual_vlm_alignment)
+    residual_action_alignment_ema = update_ema(
+        "cabo_residual_action_alignment_ema", residual_action_alignment
+    )
+
+    # All six values are moments of the same projected vectors. Preserve their pairwise
+    # Cauchy-Schwarz bounds after EMA in case floating-point reduction introduces tiny violations.
+    cross_limit = math.sqrt(max(vlm_ema * action_ema, 0.0))
+    cross_ema = min(max(cross_ema, -cross_limit), cross_limit)
+    residual_vlm_limit = math.sqrt(max(residual_energy_ema * vlm_ema, 0.0))
+    residual_vlm_alignment_ema = min(max(residual_vlm_alignment_ema, -residual_vlm_limit), residual_vlm_limit)
+    residual_action_limit = math.sqrt(max(residual_energy_ema * action_ema, 0.0))
+    residual_action_alignment_ema = min(
+        max(residual_action_alignment_ema, -residual_action_limit), residual_action_limit
+    )
+
+    post_action_vlm_alignment = residual_vlm_alignment_ema + cross_ema
+    raw_vlm_scale = 0.0 if vlm_ema <= 0.0 else -post_action_vlm_alignment / ((1.0 + regularization) * vlm_ema)
+    vlm_scale = min(max(raw_vlm_scale, 0.0), max_vlm_scale)
+
+    predicted_action_only_residual = max(
+        residual_energy_ema + 2.0 * residual_action_alignment_ema + action_ema,
+        0.0,
+    )
+    predicted_joint_residual = max(
+        predicted_action_only_residual + 2.0 * vlm_scale * post_action_vlm_alignment + vlm_scale**2 * vlm_ema,
+        0.0,
+    )
+    predicted_action_improvement = residual_energy_ema - predicted_action_only_residual
+    predicted_vlm_improvement = predicted_action_only_residual - predicted_joint_residual
+    cross_correlation = cross_ema / cross_limit if cross_limit > 0.0 else 0.0
+
+    controller_group.update(
+        {
+            "cabo_ema_initialized": True,
+            "cabo_residual_ema_initialized": True,
+            "cabo_vlm_drift_ema": vlm_ema,
+            "cabo_action_drift_ema": action_ema,
+            "cabo_cross_drift_ema": cross_ema,
+            "cabo_residual_energy_ema": residual_energy_ema,
+            "cabo_residual_vlm_alignment_ema": residual_vlm_alignment_ema,
+            "cabo_residual_action_alignment_ema": residual_action_alignment_ema,
+            "cabo_vlm_scale": vlm_scale,
+            # Residual mode always treats the action-side candidate as the primary, full update.
+            "cabo_action_scale": 1.0,
+        }
+    )
+    return vlm_scale, {
+        "cabo/vlm_drift": vlm_drift,
+        "cabo/action_drift": action_drift,
+        "cabo/cross_drift": cross_drift,
+        "cabo/vlm_drift_ema": vlm_ema,
+        "cabo/action_drift_ema": action_ema,
+        "cabo/cross_drift_ema": cross_ema,
+        "cabo/cross_correlation_ema": cross_correlation,
+        "cabo/residual_energy": residual_energy,
+        "cabo/residual_vlm_alignment": residual_vlm_alignment,
+        "cabo/residual_action_alignment": residual_action_alignment,
+        "cabo/residual_energy_ema": residual_energy_ema,
+        "cabo/residual_vlm_alignment_ema": residual_vlm_alignment_ema,
+        "cabo/residual_action_alignment_ema": residual_action_alignment_ema,
+        "cabo/post_action_vlm_alignment_ema": post_action_vlm_alignment,
+        "cabo/predicted_action_only_residual_ema": predicted_action_only_residual,
+        "cabo/predicted_joint_residual_ema": predicted_joint_residual,
+        "cabo/predicted_action_improvement_ema": predicted_action_improvement,
+        "cabo/predicted_vlm_improvement_ema": predicted_vlm_improvement,
+        "cabo/vlm_scale": vlm_scale,
+        "cabo/action_scale": 1.0,
+        "cabo/residual_scale_clamped": float(vlm_scale != raw_vlm_scale),
         "cabo/probe_nonfinite": 0.0,
     }
 

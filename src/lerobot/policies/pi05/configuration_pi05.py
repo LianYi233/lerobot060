@@ -98,14 +98,21 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = True
     action_head_grad_clip_ratio: float = 10.0
 
-    # Experimental Counterfactual Action-Budget Optimization (CABO). CABO estimates the linearized
-    # flow-velocity drift of the next VLM and action-side AdamW updates. ``budget`` limits only the
-    # action-side update using a leaky joint-drift budget. ``balance`` ignores update direction and
-    # symmetrically amplifies the weaker marginal influence while attenuating the stronger one.
+    # Experimental counterfactual action-space optimizer control (CABO). CABO estimates the
+    # linearized flow-velocity change of the next VLM and action-side AdamW updates. ``residual``
+    # keeps the action update at full scale and applies the VLM update only when it is predicted to
+    # reduce the flow-matching residual left by the action update. ``budget`` and ``balance`` retain
+    # the earlier magnitude-only controllers for ablations and checkpoint compatibility.
     cabo_enabled: bool = False
     # Keep this as ``str`` rather than ``Literal``: draccus 0.10 cannot decode Literal fields from CLI.
     # ``__post_init__`` enforces the supported values below.
-    cabo_control_mode: str = "budget"
+    cabo_control_mode: str = "residual"
+    # Residual mode minimizes the linearized post-action flow loss plus this dimensionless
+    # regularizer times the squared VLM-induced drift. It discourages using VLM capacity for small,
+    # noisy improvements without tying the value to the absolute scale of the velocity units.
+    cabo_residual_regularization: float = 0.1
+    # Residual mode never amplifies the VLM AdamW candidate beyond this multiplier.
+    cabo_residual_vlm_max_scale: float = 1.0
     # Maximum multiplier in balance mode; attenuation is bounded by its reciprocal.
     cabo_balance_max_scale: float = 2.0
     cabo_action_drift_ratio: float = 0.1
@@ -155,9 +162,20 @@ class PI05Config(PreTrainedConfig):
                 f"action_head_grad_clip_ratio must be greater than 0, got {self.action_head_grad_clip_ratio}"
             )
 
-        if self.cabo_control_mode not in ("budget", "balance"):
+        if self.cabo_control_mode not in ("residual", "budget", "balance"):
             raise ValueError(
-                f"cabo_control_mode must be 'budget' or 'balance', got {self.cabo_control_mode!r}"
+                "cabo_control_mode must be 'residual', 'budget', or 'balance', "
+                f"got {self.cabo_control_mode!r}"
+            )
+        if not math.isfinite(self.cabo_residual_regularization) or self.cabo_residual_regularization < 0.0:
+            raise ValueError(
+                "cabo_residual_regularization must be finite and non-negative, "
+                f"got {self.cabo_residual_regularization}"
+            )
+        if not math.isfinite(self.cabo_residual_vlm_max_scale) or self.cabo_residual_vlm_max_scale <= 0.0:
+            raise ValueError(
+                "cabo_residual_vlm_max_scale must be finite and greater than 0, "
+                f"got {self.cabo_residual_vlm_max_scale}"
             )
         if not math.isfinite(self.cabo_balance_max_scale) or self.cabo_balance_max_scale < 1.0:
             raise ValueError(

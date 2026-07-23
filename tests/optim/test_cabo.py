@@ -27,6 +27,7 @@ from lerobot.optim.cabo import (
     temporary_optimizer_group_lr_scales,
     update_cabo_budget,
     update_cabo_influence_balance,
+    update_cabo_residual_compensation,
 )
 
 
@@ -114,6 +115,94 @@ def test_temporary_group_lr_scales_can_amplify_one_group_and_attenuate_another()
     )
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
     assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
+
+
+def test_cabo_residual_compensation_uses_vlm_only_for_post_action_residual():
+    controller_group = {}
+
+    vlm_scale, metrics = update_cabo_residual_compensation(
+        controller_group,
+        vlm_drift=4.0,
+        action_drift=9.0,
+        cross_drift=2.0,
+        residual_energy=16.0,
+        residual_vlm_alignment=-3.0,
+        residual_action_alignment=-5.0,
+        ema_decay=0.0,
+        regularization=0.0,
+        max_vlm_scale=1.0,
+    )
+
+    # After the full action update, <e + da, dv> = -3 + 2 = -1. The VLM therefore
+    # supplies exactly one quarter of its candidate update: -(-1) / Dv = 0.25.
+    assert vlm_scale == pytest.approx(0.25)
+    assert metrics["cabo/action_scale"] == pytest.approx(1.0)
+    assert metrics["cabo/post_action_vlm_alignment_ema"] == pytest.approx(-1.0)
+    assert metrics["cabo/predicted_action_only_residual_ema"] == pytest.approx(15.0)
+    assert metrics["cabo/predicted_joint_residual_ema"] == pytest.approx(14.75)
+    assert metrics["cabo/predicted_vlm_improvement_ema"] == pytest.approx(0.25)
+    assert controller_group["cabo_vlm_scale"] == pytest.approx(0.25)
+    assert controller_group["cabo_action_scale"] == pytest.approx(1.0)
+
+
+def test_cabo_residual_compensation_rejects_vlm_update_that_worsens_action_residual():
+    vlm_scale, metrics = update_cabo_residual_compensation(
+        {},
+        vlm_drift=1.0,
+        action_drift=1.0,
+        cross_drift=0.5,
+        residual_energy=4.0,
+        residual_vlm_alignment=0.25,
+        residual_action_alignment=-1.0,
+        ema_decay=0.0,
+        regularization=0.1,
+        max_vlm_scale=1.0,
+    )
+
+    assert vlm_scale == pytest.approx(0.0)
+    assert metrics["cabo/post_action_vlm_alignment_ema"] == pytest.approx(0.75)
+    assert metrics["cabo/predicted_vlm_improvement_ema"] == pytest.approx(0.0)
+    assert metrics["cabo/residual_scale_clamped"] == 1.0
+
+
+def test_cabo_residual_compensation_regularizes_and_caps_vlm_scale():
+    vlm_scale, metrics = update_cabo_residual_compensation(
+        {},
+        vlm_drift=1.0,
+        action_drift=1.0,
+        cross_drift=0.0,
+        residual_energy=9.0,
+        residual_vlm_alignment=-3.0,
+        residual_action_alignment=-1.0,
+        ema_decay=0.0,
+        regularization=1.0,
+        max_vlm_scale=1.0,
+    )
+
+    # The regularized unconstrained scale is 1.5, so the trust-region cap wins.
+    assert vlm_scale == pytest.approx(1.0)
+    assert metrics["cabo/residual_scale_clamped"] == 1.0
+
+
+def test_cabo_residual_compensation_preserves_state_on_nonfinite_probe():
+    controller_group = {"cabo_vlm_scale": 0.25, "cabo_action_scale": 1.0}
+
+    vlm_scale, metrics = update_cabo_residual_compensation(
+        controller_group,
+        vlm_drift=1.0,
+        action_drift=1.0,
+        cross_drift=0.0,
+        residual_energy=float("nan"),
+        residual_vlm_alignment=0.0,
+        residual_action_alignment=0.0,
+        ema_decay=0.0,
+        regularization=0.1,
+        max_vlm_scale=1.0,
+    )
+
+    assert vlm_scale == pytest.approx(0.25)
+    assert controller_group == {"cabo_vlm_scale": 0.25, "cabo_action_scale": 1.0}
+    assert metrics["cabo/probe_nonfinite"] == 1.0
 
 
 def test_cabo_influence_balance_symmetrically_equalizes_marginal_drift():

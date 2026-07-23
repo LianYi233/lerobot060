@@ -57,6 +57,7 @@ from lerobot.optim.cabo import (
     require_adamw,
     update_cabo_budget,
     update_cabo_influence_balance,
+    update_cabo_residual_compensation,
     validate_adamw_param_group,
 )
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
@@ -1276,7 +1277,7 @@ class PI05Policy(PreTrainedPolicy):
         *,
         step: int,
         process_index: int = 0,
-    ) -> tuple[Tensor | None, int]:
+    ) -> tuple[Tensor | None, Tensor | None, int]:
         batch_size = batch[ACTION].shape[0]
         action_horizon = batch[ACTION].shape[1]
         action_padding = batch.get(f"{ACTION}_is_pad")
@@ -1313,7 +1314,7 @@ class PI05Policy(PreTrainedPolicy):
 
             candidate_indices = torch.nonzero(valid_steps.any(dim=1), as_tuple=False).flatten()
             if candidate_indices.numel() == 0:
-                return None, 0
+                return None, None, 0
             permutation = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)
             selected_indices = candidate_indices[permutation[: self.config.cabo_probe_batch_size]]
             selected_valid_steps = valid_steps.index_select(0, selected_indices)
@@ -1336,10 +1337,12 @@ class PI05Policy(PreTrainedPolicy):
 
             original_action_dim = self.config.output_features[ACTION].shape[0]
             velocity = velocity[:, :, :original_action_dim]
+            target_velocity = (noise - actions)[:, :, :original_action_dim]
+            residual = (velocity - target_velocity).detach()
             valid_outputs = selected_valid_steps[:, :, None].expand_as(velocity)
             valid_output_elements = int(valid_outputs.sum().item())
             if valid_output_elements == 0:
-                return None, 0
+                return None, None, 0
             projections = (
                 torch.empty(
                     (self.config.cabo_num_projections, *velocity.shape),
@@ -1355,7 +1358,15 @@ class PI05Policy(PreTrainedPolicy):
         probe_scalars = torch.sum(projected_velocity, dim=tuple(range(1, projections.ndim))) / math.sqrt(
             valid_output_elements
         )
-        return probe_scalars, valid_output_elements
+        # The residual projections do not participate in autograd. Their products with the VLM and
+        # action candidate-update projections estimate whether each update points along a useful
+        # flow-loss descent direction, rather than merely measuring how large the update is.
+        projected_residual = residual.unsqueeze(0) * projections
+        projected_residual = projected_residual * valid_outputs.unsqueeze(0)
+        residual_projections = torch.sum(
+            projected_residual, dim=tuple(range(1, projections.ndim))
+        ) / math.sqrt(valid_output_elements)
+        return probe_scalars, residual_projections.detach(), valid_output_elements
 
     def compute_optimizer_step_control(
         self,
@@ -1370,12 +1381,14 @@ class PI05Policy(PreTrainedPolicy):
         adamw = require_adamw(optimizer)
         vlm_group = get_named_param_group(adamw, CABO_VLM_GROUP)
         action_group = get_named_param_group(adamw, CABO_ACTION_GROUP)
-        control_mode = getattr(self.config, "cabo_control_mode", "budget")
-        if control_mode not in ("budget", "balance"):
+        control_mode = getattr(self.config, "cabo_control_mode", "residual")
+        if control_mode not in ("residual", "budget", "balance"):
             raise ValueError(f"Unsupported CABO control mode: {control_mode!r}")
         step = int(action_group.get("cabo_step", 0))
         vlm_scale = float(action_group.get("cabo_vlm_scale", 1.0))
-        action_scale = float(action_group.get("cabo_action_scale", 1.0))
+        action_scale = (
+            1.0 if control_mode == "residual" else float(action_group.get("cabo_action_scale", 1.0))
+        )
 
         def current_group_scales() -> dict[str, float]:
             if control_mode == "balance":
@@ -1383,6 +1396,8 @@ class PI05Policy(PreTrainedPolicy):
                     CABO_VLM_GROUP: vlm_scale,
                     CABO_ACTION_GROUP: action_scale,
                 }
+            if control_mode == "residual":
+                return {CABO_VLM_GROUP: vlm_scale}
             return {CABO_ACTION_GROUP: action_scale}
 
         def current_scale_metrics() -> dict[str, float]:
@@ -1390,15 +1405,16 @@ class PI05Policy(PreTrainedPolicy):
                 "cabo/action_scale": action_scale,
                 "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
                 "cabo/control_mode_balance": float(control_mode == "balance"),
+                "cabo/control_mode_residual": float(control_mode == "residual"),
             }
-            if control_mode == "balance":
+            if control_mode in ("residual", "balance"):
                 metrics.update(
                     {
                         "cabo/vlm_scale": vlm_scale,
                         "cabo/effective_vlm_lr": float(vlm_group["lr"]) * vlm_scale,
                     }
                 )
-            else:
+            if control_mode == "budget":
                 metrics["cabo/budget"] = float(action_group.get("cabo_budget", 0.0))
             return metrics
 
@@ -1414,7 +1430,7 @@ class PI05Policy(PreTrainedPolicy):
         device = batch[ACTION].device
         process_index = int(getattr(accelerator, "process_index", 0))
         with torch.enable_grad(), accelerator.autocast():
-            probe_scalars, local_valid_elements = self._cabo_probe_velocity(
+            probe_scalars, residual_projections, local_valid_elements = self._cabo_probe_velocity(
                 batch, step=step, process_index=process_index
             )
 
@@ -1471,11 +1487,19 @@ class PI05Policy(PreTrainedPolicy):
                 for parameter in parameters_without_training_grad:
                     parameter.grad = None
 
+        residual_projection_values = (
+            torch.zeros(self.config.cabo_num_projections, dtype=torch.float32, device=device)
+            if residual_projections is None
+            else residual_projections.reshape(-1).to(dtype=torch.float32)
+        )
         local_probe_moments = torch.stack(
             [
                 projection_values[:, 0].square().mean(),
                 projection_values[:, 1].square().mean(),
                 (projection_values[:, 0] * projection_values[:, 1]).mean(),
+                residual_projection_values.square().mean(),
+                (residual_projection_values * projection_values[:, 0]).mean(),
+                (residual_projection_values * projection_values[:, 1]).mean(),
             ]
         )
         weighted_probe_statistics = torch.cat(
@@ -1485,7 +1509,7 @@ class PI05Policy(PreTrainedPolicy):
             ]
         )
         weighted_probe_statistics = accelerator.reduce(weighted_probe_statistics, reduction="sum")
-        global_valid_elements = float(weighted_probe_statistics[3].item())
+        global_valid_elements = float(weighted_probe_statistics[6].item())
         if global_valid_elements <= 0.0:
             # Keep the controller step unchanged so the next batch retries the scheduled probe.
             metrics = current_scale_metrics()
@@ -1502,9 +1526,30 @@ class PI05Policy(PreTrainedPolicy):
                 metrics=metrics,
             )
 
-        probe_moments = weighted_probe_statistics[:3] / global_valid_elements
-        vlm_drift, action_drift, cross_drift = (float(value.item()) for value in probe_moments)
-        if control_mode == "balance":
+        probe_moments = weighted_probe_statistics[:6] / global_valid_elements
+        (
+            vlm_drift,
+            action_drift,
+            cross_drift,
+            residual_energy,
+            residual_vlm_alignment,
+            residual_action_alignment,
+        ) = (float(value.item()) for value in probe_moments)
+        if control_mode == "residual":
+            vlm_scale, metrics = update_cabo_residual_compensation(
+                action_group,
+                vlm_drift=vlm_drift,
+                action_drift=action_drift,
+                cross_drift=cross_drift,
+                residual_energy=residual_energy,
+                residual_vlm_alignment=residual_vlm_alignment,
+                residual_action_alignment=residual_action_alignment,
+                ema_decay=self.config.cabo_drift_ema_decay,
+                regularization=self.config.cabo_residual_regularization,
+                max_vlm_scale=self.config.cabo_residual_vlm_max_scale,
+            )
+            action_scale = 1.0
+        elif control_mode == "balance":
             vlm_scale, action_scale, metrics = update_cabo_influence_balance(
                 action_group,
                 vlm_drift=vlm_drift,
@@ -1532,6 +1577,7 @@ class PI05Policy(PreTrainedPolicy):
                 {
                     "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
                     "cabo/control_mode_balance": float(control_mode == "balance"),
+                    "cabo/control_mode_residual": float(control_mode == "residual"),
                     "cabo/probe_applied": 1.0,
                     "cabo/probe_skipped_padding": 0.0,
                     "cabo/probe_valid_elements": global_valid_elements,
@@ -1540,7 +1586,7 @@ class PI05Policy(PreTrainedPolicy):
                     "optimizer_step/nonfinite_probe": 1.0,
                 }
             )
-            if control_mode == "balance":
+            if control_mode in ("residual", "balance"):
                 metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
             return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
 
@@ -1549,13 +1595,14 @@ class PI05Policy(PreTrainedPolicy):
             {
                 "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
                 "cabo/control_mode_balance": float(control_mode == "balance"),
+                "cabo/control_mode_residual": float(control_mode == "residual"),
                 "cabo/probe_applied": 1.0,
                 "cabo/probe_skipped_padding": 0.0,
                 "cabo/probe_valid_elements": global_valid_elements,
                 "cabo/num_projections": float(self.config.cabo_num_projections),
             }
         )
-        if control_mode == "balance":
+        if control_mode in ("residual", "balance"):
             metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
         return OptimizerStepControl(
             group_scales=current_group_scales(),
@@ -1579,7 +1626,9 @@ class PI05Policy(PreTrainedPolicy):
         clipping interface.
         """
         _ = accelerator
-        if getattr(self.config, "cabo_enabled", False):
+        cabo_enabled = getattr(self.config, "cabo_enabled", False)
+        cabo_control_mode = getattr(self.config, "cabo_control_mode", "residual")
+        if cabo_enabled and cabo_control_mode != "residual":
             return {
                 "action_head_clip_applied": 0.0,
                 "cabo/gradient_clip_disabled": 1.0,
