@@ -28,6 +28,7 @@ pytest.importorskip("transformers")
 
 from lerobot.optim.cabo import CABO_ACTION_GROUP, CABO_VLM_GROUP  # noqa: E402
 from lerobot.policies.pi05 import PI05Policy  # noqa: E402
+from lerobot.policies.pi05.modeling_pi05 import _reduce_action_losses, _valid_action_steps  # noqa: E402
 from lerobot.utils.constants import (  # noqa: E402
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -48,6 +49,7 @@ class _FakeAccelerator:
 
 class _TinyCABOPolicy(nn.Module):
     compute_optimizer_step_control = PI05Policy.compute_optimizer_step_control
+    get_optim_params = PI05Policy.get_optim_params
     validate_optimizer_step_control = PI05Policy.validate_optimizer_step_control
 
     def __init__(self):
@@ -83,6 +85,92 @@ class _TinyCABOPolicy(nn.Module):
 
     def _cabo_parameter_groups(self):
         return [self.vlm_weight], [self.action_weight]
+
+
+def test_pi05_action_loss_and_cabo_share_padding_mask():
+    batch = {
+        ACTION: torch.zeros(2, 3, 2),
+        f"{ACTION}_is_pad": torch.tensor(
+            [
+                [[False], [True], [False]],
+                [[True], [True], [True]],
+            ]
+        ),
+    }
+    losses = torch.tensor(
+        [
+            [[1.0, 3.0], [100.0, 100.0], [5.0, 7.0]],
+            [[100.0, 100.0], [100.0, 100.0], [100.0, 100.0]],
+        ],
+        requires_grad=True,
+    )
+
+    valid_steps = _valid_action_steps(batch)
+    loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, valid_steps)
+
+    torch.testing.assert_close(
+        valid_steps,
+        torch.tensor([[True, False, True], [False, False, False]]),
+    )
+    assert loss.item() == pytest.approx(4.0)
+    torch.testing.assert_close(per_sample_loss, torch.tensor([4.0, 0.0]))
+    torch.testing.assert_close(loss_per_dim, torch.tensor([3.0, 5.0]))
+
+    loss.backward()
+    expected_gradient = torch.tensor(
+        [
+            [[0.25, 0.25], [0.0, 0.0], [0.25, 0.25]],
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+        ]
+    )
+    torch.testing.assert_close(losses.grad, expected_gradient)
+
+
+def test_pi05_valid_action_steps_rejects_misaligned_padding():
+    batch = {
+        ACTION: torch.zeros(2, 3, 2),
+        f"{ACTION}_is_pad": torch.zeros(5, dtype=torch.bool),
+    }
+
+    with pytest.raises(ValueError, match="must align with the action horizon"):
+        _valid_action_steps(batch)
+
+
+def test_pi05_cabo_supports_differential_group_learning_rates():
+    policy = _TinyCABOPolicy()
+    policy.config.cabo_vlm_optimizer_lr = 2.5e-5
+    policy.config.cabo_action_optimizer_lr = 1.0e-4
+
+    groups = policy.get_optim_params()
+
+    assert groups[0]["name"] == CABO_VLM_GROUP
+    assert groups[0]["lr"] == pytest.approx(2.5e-5)
+    assert groups[1]["name"] == CABO_ACTION_GROUP
+    assert groups[1]["lr"] == pytest.approx(1.0e-4)
+
+
+def test_pi05_cabo_warmup_defers_noisy_probes():
+    policy = _TinyCABOPolicy()
+    policy.config.cabo_warmup_steps = 2
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [policy.vlm_weight], "name": CABO_VLM_GROUP},
+            {"params": [policy.action_weight], "name": CABO_ACTION_GROUP},
+        ],
+        lr=0.1,
+    )
+    policy.vlm_weight.grad = torch.ones_like(policy.vlm_weight)
+    policy.action_weight.grad = torch.ones_like(policy.action_weight)
+
+    control = policy.compute_optimizer_step_control(
+        {ACTION: torch.ones(1, 1, 1)},
+        optimizer,
+        _FakeAccelerator(),
+    )
+
+    assert control.metrics["cabo/warmup_active"] == 1.0
+    assert control.metrics["cabo/probe_applied"] == 0.0
+    assert optimizer.param_groups[1]["cabo_step"] == 1
 
 
 class _RankSparseCABOPolicy(_TinyCABOPolicy):
