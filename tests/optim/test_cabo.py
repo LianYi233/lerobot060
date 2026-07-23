@@ -165,6 +165,26 @@ def test_cabo_residual_compensation_rejects_vlm_update_that_worsens_action_resid
     assert metrics["cabo/residual_scale_clamped"] == 1.0
 
 
+def test_cabo_residual_compensation_can_preserve_a_vlm_learning_floor():
+    vlm_scale, metrics = update_cabo_residual_compensation(
+        {},
+        vlm_drift=1.0,
+        action_drift=1.0,
+        cross_drift=0.5,
+        residual_energy=4.0,
+        residual_vlm_alignment=0.25,
+        residual_action_alignment=-1.0,
+        ema_decay=0.0,
+        regularization=0.1,
+        min_vlm_scale=0.1,
+        max_vlm_scale=1.0,
+    )
+
+    assert vlm_scale == pytest.approx(0.1)
+    assert metrics["cabo/residual_scale_at_floor"] == 1.0
+    assert metrics["cabo/residual_scale_clamped"] == 1.0
+
+
 def test_cabo_residual_compensation_regularizes_and_caps_vlm_scale():
     vlm_scale, metrics = update_cabo_residual_compensation(
         {},
