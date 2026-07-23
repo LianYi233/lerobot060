@@ -62,8 +62,6 @@ class PI05Config(PreTrainedConfig):
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
-
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -82,14 +80,12 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
-    # Optimizer settings. Action and VLM parameters share this single AdamW learning rate.
-    optimizer_lr: float = 2.5e-4
+    # Optimizer settings. Keep the stable LeRobot PI0.5 baseline for non-CABO training.
+    optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
-    # Global clipping is disabled for PI05. Its policy-specific hook clips only action-side gradients
-    # against the VLM gradient RMS and deliberately leaves VLM gradients unchanged.
-    optimizer_grad_clip_norm: float = 0.0
+    optimizer_grad_clip_norm: float = 1.0
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:
@@ -111,8 +107,16 @@ class PI05Config(PreTrainedConfig):
     # regularizer times the squared VLM-induced drift. It discourages using VLM capacity for small,
     # noisy improvements without tying the value to the absolute scale of the velocity units.
     cabo_residual_regularization: float = 0.1
+    # Optional floor that prevents noisy one-step probes from completely freezing representation
+    # learning. Zero preserves the exact residual controller.
+    cabo_residual_vlm_min_scale: float = 0.0
     # Residual mode never amplifies the VLM AdamW candidate beyond this multiplier.
     cabo_residual_vlm_max_scale: float = 1.0
+    # Optional differential learning rates. ``None`` inherits ``optimizer_lr``.
+    cabo_vlm_optimizer_lr: float | None = None
+    cabo_action_optimizer_lr: float | None = None
+    # Delay probing until AdamW moments and the action expert have a useful initial estimate.
+    cabo_warmup_steps: int = 0
     # Maximum multiplier in balance mode; attenuation is bounded by its reciprocal.
     cabo_balance_max_scale: float = 2.0
     cabo_action_drift_ratio: float = 0.1
@@ -135,7 +139,7 @@ class PI05Config(PreTrainedConfig):
     # For example, --steps=3000 will scale warmup to 100 and decay to 3000
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
-    scheduler_decay_lr: float = 2.5e-5
+    scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
@@ -172,11 +176,32 @@ class PI05Config(PreTrainedConfig):
                 "cabo_residual_regularization must be finite and non-negative, "
                 f"got {self.cabo_residual_regularization}"
             )
+        if (
+            not math.isfinite(self.cabo_residual_vlm_min_scale)
+            or self.cabo_residual_vlm_min_scale < 0.0
+        ):
+            raise ValueError(
+                "cabo_residual_vlm_min_scale must be finite and non-negative, "
+                f"got {self.cabo_residual_vlm_min_scale}"
+            )
         if not math.isfinite(self.cabo_residual_vlm_max_scale) or self.cabo_residual_vlm_max_scale <= 0.0:
             raise ValueError(
                 "cabo_residual_vlm_max_scale must be finite and greater than 0, "
                 f"got {self.cabo_residual_vlm_max_scale}"
             )
+        if self.cabo_residual_vlm_min_scale > self.cabo_residual_vlm_max_scale:
+            raise ValueError(
+                "cabo_residual_vlm_min_scale cannot exceed cabo_residual_vlm_max_scale, "
+                f"got min={self.cabo_residual_vlm_min_scale}, max={self.cabo_residual_vlm_max_scale}"
+            )
+        for name, learning_rate in (
+            ("cabo_vlm_optimizer_lr", self.cabo_vlm_optimizer_lr),
+            ("cabo_action_optimizer_lr", self.cabo_action_optimizer_lr),
+        ):
+            if learning_rate is not None and (not math.isfinite(learning_rate) or learning_rate <= 0.0):
+                raise ValueError(f"{name} must be finite and greater than 0, got {learning_rate}")
+        if self.cabo_warmup_steps < 0:
+            raise ValueError(f"cabo_warmup_steps must be non-negative, got {self.cabo_warmup_steps}")
         if not math.isfinite(self.cabo_balance_max_scale) or self.cabo_balance_max_scale < 1.0:
             raise ValueError(
                 f"cabo_balance_max_scale must be finite and at least 1, got {self.cabo_balance_max_scale}"
