@@ -85,6 +85,9 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     parameters = [nn.Parameter(torch.zeros(())), nn.Parameter(torch.ones(()))]
     optimizer = optimizer_config.build(parameters)
 
+    assert config.chunk_size == 10
+    assert config.n_action_steps == 10
+    assert config.replan_interval == 10
     assert config.optimizer_grad_clip_norm == 1.0
     assert optimizer_config.grad_clip_norm == 1.0
     assert optimizer_config.lr == pytest.approx(2.5e-5)
@@ -118,6 +121,20 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert config.cabo_num_projections == 4
     assert config.cabo_base_action_scale == pytest.approx(0.1)
     assert config.cabo_negative_cross_discount == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("chunk_size", 0),
+        ("n_action_steps", 0),
+        ("replan_interval", 0),
+        ("replan_interval", -1),
+    ],
+)
+def test_pi05_rejects_invalid_action_horizons(field: str, value: int):
+    with pytest.raises(ValueError, match=field):
+        PI05Config(**{field: value})
 
 
 @pytest.mark.parametrize(
