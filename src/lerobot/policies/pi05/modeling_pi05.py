@@ -1753,10 +1753,22 @@ class PI05Policy(PreTrainedPolicy):
 
     def reset(self):
         """Reset internal state - called when environment resets."""
-        self._action_queue = deque(maxlen=self.config.n_action_steps)
+        execution_horizon = self._execution_horizon()
+        self._action_queue = deque(maxlen=execution_horizon)
         self._queues = {
-            ACTION: deque(maxlen=self.config.n_action_steps),
+            ACTION: deque(maxlen=execution_horizon),
         }
+
+    def _execution_horizon(self) -> int:
+        """Return the receding-horizon action count used by ``select_action``.
+
+        ``n_action_steps`` is retained as a checkpoint-compatible upper bound.
+        ``replan_interval`` lets newer code safely shorten the open-loop
+        interval of an older checkpoint without changing its learned action
+        chunk shape.
+        """
+        replan_interval = getattr(self.config, "replan_interval", self.config.n_action_steps)
+        return min(self.config.n_action_steps, replan_interval)
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1854,10 +1866,14 @@ class PI05Policy(PreTrainedPolicy):
 
         self.eval()
 
-        # Action queue logic for n_action_steps > 1
+        # Execute only a short prefix, then observe and predict a fresh chunk.
+        # This is important after contacts such as grasping, placing, opening,
+        # or closing, where the remainder of a long open-loop chunk quickly
+        # becomes stale.
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-            # Transpose to get shape (n_action_steps, batch_size, action_dim)
+            execution_horizon = self._execution_horizon()
+            actions = self.predict_action_chunk(batch)[:, :execution_horizon]
+            # Transpose to get shape (execution_horizon, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
