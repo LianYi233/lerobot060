@@ -35,8 +35,15 @@ class PI05Config(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    # LIBERO benefits from short, receding-horizon control. OpenPI's PI0.5 LIBERO
+    # recipe trains a 10-step action horizon, while the historical LeRobot
+    # default predicted and executed 50 steps open loop.
+    chunk_size: int = 10  # Number of action steps to predict, in OpenPI called "action_horizon"
+    n_action_steps: int = 10  # Maximum number of predicted action steps to enqueue
+    # Cap the number of actions executed before observing the environment again.
+    # This separate field also makes old checkpoints that saved
+    # n_action_steps=50 replan every 10 steps when loaded by newer code.
+    replan_interval: int = 10
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -147,10 +154,16 @@ class PI05Config(PreTrainedConfig):
         super().__post_init__()
 
         # Validate configuration
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be greater than 0, got {self.chunk_size}")
+        if self.n_action_steps <= 0:
+            raise ValueError(f"n_action_steps must be greater than 0, got {self.n_action_steps}")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
+        if self.replan_interval <= 0:
+            raise ValueError(f"replan_interval must be greater than 0, got {self.replan_interval}")
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
