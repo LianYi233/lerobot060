@@ -79,6 +79,37 @@ lerobot-train \
   - [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
   - [lerobot/pi05_libero](https://huggingface.co/lerobot/pi05_libero) (specifically trained on the Libero dataset)
 
+### LIBERO Receding-Horizon Control
+
+For LIBERO, train and execute short 10-step chunks. This matches the OpenPI PI0.5 LIBERO action
+horizon and prevents a policy from blindly finishing a stale 50-step chunk after grasping or placing
+changes the scene:
+
+```bash
+lerobot-train \
+    ... \
+    --policy.chunk_size=10 \
+    --policy.n_action_steps=10 \
+    --policy.replan_interval=10 \
+    --steps=30000
+```
+
+`replan_interval` is intentionally separate from the learned `chunk_size`. A checkpoint trained with
+the older 50-step shape remains loadable, but only the first 10 actions are executed before a new
+observation is processed. This makes it possible to test the change on an existing checkpoint without
+retraining:
+
+```bash
+lerobot-eval \
+    --policy.path=/path/to/checkpoint \
+    --policy.replan_interval=10 \
+    ...
+```
+
+For an evaluation ablation, compare intervals 5, 10, and 20 on the same initial states. Use 10 as the
+default; 5 is more reactive but roughly doubles inference frequency, while 20 is cheaper but more
+open loop.
+
 ### Training Parameters Explained
 
 Fresh π₀.₅ configurations use the stable LeRobot AdamW baseline of `2.5e-5`. After warmup, the
@@ -169,6 +200,9 @@ the CABO controller state.
 
 | Parameter                       | Default  | Description                                                |
 | ------------------------------- | -------- | ---------------------------------------------------------- |
+| `chunk_size`                    | `10`     | Predicted action horizon; use 10 for LIBERO                |
+| `n_action_steps`                | `10`     | Maximum predicted actions placed in the execution queue    |
+| `replan_interval`               | `10`     | Actions executed before observing and replanning again     |
 | `optimizer_lr`                  | `2.5e-5` | Stable AdamW baseline learning rate                         |
 | `scheduler_decay_lr`            | `2.5e-6` | Learning-rate floor after cosine decay                      |
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
@@ -214,7 +248,7 @@ lerobot-edit-dataset \
     --repo_id your_dataset \
     --operation.type recompute_stats \
     --operation.relative_action true \
-    --operation.chunk_size 50 \
+    --operation.chunk_size 10 \
     --operation.relative_exclude_joints "['gripper']" \
     --push_to_hub true
 ```
@@ -225,11 +259,11 @@ Or equivalently in Python:
 from lerobot.datasets import LeRobotDataset, recompute_stats
 
 dataset = LeRobotDataset("your_dataset")
-recompute_stats(dataset, relative_action=True, chunk_size=50, relative_exclude_joints=["gripper"])
+recompute_stats(dataset, relative_action=True, chunk_size=10, relative_exclude_joints=["gripper"])
 dataset.push_to_hub()
 ```
 
-The `chunk_size` should match your policy's `chunk_size` (default 50 for π₀.₅). `relative_exclude_joints` lists joint names that should remain in absolute space (e.g. gripper commands). Use `--push_to_hub true` to upload the updated stats to the Hub.
+The `chunk_size` should match your policy's `chunk_size` (default 10 for π₀.₅). `relative_exclude_joints` lists joint names that should remain in absolute space (e.g. gripper commands). Use `--push_to_hub true` to upload the updated stats to the Hub.
 
 Then train with relative actions enabled:
 
