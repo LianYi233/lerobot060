@@ -254,8 +254,8 @@ class TrainPipelineConfig(HubMixin):
 
         if getattr(active_cfg, "cabo_enabled", False) and not self.use_policy_training_preset:
             raise ValueError(
-                "PI0.5 CABO requires use_policy_training_preset=True so its named VLM/action "
-                "optimizer parameter groups are constructed correctly."
+                "PI0.5 CABO requires use_policy_training_preset=True so its named VLM, action "
+                "expert, and action projection optimizer groups are constructed correctly."
             )
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:

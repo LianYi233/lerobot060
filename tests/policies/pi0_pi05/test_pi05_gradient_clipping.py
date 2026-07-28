@@ -59,7 +59,6 @@ def _make_policy_with_gradients(
             clip_action_head_by_vlm=True,
             action_head_grad_clip_ratio=action_head_grad_clip_ratio,
             cabo_enabled=False,
-            cabo_control_mode="residual",
         ),
     )
 
@@ -104,16 +103,11 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
     assert not config.cabo_enabled
-    assert config.cabo_control_mode == "residual"
-    assert config.cabo_residual_regularization == pytest.approx(0.1)
-    assert config.cabo_residual_vlm_max_scale == pytest.approx(1.0)
-    assert config.cabo_balance_max_scale == pytest.approx(2.0)
-    assert config.cabo_action_drift_ratio == pytest.approx(0.1)
-    assert config.cabo_probe_interval == 8
-    assert config.cabo_probe_batch_size == 1
-    assert config.cabo_num_projections == 4
-    assert config.cabo_base_action_scale == pytest.approx(0.1)
-    assert config.cabo_negative_cross_discount == pytest.approx(0.5)
+    assert config.cabo_expert_update_ratio == pytest.approx(2.0)
+    assert config.cabo_projection_update_ratio == pytest.approx(5.0)
+    assert config.cabo_vlm_update_ema_decay == pytest.approx(0.95)
+    assert config.cabo_update_warmup_steps == 100
+    assert config.cabo_vlm_update_floor_ratio == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize(
@@ -125,71 +119,49 @@ def test_pi05_rejects_invalid_action_head_grad_clip_ratio(action_head_grad_clip_
         PI05Config(action_head_grad_clip_ratio=action_head_grad_clip_ratio)
 
 
-@pytest.mark.parametrize("cabo_action_drift_ratio", [0.0, -1.0, 1.1])
-def test_pi05_rejects_invalid_cabo_action_drift_ratio(cabo_action_drift_ratio: float):
-    with pytest.raises(ValueError, match="cabo_action_drift_ratio"):
-        PI05Config(cabo_action_drift_ratio=cabo_action_drift_ratio)
-
-
-def test_pi05_rejects_invalid_cabo_control_mode():
-    with pytest.raises(ValueError, match="cabo_control_mode"):
-        PI05Config(cabo_control_mode="unknown")
-
-
-@pytest.mark.parametrize("cabo_residual_regularization", [-0.1, float("nan"), float("inf")])
-def test_pi05_rejects_invalid_cabo_residual_regularization(cabo_residual_regularization: float):
-    with pytest.raises(ValueError, match="cabo_residual_regularization"):
-        PI05Config(cabo_residual_regularization=cabo_residual_regularization)
-
-
 @pytest.mark.parametrize(
-    "cabo_residual_vlm_max_scale",
-    [0.0, -0.1, float("nan"), float("inf")],
+    "field,value",
+    [
+        ("cabo_expert_update_ratio", 0.0),
+        ("cabo_expert_update_ratio", float("nan")),
+        ("cabo_projection_update_ratio", -1.0),
+        ("cabo_projection_update_ratio", float("inf")),
+    ],
 )
-def test_pi05_rejects_invalid_cabo_residual_vlm_max_scale(cabo_residual_vlm_max_scale: float):
-    with pytest.raises(ValueError, match="cabo_residual_vlm_max_scale"):
-        PI05Config(cabo_residual_vlm_max_scale=cabo_residual_vlm_max_scale)
+def test_pi05_rejects_invalid_cabo_update_ratio(field: str, value: float):
+    with pytest.raises(ValueError, match=field):
+        PI05Config(**{field: value})
 
 
-def test_pi05_cabo_control_mode_decodes_from_nested_cli_argument():
+def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
     config = draccus.parse(
         TrainPipelineConfig,
         args=[
             "--dataset.repo_id=user/repo",
             "--policy.type=pi05",
-            "--policy.cabo_control_mode=balance",
+            "--policy.cabo_projection_update_ratio=3.5",
         ],
     )
 
     assert isinstance(config.policy, PI05Config)
-    assert config.policy.cabo_control_mode == "balance"
+    assert config.policy.cabo_projection_update_ratio == pytest.approx(3.5)
 
 
-@pytest.mark.parametrize(
-    "cabo_balance_max_scale",
-    [0.0, 0.5, float("nan"), float("inf"), float("-inf")],
-)
-def test_pi05_rejects_invalid_cabo_balance_max_scale(cabo_balance_max_scale: float):
-    with pytest.raises(ValueError, match="cabo_balance_max_scale"):
-        PI05Config(cabo_balance_max_scale=cabo_balance_max_scale)
+@pytest.mark.parametrize("cabo_vlm_update_ema_decay", [-0.1, 1.0, float("nan")])
+def test_pi05_rejects_invalid_cabo_ema_decay(cabo_vlm_update_ema_decay: float):
+    with pytest.raises(ValueError, match="cabo_vlm_update_ema_decay"):
+        PI05Config(cabo_vlm_update_ema_decay=cabo_vlm_update_ema_decay)
 
 
-@pytest.mark.parametrize("cabo_num_projections", [0, 1, -1])
-def test_pi05_rejects_too_few_cabo_projections(cabo_num_projections: int):
-    with pytest.raises(ValueError, match="cabo_num_projections"):
-        PI05Config(cabo_num_projections=cabo_num_projections)
+def test_pi05_rejects_negative_cabo_warmup():
+    with pytest.raises(ValueError, match="cabo_update_warmup_steps"):
+        PI05Config(cabo_update_warmup_steps=-1)
 
 
-@pytest.mark.parametrize("cabo_base_action_scale", [-0.1, 1.1])
-def test_pi05_rejects_invalid_cabo_base_action_scale(cabo_base_action_scale: float):
-    with pytest.raises(ValueError, match="cabo_base_action_scale"):
-        PI05Config(cabo_base_action_scale=cabo_base_action_scale)
-
-
-@pytest.mark.parametrize("cabo_negative_cross_discount", [-0.1, 1.1])
-def test_pi05_rejects_invalid_cabo_negative_cross_discount(cabo_negative_cross_discount: float):
-    with pytest.raises(ValueError, match="cabo_negative_cross_discount"):
-        PI05Config(cabo_negative_cross_discount=cabo_negative_cross_discount)
+@pytest.mark.parametrize("cabo_vlm_update_floor_ratio", [-0.1, 1.1])
+def test_pi05_rejects_invalid_cabo_vlm_floor_ratio(cabo_vlm_update_floor_ratio: float):
+    with pytest.raises(ValueError, match="cabo_vlm_update_floor_ratio"):
+        PI05Config(cabo_vlm_update_floor_ratio=cabo_vlm_update_floor_ratio)
 
 
 def test_pi05_rejects_cabo_with_expert_only_training():
@@ -212,29 +184,12 @@ def test_pi05_cabo_requires_policy_training_preset(tmp_path):
         config.validate()
 
 
-def test_pi05_cabo_residual_mode_keeps_action_gradient_clipping():
+def test_pi05_cabo_disables_relative_gradient_clipping_hook():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
         action_gradient=20.0,
         vlm_gradient=1.0,
     )
     policy.config.cabo_enabled = True
-    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
-
-    metrics = PI05Policy.clip_gradients(policy)
-
-    assert metrics["action_head_clip_applied"] == 1.0
-    assert _gradient_rms(action_parameters) == pytest.approx(10.0, abs=1e-6)
-    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
-        assert torch.equal(parameter.grad, gradient_before)
-
-
-def test_pi05_cabo_legacy_budget_mode_disables_gradient_clipping_hook():
-    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
-        action_gradient=20.0,
-        vlm_gradient=1.0,
-    )
-    policy.config.cabo_enabled = True
-    policy.config.cabo_control_mode = "budget"
     action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
     vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
 

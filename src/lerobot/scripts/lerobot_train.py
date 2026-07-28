@@ -143,9 +143,9 @@ def _prepare_policy_optimizer_step_control(
     if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
         return OptimizerStepControl()
 
-    # The main backward pass has already synchronized DDP gradients. CABO's probe gradients are
-    # local Jacobian-vector products and are reduced explicitly as two scalars, so suppress a second
-    # full gradient synchronization here.
+    # The main backward pass has already synchronized DDP gradients. The controller only inspects
+    # those gradients and reduces aggregate update-norm scalars, so suppress any redundant full
+    # gradient synchronization inside the policy hook.
     no_sync = accelerator.no_sync(policy) if has_method(accelerator, "no_sync") else nullcontext()
     with no_sync:
         result = unwrapped_policy.compute_optimizer_step_control(
@@ -521,8 +521,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if getattr(cfg.trainable_config, "cabo_enabled", False) and incompatible_groups:
                 raise ValueError(
                     "A non-CABO optimizer checkpoint cannot be resumed with CABO enabled because CABO "
-                    "uses named VLM/action parameter groups. Start a new run from the checkpoint's model "
-                    "weights, or resume a checkpoint that was already trained with CABO."
+                    "uses named VLM, action expert, and action projection parameter groups. Start a "
+                    "new run from the checkpoint's model weights, or resume a checkpoint that was "
+                    "already trained with this CABO parameter-group layout."
                 ) from exc
             raise
 

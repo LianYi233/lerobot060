@@ -98,37 +98,18 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = True
     action_head_grad_clip_ratio: float = 10.0
 
-    # Experimental counterfactual action-space optimizer control (CABO). CABO estimates the
-    # linearized flow-velocity change of the next VLM and action-side AdamW updates. ``residual``
-    # keeps the action update at full scale and applies the VLM update only when it is predicted to
-    # reduce the flow-matching residual left by the action update. ``budget`` and ``balance`` retain
-    # the earlier magnitude-only controllers for ablations and checkpoint compatibility.
+    # Relative-update optimizer control (CABO). CABO deterministically computes the next AdamW
+    # learning update for each parameter group, keeps the VLM update at full scale, and limits the
+    # action expert/projection relative update rates against an EMA of the VLM relative update rate.
+    # Weight decay is excluded from the measured learning rates so it is not mistaken for VLM signal.
     cabo_enabled: bool = False
-    # Keep this as ``str`` rather than ``Literal``: draccus 0.10 cannot decode Literal fields from CLI.
-    # ``__post_init__`` enforces the supported values below.
-    cabo_control_mode: str = "residual"
-    # Residual mode minimizes the linearized post-action flow loss plus this dimensionless
-    # regularizer times the squared VLM-induced drift. It discourages using VLM capacity for small,
-    # noisy improvements without tying the value to the absolute scale of the velocity units.
-    cabo_residual_regularization: float = 0.1
-    # Residual mode never amplifies the VLM AdamW candidate beyond this multiplier.
-    cabo_residual_vlm_max_scale: float = 1.0
-    # Maximum multiplier in balance mode; attenuation is bounded by its reciprocal.
-    cabo_balance_max_scale: float = 2.0
-    cabo_action_drift_ratio: float = 0.1
-    cabo_probe_interval: int = 8
-    cabo_probe_batch_size: int = 1
-    cabo_num_projections: int = 4
-    # Dimensionless action-only allowance. When VLM drift is zero, this grants approximately this
-    # fraction of the full candidate action step instead of starving the action side completely. A
-    # positive value deliberately relaxes the pure relative-drift bound.
-    cabo_base_action_scale: float = 0.1
-    # Positive cross drift is charged fully. Negative (cancelling) cross drift receives only this
-    # fraction of its measured credit to avoid trusting noisy cancellation estimates too strongly.
-    cabo_negative_cross_discount: float = 0.5
-    cabo_drift_ema_decay: float = 0.9
-    cabo_budget_decay: float = 0.95
-    cabo_budget_cap_windows: float = 4.0
+    cabo_expert_update_ratio: float = 2.0
+    cabo_projection_update_ratio: float = 5.0
+    cabo_vlm_update_ema_decay: float = 0.95
+    # Keep both action groups unrestricted while collecting a stable VLM reference.
+    cabo_update_warmup_steps: int = 100
+    # After warmup, retain this fraction of the warmup-average VLM rate as a reference floor.
+    cabo_vlm_update_floor_ratio: float = 0.1
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps
@@ -162,51 +143,26 @@ class PI05Config(PreTrainedConfig):
                 f"action_head_grad_clip_ratio must be greater than 0, got {self.action_head_grad_clip_ratio}"
             )
 
-        if self.cabo_control_mode not in ("residual", "budget", "balance"):
+        for name, value in (
+            ("cabo_expert_update_ratio", self.cabo_expert_update_ratio),
+            ("cabo_projection_update_ratio", self.cabo_projection_update_ratio),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and greater than 0, got {value}")
+        if not 0.0 <= self.cabo_vlm_update_ema_decay < 1.0:
             raise ValueError(
-                "cabo_control_mode must be 'residual', 'budget', or 'balance', "
-                f"got {self.cabo_control_mode!r}"
+                "cabo_vlm_update_ema_decay must be in [0, 1), "
+                f"got {self.cabo_vlm_update_ema_decay}"
             )
-        if not math.isfinite(self.cabo_residual_regularization) or self.cabo_residual_regularization < 0.0:
+        if self.cabo_update_warmup_steps < 0:
             raise ValueError(
-                "cabo_residual_regularization must be finite and non-negative, "
-                f"got {self.cabo_residual_regularization}"
+                "cabo_update_warmup_steps must be non-negative, "
+                f"got {self.cabo_update_warmup_steps}"
             )
-        if not math.isfinite(self.cabo_residual_vlm_max_scale) or self.cabo_residual_vlm_max_scale <= 0.0:
+        if not 0.0 <= self.cabo_vlm_update_floor_ratio <= 1.0:
             raise ValueError(
-                "cabo_residual_vlm_max_scale must be finite and greater than 0, "
-                f"got {self.cabo_residual_vlm_max_scale}"
-            )
-        if not math.isfinite(self.cabo_balance_max_scale) or self.cabo_balance_max_scale < 1.0:
-            raise ValueError(
-                f"cabo_balance_max_scale must be finite and at least 1, got {self.cabo_balance_max_scale}"
-            )
-        if not 0.0 < self.cabo_action_drift_ratio <= 1.0:
-            raise ValueError(f"cabo_action_drift_ratio must be in (0, 1], got {self.cabo_action_drift_ratio}")
-        if self.cabo_probe_interval <= 0:
-            raise ValueError(f"cabo_probe_interval must be greater than 0, got {self.cabo_probe_interval}")
-        if self.cabo_probe_batch_size <= 0:
-            raise ValueError(
-                f"cabo_probe_batch_size must be greater than 0, got {self.cabo_probe_batch_size}"
-            )
-        if self.cabo_num_projections < 2:
-            raise ValueError(
-                "cabo_num_projections must be at least 2 to estimate cross drift, "
-                f"got {self.cabo_num_projections}"
-            )
-        if not 0.0 <= self.cabo_base_action_scale <= 1.0:
-            raise ValueError(f"cabo_base_action_scale must be in [0, 1], got {self.cabo_base_action_scale}")
-        if not 0.0 <= self.cabo_negative_cross_discount <= 1.0:
-            raise ValueError(
-                f"cabo_negative_cross_discount must be in [0, 1], got {self.cabo_negative_cross_discount}"
-            )
-        if not 0.0 <= self.cabo_drift_ema_decay < 1.0:
-            raise ValueError(f"cabo_drift_ema_decay must be in [0, 1), got {self.cabo_drift_ema_decay}")
-        if not 0.0 <= self.cabo_budget_decay < 1.0:
-            raise ValueError(f"cabo_budget_decay must be in [0, 1), got {self.cabo_budget_decay}")
-        if not math.isfinite(self.cabo_budget_cap_windows) or self.cabo_budget_cap_windows < 1.0:
-            raise ValueError(
-                f"cabo_budget_cap_windows must be finite and at least 1, got {self.cabo_budget_cap_windows}"
+                "cabo_vlm_update_floor_ratio must be in [0, 1], "
+                f"got {self.cabo_vlm_update_floor_ratio}"
             )
         if self.cabo_enabled and self.train_expert_only:
             raise ValueError(

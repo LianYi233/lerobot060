@@ -48,16 +48,16 @@ else:
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.cabo import (
-    CABO_ACTION_GROUP,
+    CABO_ACTION_EXPERT_GROUP,
+    CABO_ACTION_PROJECTION_GROUP,
     CABO_GROUP_NAME,
     CABO_VLM_GROUP,
     OptimizerStepControl,
-    candidate_update_projection,
+    adamw_group_relative_update_moments,
     get_named_param_group,
+    relative_update_rate,
     require_adamw,
-    update_cabo_budget,
-    update_cabo_influence_balance,
-    update_cabo_residual_compensation,
+    update_cabo_relative_update_scales,
     validate_adamw_param_group,
 )
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
@@ -780,11 +780,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
-        """Predict flow velocity for explicit noisy actions and timesteps.
-
-        Keeping this entry point eager gives CABO a deterministic differentiable probe even when the
-        regular training ``forward`` is wrapped with ``torch.compile``.
-        """
+        """Predict flow velocity for explicit noisy actions and timesteps."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
@@ -1186,6 +1182,17 @@ class PI05Policy(PreTrainedPolicy):
     def _vlm_modules(self) -> list[nn.Module]:
         return [self.model.paligemma_with_expert.paligemma]
 
+    def _action_expert_modules(self) -> list[nn.Module]:
+        return [self.model.paligemma_with_expert.gemma_expert]
+
+    def _action_projection_modules(self) -> list[nn.Module]:
+        return [
+            self.model.action_in_proj,
+            self.model.action_out_proj,
+            self.model.time_mlp_in,
+            self.model.time_mlp_out,
+        ]
+
     def _action_modules(self) -> list[nn.Module]:
         return [
             self.model.paligemma_with_expert.gemma_expert,
@@ -1195,16 +1202,29 @@ class PI05Policy(PreTrainedPolicy):
             self.model.time_mlp_out,
         ]
 
-    def _cabo_parameter_groups(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    def _cabo_parameter_groups(
+        self,
+    ) -> tuple[list[nn.Parameter], list[nn.Parameter], list[nn.Parameter]]:
         vlm_parameters = _unique_trainable_parameters(self._vlm_modules())
-        action_parameters = _unique_trainable_parameters(self._action_modules())
-        vlm_ids = {id(parameter) for parameter in vlm_parameters}
-        action_ids = {id(parameter) for parameter in action_parameters}
-        if vlm_ids & action_ids:
-            raise ValueError("CABO VLM and action parameter groups must be disjoint")
+        expert_parameters = _unique_trainable_parameters(self._action_expert_modules())
+        projection_parameters = _unique_trainable_parameters(self._action_projection_modules())
+        expected_groups = {
+            CABO_VLM_GROUP: vlm_parameters,
+            CABO_ACTION_EXPERT_GROUP: expert_parameters,
+            CABO_ACTION_PROJECTION_GROUP: projection_parameters,
+        }
+        group_ids = {
+            name: {id(parameter) for parameter in parameters}
+            for name, parameters in expected_groups.items()
+        }
+        names = list(group_ids)
+        for index, name in enumerate(names):
+            for other_name in names[index + 1 :]:
+                if group_ids[name] & group_ids[other_name]:
+                    raise ValueError(f"CABO parameter groups {name!r} and {other_name!r} must be disjoint")
 
         all_trainable = {id(parameter) for parameter in self.parameters() if parameter.requires_grad}
-        grouped = vlm_ids | action_ids
+        grouped = set().union(*group_ids.values())
         if grouped != all_trainable:
             missing = len(all_trainable - grouped)
             extra = len(grouped - all_trainable)
@@ -1212,20 +1232,22 @@ class PI05Policy(PreTrainedPolicy):
                 "CABO parameter grouping must cover every trainable PI0.5 parameter exactly once; "
                 f"missing={missing}, extra={extra}"
             )
-        if not vlm_parameters or not action_parameters:
+        empty_groups = [name for name, parameters in expected_groups.items() if not parameters]
+        if empty_groups:
             raise ValueError(
-                "CABO requires non-empty trainable VLM and action parameter groups; "
-                f"vlm={len(vlm_parameters)}, action={len(action_parameters)}"
+                "CABO requires non-empty trainable VLM, action expert, and action projection groups; "
+                f"empty={empty_groups}"
             )
-        return vlm_parameters, action_parameters
+        return vlm_parameters, expert_parameters, projection_parameters
 
     def get_optim_params(self):
         if not self.config.cabo_enabled:
             return self.parameters()
-        vlm_parameters, action_parameters = self._cabo_parameter_groups()
+        vlm_parameters, expert_parameters, projection_parameters = self._cabo_parameter_groups()
         return [
             {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_GROUP},
-            {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_GROUP},
+            {"params": expert_parameters, CABO_GROUP_NAME: CABO_ACTION_EXPERT_GROUP},
+            {"params": projection_parameters, CABO_GROUP_NAME: CABO_ACTION_PROJECTION_GROUP},
         ]
 
     def validate_optimizer_step_control(self, optimizer) -> None:
@@ -1234,14 +1256,15 @@ class PI05Policy(PreTrainedPolicy):
             return
 
         adamw = require_adamw(optimizer)
-        if len(adamw.param_groups) != 2:
+        if len(adamw.param_groups) != 3:
             raise ValueError(
-                f"CABO requires exactly two named AdamW parameter groups, got {len(adamw.param_groups)}"
+                f"CABO requires exactly three named AdamW parameter groups, got {len(adamw.param_groups)}"
             )
-        expected_vlm, expected_action = self._cabo_parameter_groups()
+        expected_vlm, expected_expert, expected_projection = self._cabo_parameter_groups()
         expected_groups = {
             CABO_VLM_GROUP: {id(parameter) for parameter in expected_vlm},
-            CABO_ACTION_GROUP: {id(parameter) for parameter in expected_action},
+            CABO_ACTION_EXPERT_GROUP: {id(parameter) for parameter in expected_expert},
+            CABO_ACTION_PROJECTION_GROUP: {id(parameter) for parameter in expected_projection},
         }
         for name, expected_ids in expected_groups.items():
             group = get_named_param_group(adamw, name)
@@ -1265,108 +1288,11 @@ class PI05Policy(PreTrainedPolicy):
             parameter for group in adamw.param_groups for parameter in group["params"]
         ]
         all_optimizer_ids = {id(parameter) for parameter in all_optimizer_parameters}
-        expected_all_ids = expected_groups[CABO_VLM_GROUP] | expected_groups[CABO_ACTION_GROUP]
+        expected_all_ids = set().union(*expected_groups.values())
         if len(all_optimizer_ids) != len(all_optimizer_parameters) or all_optimizer_ids != expected_all_ids:
             raise ValueError(
                 "CABO optimizer parameter groups must cover every trainable PI0.5 parameter exactly once"
             )
-
-    def _cabo_probe_velocity(
-        self,
-        batch: dict[str, Tensor],
-        *,
-        step: int,
-        process_index: int = 0,
-    ) -> tuple[Tensor | None, Tensor | None, int]:
-        batch_size = batch[ACTION].shape[0]
-        action_horizon = batch[ACTION].shape[1]
-        action_padding = batch.get(f"{ACTION}_is_pad")
-        if isinstance(action_padding, Tensor):
-            if action_padding.numel() % (batch_size * action_horizon) != 0:
-                raise ValueError(
-                    f"{ACTION}_is_pad must align with the action horizon; "
-                    f"got action shape={tuple(batch[ACTION].shape)}, "
-                    f"padding shape={tuple(action_padding.shape)}"
-                )
-            padded_steps = (
-                action_padding.to(device=batch[ACTION].device, dtype=torch.bool)
-                .reshape(batch_size, action_horizon, -1)
-                .any(dim=-1)
-            )
-        else:
-            padded_steps = torch.zeros(
-                (batch_size, action_horizon), dtype=torch.bool, device=batch[ACTION].device
-            )
-        valid_steps = ~padded_steps
-
-        device = batch[ACTION].device
-        fork_devices = []
-        if device.type == "cuda":
-            fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
-        with torch.random.fork_rng(devices=fork_devices):
-            # A private deterministic RNG stream keeps CABO from changing the stochastic training
-            # trajectory merely by being probed. Include the rank so DDP also contributes independent
-            # Hutchinson directions instead of repeating the same projection on every shard.
-            probe_seed = 17_071 + step + 1_000_003 * process_index
-            torch.manual_seed(probe_seed)
-            if device.type == "cuda":
-                torch.cuda.manual_seed(probe_seed)
-
-            candidate_indices = torch.nonzero(valid_steps.any(dim=1), as_tuple=False).flatten()
-            if candidate_indices.numel() == 0:
-                return None, None, 0
-            permutation = torch.randperm(candidate_indices.numel(), device=candidate_indices.device)
-            selected_indices = candidate_indices[permutation[: self.config.cabo_probe_batch_size]]
-            selected_valid_steps = valid_steps.index_select(0, selected_indices)
-
-            probe_batch = {
-                key: value.index_select(0, selected_indices.to(device=value.device))
-                if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
-                else value
-                for key, value in batch.items()
-            }
-            images, img_masks = self._preprocess_images(probe_batch)
-            tokens = probe_batch[f"{OBS_LANGUAGE_TOKENS}"]
-            masks = probe_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-            actions = self.prepare_action(probe_batch)
-            noise = self.model.sample_noise(actions.shape, device)
-            sample_time = self.model.sample_time(actions.shape[0], device)
-            expanded_time = sample_time[:, None, None]
-            x_t = expanded_time * noise + (1.0 - expanded_time) * actions
-            velocity = self.model.predict_velocity(images, img_masks, tokens, masks, x_t, sample_time)
-
-            original_action_dim = self.config.output_features[ACTION].shape[0]
-            velocity = velocity[:, :, :original_action_dim]
-            target_velocity = (noise - actions)[:, :, :original_action_dim]
-            residual = (velocity - target_velocity).detach()
-            valid_outputs = selected_valid_steps[:, :, None].expand_as(velocity)
-            valid_output_elements = int(valid_outputs.sum().item())
-            if valid_output_elements == 0:
-                return None, None, 0
-            projections = (
-                torch.empty(
-                    (self.config.cabo_num_projections, *velocity.shape),
-                    dtype=velocity.dtype,
-                    device=velocity.device,
-                )
-                .bernoulli_(0.5)
-                .mul_(2.0)
-                .sub_(1.0)
-            )
-        projected_velocity = velocity.unsqueeze(0) * projections
-        projected_velocity = projected_velocity * valid_outputs.unsqueeze(0)
-        probe_scalars = torch.sum(projected_velocity, dim=tuple(range(1, projections.ndim))) / math.sqrt(
-            valid_output_elements
-        )
-        # The residual projections do not participate in autograd. Their products with the VLM and
-        # action candidate-update projections estimate whether each update points along a useful
-        # flow-loss descent direction, rather than merely measuring how large the update is.
-        projected_residual = residual.unsqueeze(0) * projections
-        projected_residual = projected_residual * valid_outputs.unsqueeze(0)
-        residual_projections = torch.sum(
-            projected_residual, dim=tuple(range(1, projections.ndim))
-        ) / math.sqrt(valid_output_elements)
-        return probe_scalars, residual_projections.detach(), valid_output_elements
 
     def compute_optimizer_step_control(
         self,
@@ -1374,238 +1300,71 @@ class PI05Policy(PreTrainedPolicy):
         optimizer,
         accelerator,
     ) -> OptimizerStepControl:
-        """Estimate counterfactual action-space drift and return named optimizer group scales."""
+        """Limit deterministic action-side AdamW updates relative to the VLM update."""
         if not self.config.cabo_enabled:
             return OptimizerStepControl()
 
+        _ = batch
         adamw = require_adamw(optimizer)
         vlm_group = get_named_param_group(adamw, CABO_VLM_GROUP)
-        action_group = get_named_param_group(adamw, CABO_ACTION_GROUP)
-        control_mode = getattr(self.config, "cabo_control_mode", "residual")
-        if control_mode not in ("residual", "budget", "balance"):
-            raise ValueError(f"Unsupported CABO control mode: {control_mode!r}")
-        step = int(action_group.get("cabo_step", 0))
-        vlm_scale = float(action_group.get("cabo_vlm_scale", 1.0))
-        action_scale = (
-            1.0 if control_mode == "residual" else float(action_group.get("cabo_action_scale", 1.0))
+        expert_group = get_named_param_group(adamw, CABO_ACTION_EXPERT_GROUP)
+        projection_group = get_named_param_group(adamw, CABO_ACTION_PROJECTION_GROUP)
+
+        group_moments = []
+        active_numels = []
+        for group in (vlm_group, expert_group, projection_group):
+            update_norm_sq, parameter_norm_sq, active_numel = adamw_group_relative_update_moments(
+                group,
+                adamw.state,
+                include_weight_decay=False,
+            )
+            group_moments.extend((update_norm_sq, parameter_norm_sq))
+            active_numels.append(active_numel)
+
+        moments = torch.stack(group_moments)
+        num_processes = int(getattr(accelerator, "num_processes", 1))
+        if num_processes > 1:
+            moments = accelerator.reduce(moments, reduction="sum")
+
+        vlm_rate, expert_rate, projection_rate = (
+            relative_update_rate(float(moments[index].item()), float(moments[index + 1].item()))
+            for index in (0, 2, 4)
         )
-
-        def current_group_scales() -> dict[str, float]:
-            if control_mode == "balance":
-                return {
-                    CABO_VLM_GROUP: vlm_scale,
-                    CABO_ACTION_GROUP: action_scale,
-                }
-            if control_mode == "residual":
-                return {CABO_VLM_GROUP: vlm_scale}
-            return {CABO_ACTION_GROUP: action_scale}
-
-        def current_scale_metrics() -> dict[str, float]:
-            metrics = {
-                "cabo/action_scale": action_scale,
-                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                "cabo/control_mode_balance": float(control_mode == "balance"),
-                "cabo/control_mode_residual": float(control_mode == "residual"),
-            }
-            if control_mode in ("residual", "balance"):
-                metrics.update(
-                    {
-                        "cabo/vlm_scale": vlm_scale,
-                        "cabo/effective_vlm_lr": float(vlm_group["lr"]) * vlm_scale,
-                    }
-                )
-            if control_mode == "budget":
-                metrics["cabo/budget"] = float(action_group.get("cabo_budget", 0.0))
-            return metrics
-
-        if step % self.config.cabo_probe_interval != 0:
-            action_group["cabo_step"] = step + 1
-            metrics = current_scale_metrics()
-            metrics["cabo/probe_applied"] = 0.0
-            return OptimizerStepControl(
-                group_scales=current_group_scales(),
-                metrics=metrics,
-            )
-
-        device = batch[ACTION].device
-        process_index = int(getattr(accelerator, "process_index", 0))
-        with torch.enable_grad(), accelerator.autocast():
-            probe_scalars, residual_projections, local_valid_elements = self._cabo_probe_velocity(
-                batch, step=step, process_index=process_index
-            )
-
-        projection_values = torch.zeros(
-            (self.config.cabo_num_projections, 2), dtype=torch.float32, device=device
+        expert_scale, projection_scale, metrics = update_cabo_relative_update_scales(
+            vlm_group,
+            vlm_rate=vlm_rate,
+            expert_rate=expert_rate,
+            projection_rate=projection_rate,
+            expert_ratio=self.config.cabo_expert_update_ratio,
+            projection_ratio=self.config.cabo_projection_update_ratio,
+            ema_decay=self.config.cabo_vlm_update_ema_decay,
+            warmup_steps=self.config.cabo_update_warmup_steps,
+            vlm_floor_ratio=self.config.cabo_vlm_update_floor_ratio,
         )
-        group_indices = {CABO_VLM_GROUP: 0, CABO_ACTION_GROUP: 1}
-        projection_index = 0
-        handles = []
-        parameters_without_training_grad = []
-
-        def register_group_hooks(group_name: str, param_group: dict) -> None:
-            for parameter in param_group["params"]:
-                if not parameter.requires_grad:
-                    continue
-                if parameter.grad is None:
-                    parameters_without_training_grad.append(parameter)
-
-                def accumulate_projection(
-                    probe_gradient,
-                    *,
-                    parameter=parameter,
-                    group=param_group,
-                    group_index=group_indices[group_name],
-                ):
-                    contribution = candidate_update_projection(
-                        probe_gradient,
-                        parameter,
-                        group,
-                        adamw.state.get(parameter, {}),
-                    )
-                    projection_values[projection_index, group_index].add_(
-                        contribution.to(dtype=torch.float32)
-                    )
-                    # Preserve the already-computed training gradient exactly. Returning zero makes
-                    # AccumulateGrad add nothing when the differentiable CABO probe is backpropagated.
-                    return torch.zeros_like(probe_gradient)
-
-                handles.append(parameter.register_hook(accumulate_projection))
-
-        if probe_scalars is not None:
-            probe_scalars = probe_scalars.reshape(-1)
-            register_group_hooks(CABO_VLM_GROUP, vlm_group)
-            register_group_hooks(CABO_ACTION_GROUP, action_group)
-            try:
-                for projection_index, probe_scalar in enumerate(probe_scalars):
-                    probe_scalar.backward(retain_graph=projection_index + 1 < probe_scalars.numel())
-            finally:
-                for handle in handles:
-                    handle.remove()
-                # A zero-returning leaf hook prevents the probe value from being accumulated, but
-                # AccumulateGrad still materializes a zero ``.grad`` tensor. Restore the exact main
-                # backward state so AdamW continues to skip parameters that had no training gradient.
-                for parameter in parameters_without_training_grad:
-                    parameter.grad = None
-
-        residual_projection_values = (
-            torch.zeros(self.config.cabo_num_projections, dtype=torch.float32, device=device)
-            if residual_projections is None
-            else residual_projections.reshape(-1).to(dtype=torch.float32)
-        )
-        local_probe_moments = torch.stack(
-            [
-                projection_values[:, 0].square().mean(),
-                projection_values[:, 1].square().mean(),
-                (projection_values[:, 0] * projection_values[:, 1]).mean(),
-                residual_projection_values.square().mean(),
-                (residual_projection_values * projection_values[:, 0]).mean(),
-                (residual_projection_values * projection_values[:, 1]).mean(),
-            ]
-        )
-        weighted_probe_statistics = torch.cat(
-            [
-                local_probe_moments * float(local_valid_elements),
-                torch.tensor([float(local_valid_elements)], dtype=torch.float32, device=device),
-            ]
-        )
-        weighted_probe_statistics = accelerator.reduce(weighted_probe_statistics, reduction="sum")
-        global_valid_elements = float(weighted_probe_statistics[6].item())
-        if global_valid_elements <= 0.0:
-            # Keep the controller step unchanged so the next batch retries the scheduled probe.
-            metrics = current_scale_metrics()
-            metrics.update(
-                {
-                    "cabo/probe_applied": 0.0,
-                    "cabo/probe_skipped_padding": 1.0,
-                    "cabo/probe_valid_elements": 0.0,
-                    "cabo/probe_retry_next_step": 1.0,
-                }
-            )
-            return OptimizerStepControl(
-                group_scales=current_group_scales(),
-                metrics=metrics,
-            )
-
-        probe_moments = weighted_probe_statistics[:6] / global_valid_elements
-        (
-            vlm_drift,
-            action_drift,
-            cross_drift,
-            residual_energy,
-            residual_vlm_alignment,
-            residual_action_alignment,
-        ) = (float(value.item()) for value in probe_moments)
-        if control_mode == "residual":
-            vlm_scale, metrics = update_cabo_residual_compensation(
-                action_group,
-                vlm_drift=vlm_drift,
-                action_drift=action_drift,
-                cross_drift=cross_drift,
-                residual_energy=residual_energy,
-                residual_vlm_alignment=residual_vlm_alignment,
-                residual_action_alignment=residual_action_alignment,
-                ema_decay=self.config.cabo_drift_ema_decay,
-                regularization=self.config.cabo_residual_regularization,
-                max_vlm_scale=self.config.cabo_residual_vlm_max_scale,
-            )
-            action_scale = 1.0
-        elif control_mode == "balance":
-            vlm_scale, action_scale, metrics = update_cabo_influence_balance(
-                action_group,
-                vlm_drift=vlm_drift,
-                action_drift=action_drift,
-                cross_drift=cross_drift,
-                ema_decay=self.config.cabo_drift_ema_decay,
-                max_scale=self.config.cabo_balance_max_scale,
-            )
-        else:
-            action_scale, metrics = update_cabo_budget(
-                action_group,
-                vlm_drift=vlm_drift,
-                action_drift=action_drift,
-                cross_drift=cross_drift,
-                action_drift_ratio=self.config.cabo_action_drift_ratio,
-                base_action_scale=self.config.cabo_base_action_scale,
-                negative_cross_discount=self.config.cabo_negative_cross_discount,
-                probe_interval=self.config.cabo_probe_interval,
-                ema_decay=self.config.cabo_drift_ema_decay,
-                budget_decay=self.config.cabo_budget_decay,
-                budget_cap_windows=self.config.cabo_budget_cap_windows,
-            )
-        if metrics["cabo/probe_nonfinite"]:
-            metrics.update(
-                {
-                    "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                    "cabo/control_mode_balance": float(control_mode == "balance"),
-                    "cabo/control_mode_residual": float(control_mode == "residual"),
-                    "cabo/probe_applied": 1.0,
-                    "cabo/probe_skipped_padding": 0.0,
-                    "cabo/probe_valid_elements": global_valid_elements,
-                    "cabo/num_projections": float(self.config.cabo_num_projections),
-                    "optimizer_step/skipped": 1.0,
-                    "optimizer_step/nonfinite_probe": 1.0,
-                }
-            )
-            if control_mode in ("residual", "balance"):
-                metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
-            return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
-
-        action_group["cabo_step"] = step + 1
         metrics.update(
             {
-                "cabo/effective_action_lr": float(action_group["lr"]) * action_scale,
-                "cabo/control_mode_balance": float(control_mode == "balance"),
-                "cabo/control_mode_residual": float(control_mode == "residual"),
-                "cabo/probe_applied": 1.0,
-                "cabo/probe_skipped_padding": 0.0,
-                "cabo/probe_valid_elements": global_valid_elements,
-                "cabo/num_projections": float(self.config.cabo_num_projections),
+                "cabo/vlm_active_numel": float(active_numels[0]),
+                "cabo/expert_active_numel": float(active_numels[1]),
+                "cabo/projection_active_numel": float(active_numels[2]),
+                "cabo/effective_vlm_lr": float(vlm_group["lr"]),
+                "cabo/effective_expert_lr": float(expert_group["lr"]) * expert_scale,
+                "cabo/effective_projection_lr": float(projection_group["lr"]) * projection_scale,
             }
         )
-        if control_mode in ("residual", "balance"):
-            metrics["cabo/effective_vlm_lr"] = float(vlm_group["lr"]) * vlm_scale
+        if metrics["cabo/update_nonfinite"]:
+            metrics.update(
+                {
+                    "optimizer_step/skipped": 1.0,
+                    "optimizer_step/nonfinite_cabo_update": 1.0,
+                }
+            )
+            return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
+
         return OptimizerStepControl(
-            group_scales=current_group_scales(),
+            group_scales={
+                CABO_ACTION_EXPERT_GROUP: expert_scale,
+                CABO_ACTION_PROJECTION_GROUP: projection_scale,
+            },
             metrics=metrics,
         )
 
@@ -1627,8 +1386,7 @@ class PI05Policy(PreTrainedPolicy):
         """
         _ = accelerator
         cabo_enabled = getattr(self.config, "cabo_enabled", False)
-        cabo_control_mode = getattr(self.config, "cabo_control_mode", "residual")
-        if cabo_enabled and cabo_control_mode != "residual":
+        if cabo_enabled:
             return {
                 "action_head_clip_applied": 0.0,
                 "cabo/gradient_clip_disabled": 1.0,
