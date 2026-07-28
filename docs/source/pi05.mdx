@@ -89,7 +89,7 @@ Without CABO, gradient clipping is policy-specific. The action-side gradient RMS
 times the VLM gradient RMS, and only action-side gradients are rescaled when that cap is exceeded.
 VLM gradients are left unchanged, and global gradient clipping is disabled. CABO is enabled by
 default and disables this action-gradient hook so that only the relative-update controller is active.
-Training checkpoints are saved every 3,000 steps by default and once more at the final step.
+Training checkpoints are saved every 10,000 steps by default and once more at the final step.
 
 PI0.5 also provides relative-update optimizer control (CABO). Before each AdamW step, CABO
 deterministically computes the candidate learning update for three parameter groups: VLM, action
@@ -143,7 +143,7 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 | ------------------------------- | -------- | ---------------------------------------------------------- |
 | `optimizer_lr`                  | `2.5e-4` | Unified AdamW learning rate for VLM and action parameters   |
 | `scheduler_decay_lr`            | `2.5e-5` | Learning-rate floor after cosine decay                      |
-| `save_freq`                     | `3000`   | Save a training checkpoint every 3,000 optimizer steps      |
+| `save_freq`                     | `10000`  | Save every 10,000 steps and always save the final checkpoint |
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
 | `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |

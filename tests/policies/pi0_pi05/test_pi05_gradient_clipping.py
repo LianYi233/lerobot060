@@ -146,7 +146,7 @@ def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
     assert isinstance(config.policy, PI05Config)
     assert config.policy.cabo_enabled
     assert config.policy.cabo_projection_update_ratio == pytest.approx(3.5)
-    assert config.save_freq == 3_000
+    assert config.save_freq == 10_000
 
 
 @pytest.mark.parametrize("cabo_vlm_update_ema_decay", [-0.1, 1.0, float("nan")])
