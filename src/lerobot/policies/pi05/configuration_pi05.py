@@ -102,7 +102,7 @@ class PI05Config(PreTrainedConfig):
     # learning update for each parameter group, keeps the VLM update at full scale, and limits the
     # action expert/projection relative update rates against an EMA of the VLM relative update rate.
     # Weight decay is excluded from the measured learning rates so it is not mistaken for VLM signal.
-    cabo_enabled: bool = False
+    cabo_enabled: bool = True
     cabo_expert_update_ratio: float = 2.0
     cabo_projection_update_ratio: float = 5.0
     cabo_vlm_update_ema_decay: float = 0.95

@@ -77,7 +77,7 @@ def _gradient_rms(parameters: list[nn.Parameter]) -> float:
     return gradients.square().mean().sqrt().item()
 
 
-def test_pi05_uses_action_only_gradient_clipping_by_default():
+def test_pi05_optimizer_and_cabo_defaults():
     config = PI05Config()
     optimizer_config = config.get_optimizer_preset()
     scheduler = config.get_scheduler_preset()
@@ -102,7 +102,7 @@ def test_pi05_uses_action_only_gradient_clipping_by_default():
     assert scheduler.num_decay_steps == 30_000
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
-    assert not config.cabo_enabled
+    assert config.cabo_enabled
     assert config.cabo_expert_update_ratio == pytest.approx(2.0)
     assert config.cabo_projection_update_ratio == pytest.approx(5.0)
     assert config.cabo_vlm_update_ema_decay == pytest.approx(0.95)
@@ -144,7 +144,9 @@ def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
     )
 
     assert isinstance(config.policy, PI05Config)
+    assert config.policy.cabo_enabled
     assert config.policy.cabo_projection_update_ratio == pytest.approx(3.5)
+    assert config.save_freq == 3_000
 
 
 @pytest.mark.parametrize("cabo_vlm_update_ema_decay", [-0.1, 1.0, float("nan")])

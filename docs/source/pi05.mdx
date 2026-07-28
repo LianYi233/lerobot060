@@ -85,9 +85,11 @@ Fresh π₀.₅ configurations use one AdamW learning rate for all trainable VLM
 parameters. After warmup, the learning rate follows a cosine decay from `2.5e-4` to a floor of
 `2.5e-5`. Loading or resuming a checkpoint preserves the optimizer values saved in that checkpoint.
 
-Gradient clipping is policy-specific. The action-side gradient RMS is capped at 10 times the VLM
-gradient RMS, and only action-side gradients are rescaled when that cap is exceeded. VLM gradients
-are left unchanged, and global gradient clipping is disabled.
+Without CABO, gradient clipping is policy-specific. The action-side gradient RMS is capped at 10
+times the VLM gradient RMS, and only action-side gradients are rescaled when that cap is exceeded.
+VLM gradients are left unchanged, and global gradient clipping is disabled. CABO is enabled by
+default and disables this action-gradient hook so that only the relative-update controller is active.
+Training checkpoints are saved every 3,000 steps by default and once more at the final step.
 
 PI0.5 also provides relative-update optimizer control (CABO). Before each AdamW step, CABO
 deterministically computes the candidate learning update for three parameter groups: VLM, action
@@ -141,10 +143,11 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 | ------------------------------- | -------- | ---------------------------------------------------------- |
 | `optimizer_lr`                  | `2.5e-4` | Unified AdamW learning rate for VLM and action parameters   |
 | `scheduler_decay_lr`            | `2.5e-5` | Learning-rate floor after cosine decay                      |
+| `save_freq`                     | `3000`   | Save a training checkpoint every 3,000 optimizer steps      |
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
 | `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
-| `cabo_enabled`                  | `false`  | Enable deterministic relative-update control                |
+| `cabo_enabled`                  | `true`   | Enable deterministic relative-update control                |
 | `cabo_expert_update_ratio`      | `2.0`    | Limit expert rate to this multiple of the VLM reference      |
 | `cabo_projection_update_ratio`  | `5.0`    | Limit projection rate to this multiple of the VLM reference  |
 | `cabo_vlm_update_ema_decay`     | `0.95`   | EMA decay used for the VLM relative-update reference         |
@@ -153,7 +156,9 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 | `freeze_vision_encoder`         | `false`  | Do not freeze the vision encoder                            |
 | `train_expert_only`             | `false`  | Do not freeze the VLM; train all parameters                 |
 
-**💡 Tip**: Setting `train_expert_only=true` freezes the VLM and trains only the action expert and projections, allowing finetuning with reduced memory usage.
+**💡 Tip**: Setting `train_expert_only=true` freezes the VLM and trains only the action expert and
+projections, allowing finetuning with reduced memory usage. Because CABO needs trainable VLM
+parameters, also set `cabo_enabled=false` for expert-only training.
 
 If your dataset is not converted with `quantiles`, you can convert it with the following command:
 
