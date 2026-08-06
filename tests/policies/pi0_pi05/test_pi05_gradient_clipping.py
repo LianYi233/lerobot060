@@ -103,11 +103,56 @@ def test_pi05_optimizer_and_cabo_defaults():
     assert config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
     assert config.cabo_enabled
+    assert config.cabo_active
+    assert config.training_stage == "flow"
+    assert config.next_action_context_steps == 25
+    assert config.next_action_prediction_steps == 25
     assert config.cabo_expert_update_ratio == pytest.approx(2.0)
     assert config.cabo_projection_update_ratio == pytest.approx(5.0)
     assert config.cabo_vlm_update_ema_decay == pytest.approx(0.95)
     assert config.cabo_update_warmup_steps == 100
     assert config.cabo_vlm_update_floor_ratio == pytest.approx(0.1)
+
+
+def test_pi05_next_action_stage_disables_cabo_and_gradient_clipping():
+    config = PI05Config(
+        training_stage="next_action",
+        optimizer_grad_clip_norm=42.0,
+    )
+
+    assert config.cabo_enabled
+    assert not config.cabo_active
+    assert config.get_optimizer_preset().grad_clip_norm == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"training_stage": "invalid"}, "training_stage"),
+        (
+            {"training_stage": "next_action", "next_action_context_steps": 0},
+            "next_action_context_steps",
+        ),
+        (
+            {"training_stage": "next_action", "next_action_prediction_steps": 0},
+            "next_action_prediction_steps",
+        ),
+        (
+            {"training_stage": "next_action", "next_action_prediction_steps": 24},
+            "must equal chunk_size",
+        ),
+    ],
+)
+def test_pi05_rejects_invalid_next_action_configuration(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        PI05Config(**kwargs)
+
+
+def test_pi05_flow_stage_does_not_require_next_action_split_to_match_chunk_size():
+    config = PI05Config(chunk_size=40, n_action_steps=40)
+
+    assert config.training_stage == "flow"
+    assert config.next_action_context_steps + config.next_action_prediction_steps != config.chunk_size
 
 
 @pytest.mark.parametrize(
@@ -149,6 +194,21 @@ def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
     assert config.save_freq == 10_000
 
 
+def test_pi05_next_action_stage_decodes_from_nested_cli_argument():
+    config = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id=user/repo",
+            "--policy.type=pi05",
+            "--policy.training_stage=next_action",
+        ],
+    )
+
+    assert isinstance(config.policy, PI05Config)
+    assert config.policy.training_stage == "next_action"
+    assert not config.policy.cabo_active
+
+
 @pytest.mark.parametrize("cabo_vlm_update_ema_decay", [-0.1, 1.0, float("nan")])
 def test_pi05_rejects_invalid_cabo_ema_decay(cabo_vlm_update_ema_decay: float):
     with pytest.raises(ValueError, match="cabo_vlm_update_ema_decay"):
@@ -186,6 +246,26 @@ def test_pi05_cabo_requires_policy_training_preset(tmp_path):
         config.validate()
 
 
+def test_pi05_next_action_stage_does_not_require_cabo_parameter_groups(tmp_path):
+    policy_config = PI05Config(
+        training_stage="next_action",
+        cabo_enabled=True,
+        push_to_hub=False,
+    )
+    config = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo"),
+        policy=policy_config,
+        output_dir=tmp_path / "new-output",
+        use_policy_training_preset=False,
+        optimizer=policy_config.get_optimizer_preset(),
+        scheduler=policy_config.get_scheduler_preset(),
+    )
+
+    config.validate()
+
+    assert not config.cabo_active
+
+
 def test_pi05_cabo_disables_relative_gradient_clipping_hook():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
         action_gradient=20.0,
@@ -199,6 +279,25 @@ def test_pi05_cabo_disables_relative_gradient_clipping_hook():
 
     assert metrics["action_head_clip_applied"] == 0.0
     assert metrics["cabo/gradient_clip_disabled"] == 1.0
+    for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+
+def test_pi05_next_action_stage_disables_relative_gradient_clipping_hook():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+    )
+    policy.config.training_stage = "next_action"
+    action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics["action_head_clip_applied"] == 0.0
+    assert metrics["next_action/gradient_clip_disabled"] == 1.0
     for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
         assert torch.equal(parameter.grad, gradient_before)
     for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):

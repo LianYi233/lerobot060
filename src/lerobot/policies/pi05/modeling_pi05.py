@@ -631,6 +631,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # These parameters deliberately exist only in next-action checkpoints. Keeping the
+        # prediction head separate prevents the temporary regression objective from overwriting
+        # the flow-matching output projection that is used by the second training stage.
+        if config.training_stage == "next_action":
+            self.next_action_query = nn.Parameter(self.action_in_proj.bias.detach().clone())
+            self.next_action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+            self.initialize_next_action_parameters_from_flow()
+            self._freeze_for_next_action_pretraining()
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -640,6 +649,40 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+    @torch.no_grad()
+    def initialize_next_action_parameters_from_flow(self) -> None:
+        """Initialize the stage-only parameters from the corresponding flow projections."""
+        if self.config.training_stage != "next_action":
+            raise RuntimeError("Next-action parameters only exist in training_stage='next_action'")
+        self.next_action_query.copy_(self.action_in_proj.bias)
+        self.next_action_out_proj.load_state_dict(self.action_out_proj.state_dict())
+
+    def _freeze_for_next_action_pretraining(self) -> None:
+        """Keep only the expert, action input projection, query, and temporary head trainable."""
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+        for module in (
+            self.paligemma_with_expert.gemma_expert,
+            self.action_in_proj,
+            self.next_action_out_proj,
+        ):
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+        self.next_action_query.requires_grad = True
+        self._keep_next_action_frozen_modules_in_eval_mode()
+
+    def _keep_next_action_frozen_modules_in_eval_mode(self) -> None:
+        self.paligemma_with_expert.paligemma.eval()
+        self.time_mlp_in.eval()
+        self.time_mlp_out.eval()
+        self.action_out_proj.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.config.training_stage == "next_action":
+            self._keep_next_action_frozen_modules_in_eval_mode()
+        return self
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -779,6 +822,139 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def embed_next_action_suffix(
+        self, context_actions: Tensor, context_is_pad: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Embed action context followed by a block of shared future-query tokens."""
+        batch_size, context_steps = context_actions.shape[:2]
+        prediction_steps = self.config.next_action_prediction_steps
+
+        context_embs = self._apply_checkpoint(self.action_in_proj, context_actions)
+        query_embs = self.next_action_query.view(1, 1, -1).expand(batch_size, prediction_steps, -1)
+        suffix_embs = torch.cat((context_embs, query_embs), dim=1)
+
+        query_is_pad = torch.zeros(
+            batch_size, prediction_steps, dtype=torch.bool, device=context_actions.device
+        )
+        suffix_pad_masks = ~torch.cat((context_is_pad, query_is_pad), dim=1)
+
+        # Two bidirectional blocks: context tokens share block one, while future queries share
+        # block two and can attend to the complete (valid) context. No target action is embedded.
+        block_starts = [1] + [0] * (context_steps - 1) + [1] + [0] * (prediction_steps - 1)
+        suffix_att_masks = (
+            torch.tensor(block_starts, dtype=torch.bool, device=context_actions.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+
+        timestep = torch.full(
+            (batch_size,),
+            self.config.time_sampling_offset,
+            dtype=torch.float32,
+            device=context_actions.device,
+        )
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
+            device=timestep.device,
+        ).to(dtype=timestep.dtype)
+        adarms_cond = self.time_mlp_out(F.silu(self.time_mlp_in(time_emb)))
+        adarms_cond = F.silu(adarms_cond)
+        return suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond
+
+    def predict_next_actions(self, context_actions: Tensor, context_is_pad: Tensor) -> Tensor:
+        """Predict the future action block using only the preceding action block."""
+        if self.config.training_stage != "next_action":
+            raise RuntimeError("predict_next_actions is only available in training_stage='next_action'")
+        expected_action_shape = (
+            "batch",
+            self.config.next_action_context_steps,
+            self.config.max_action_dim,
+        )
+        if context_actions.ndim != 3 or context_actions.shape[1:] != expected_action_shape[1:]:
+            raise ValueError(
+                f"context_actions must have shape {expected_action_shape}, got {tuple(context_actions.shape)}"
+            )
+        expected_shape = (context_actions.shape[0], self.config.next_action_context_steps)
+        if context_is_pad.shape != expected_shape:
+            raise ValueError(
+                f"context_is_pad must have shape {expected_shape}, got {tuple(context_is_pad.shape)}"
+            )
+        context_is_pad = context_is_pad.to(device=context_actions.device, dtype=torch.bool)
+        # Padding values are semantically absent and may contain NaNs. Zero them before the input
+        # projection so masked context cannot contaminate attention activations or zero-loss gradients.
+        context_actions = torch.where(
+            context_is_pad.unsqueeze(-1),
+            torch.zeros_like(context_actions),
+            context_actions,
+        )
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_next_action_suffix(
+            context_actions, context_is_pad
+        )
+        expert_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+        suffix_embs = suffix_embs.to(dtype=expert_dtype)
+        att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        # Keep semantic positions stable even when an episode tail pads part of the context: the
+        # future queries must always occupy positions context_steps..chunk_size-1.
+        position_ids = (
+            torch.arange(self.config.chunk_size, dtype=torch.long, device=context_actions.device)
+            .unsqueeze(0)
+            .expand(context_actions.shape[0], -1)
+        )
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
+        query_out = suffix_out[:, -self.config.next_action_prediction_steps :].to(torch.float32)
+        return self._apply_checkpoint(self.next_action_out_proj, query_out)
+
+    def _split_next_action_batch(
+        self, actions: Tensor, action_is_pad: Tensor | None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if action_is_pad is None:
+            raise ValueError("action_is_pad is required for next-action pretraining")
+        if actions.ndim != 3 or actions.shape[1] != self.config.chunk_size:
+            raise ValueError(
+                f"actions must have shape [batch, {self.config.chunk_size}, action_dim], "
+                f"got {tuple(actions.shape)}"
+            )
+        expected_mask_shape = actions.shape[:2]
+        if action_is_pad.shape != expected_mask_shape:
+            raise ValueError(
+                f"action_is_pad must have shape {expected_mask_shape}, got {tuple(action_is_pad.shape)}"
+            )
+        action_is_pad = action_is_pad.to(device=actions.device, dtype=torch.bool)
+        context_steps = self.config.next_action_context_steps
+        context_actions = actions[:, :context_steps]
+        targets = actions[:, context_steps:]
+        context_is_pad = action_is_pad[:, :context_steps]
+        target_valid = ~action_is_pad[:, context_steps:]
+        invalid_order = target_valid.any(dim=1) & context_is_pad.any(dim=1)
+        # The policy performs this data-dependent validation eagerly before invoking a compiled
+        # forward. Skipping it only while Dynamo is tracing keeps the training graph contiguous.
+        if not torch.compiler.is_compiling() and invalid_order.any():
+            invalid_samples = invalid_order.nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                "action_is_pad is inconsistent: target actions are valid after padded context "
+                f"for batch indices {invalid_samples}"
+            )
+        return context_actions, targets, context_is_pad, target_valid
+
     def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
         """Predict flow velocity for explicit noisy actions and timesteps."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
@@ -822,8 +998,34 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images=None,
+        img_masks=None,
+        tokens=None,
+        masks=None,
+        actions=None,
+        noise=None,
+        time=None,
+        action_is_pad=None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
+        if actions is None:
+            raise ValueError("actions are required")
+        if self.config.training_stage == "next_action":
+            context, targets, context_is_pad, target_valid = self._split_next_action_batch(
+                actions, action_is_pad
+            )
+            predictions = self.predict_next_actions(context, context_is_pad)
+            valid_elements = target_valid.unsqueeze(-1)
+            safe_targets = torch.where(valid_elements, targets, torch.zeros_like(targets))
+            safe_predictions = torch.where(
+                valid_elements,
+                predictions,
+                torch.zeros_like(predictions),
+            )
+            return F.mse_loss(safe_targets, safe_predictions, reduction="none")
+
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -850,6 +1052,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Do a full inference forward and compute the action."""
+        if self.config.training_stage == "next_action":
+            raise RuntimeError(
+                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "load it with training_stage='flow' first"
+            )
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -969,6 +1176,13 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
+    _NEXT_ACTION_CHECKPOINT_KEYS = frozenset(
+        {
+            "model.next_action_query",
+            "model.next_action_out_proj.weight",
+            "model.next_action_out_proj.bias",
+        }
+    )
 
     def __init__(
         self,
@@ -1084,10 +1298,46 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            temporary_keys = cls._NEXT_ACTION_CHECKPOINT_KEYS
+            present_temporary_keys = temporary_keys.intersection(remapped_state_dict)
+            if present_temporary_keys and present_temporary_keys != temporary_keys:
+                missing_temporary_keys = sorted(temporary_keys - present_temporary_keys)
+                raise RuntimeError(
+                    "Invalid PI0.5 next-action checkpoint: stage-only parameters must be all present "
+                    f"or all absent; missing={missing_temporary_keys}"
+                )
 
-            if missing_keys:
+            target_is_next_action = config.training_stage == "next_action"
+            source_is_next_action = present_temporary_keys == temporary_keys
+            if source_is_next_action and not target_is_next_action:
+                # The stage-specific query/head are intentionally discarded when transferring to
+                # flow matching. No other unexpected checkpoint key is silently filtered.
+                remapped_state_dict = {
+                    key: value for key, value in remapped_state_dict.items() if key not in temporary_keys
+                }
+
+            # Always inspect incompatibilities ourselves so the two explicitly supported stage
+            # transitions can remain strict without weakening unrelated checkpoint validation.
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            allowed_missing_keys = (
+                temporary_keys if target_is_next_action and not source_is_next_action else frozenset()
+            )
+            disallowed_missing_keys = set(missing_keys) - allowed_missing_keys
+            missing_allowed_keys = allowed_missing_keys - set(missing_keys)
+            if strict and (disallowed_missing_keys or unexpected_keys or missing_allowed_keys):
+                raise RuntimeError(
+                    "PI0.5 checkpoint is incompatible with the requested training stage: "
+                    f"missing={sorted(disallowed_missing_keys)}, "
+                    f"unexpected={sorted(unexpected_keys)}, "
+                    f"expected_stage_missing={sorted(missing_allowed_keys)}"
+                )
+
+            if target_is_next_action and not source_is_next_action:
+                model.model.initialize_next_action_parameters_from_flow()
+
+            if missing_keys and set(missing_keys) == allowed_missing_keys:
+                print("Initialized PI0.5 next-action query and prediction head from flow projections")
+            elif missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 5:
                     for key in missing_keys:
@@ -1112,7 +1362,7 @@ class PI05Policy(PreTrainedPolicy):
 
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load PI05 pretrained weights from {pretrained_name_or_path!s}"
+                f"Failed to load PI05 pretrained weights from {pretrained_name_or_path!s}: {e}"
             ) from e
 
         return model
@@ -1186,21 +1436,38 @@ class PI05Policy(PreTrainedPolicy):
         return [self.model.paligemma_with_expert.gemma_expert]
 
     def _action_projection_modules(self) -> list[nn.Module]:
-        return [
+        modules = [
             self.model.action_in_proj,
             self.model.action_out_proj,
             self.model.time_mlp_in,
             self.model.time_mlp_out,
         ]
+        if getattr(self.config, "training_stage", "flow") == "next_action":
+            modules.append(self.model.next_action_out_proj)
+        return modules
 
     def _action_modules(self) -> list[nn.Module]:
-        return [
+        modules = [
             self.model.paligemma_with_expert.gemma_expert,
             self.model.action_in_proj,
             self.model.action_out_proj,
             self.model.time_mlp_in,
             self.model.time_mlp_out,
         ]
+        if getattr(self.config, "training_stage", "flow") == "next_action":
+            modules.append(self.model.next_action_out_proj)
+        return modules
+
+    def _is_cabo_active(self) -> bool:
+        # The fallback keeps policy hook unit-test stand-ins compatible while the real PI05Config
+        # exposes the stage-aware ``cabo_active`` property.
+        cabo_active = getattr(self.config, "cabo_active", None)
+        if cabo_active is not None:
+            return bool(cabo_active)
+        return (
+            bool(getattr(self.config, "cabo_enabled", False))
+            and getattr(self.config, "training_stage", "flow") == "flow"
+        )
 
     def _cabo_parameter_groups(
         self,
@@ -1214,8 +1481,7 @@ class PI05Policy(PreTrainedPolicy):
             CABO_ACTION_PROJECTION_GROUP: projection_parameters,
         }
         group_ids = {
-            name: {id(parameter) for parameter in parameters}
-            for name, parameters in expected_groups.items()
+            name: {id(parameter) for parameter in parameters} for name, parameters in expected_groups.items()
         }
         names = list(group_ids)
         for index, name in enumerate(names):
@@ -1241,8 +1507,8 @@ class PI05Policy(PreTrainedPolicy):
         return vlm_parameters, expert_parameters, projection_parameters
 
     def get_optim_params(self):
-        if not self.config.cabo_enabled:
-            return self.parameters()
+        if not PI05Policy._is_cabo_active(self):
+            return [parameter for parameter in self.parameters() if parameter.requires_grad]
         vlm_parameters, expert_parameters, projection_parameters = self._cabo_parameter_groups()
         return [
             {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_GROUP},
@@ -1252,7 +1518,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def validate_optimizer_step_control(self, optimizer) -> None:
         """Validate CABO's optimizer contract before the first training backward pass."""
-        if not self.config.cabo_enabled:
+        if not PI05Policy._is_cabo_active(self):
             return
 
         adamw = require_adamw(optimizer)
@@ -1301,7 +1567,7 @@ class PI05Policy(PreTrainedPolicy):
         accelerator,
     ) -> OptimizerStepControl:
         """Limit deterministic action-side AdamW updates relative to the VLM update."""
-        if not self.config.cabo_enabled:
+        if not PI05Policy._is_cabo_active(self):
             return OptimizerStepControl()
 
         _ = batch
@@ -1385,8 +1651,12 @@ class PI05Policy(PreTrainedPolicy):
         clipping interface.
         """
         _ = accelerator
-        cabo_enabled = getattr(self.config, "cabo_enabled", False)
-        if cabo_enabled:
+        if getattr(self.config, "training_stage", "flow") == "next_action":
+            return {
+                "action_head_clip_applied": 0.0,
+                "next_action/gradient_clip_disabled": 1.0,
+            }
+        if PI05Policy._is_cabo_active(self):
             return {
                 "action_head_clip_applied": 0.0,
                 "cabo/gradient_clip_disabled": 1.0,
@@ -1547,6 +1817,11 @@ class PI05Policy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
+        if self.config.training_stage == "next_action":
+            raise RuntimeError(
+                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "load it with training_stage='flow' first"
+            )
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
         )
@@ -1564,6 +1839,11 @@ class PI05Policy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
+        if self.config.training_stage == "next_action":
+            raise RuntimeError(
+                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "load it with training_stage='flow' first"
+            )
         self.eval()
 
         # Prepare inputs
@@ -1584,6 +1864,11 @@ class PI05Policy(PreTrainedPolicy):
         self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
     ) -> tuple[Tensor, Tensor]:
         """Predict actions and return a pooled contextual PI0.5 prefix representation."""
+        if self.config.training_stage == "next_action":
+            raise RuntimeError(
+                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "load it with training_stage='flow' first"
+            )
         self.eval()
 
         images, img_masks = self._preprocess_images(batch)
@@ -1610,6 +1895,45 @@ class PI05Policy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
+        if reduction not in ("mean", "none"):
+            raise ValueError(f"Unsupported loss reduction: {reduction!r}")
+
+        if self.config.training_stage == "next_action":
+            actions = self.prepare_action(batch)
+            if "action_is_pad" not in batch:
+                raise ValueError("action_is_pad is required for next-action pretraining")
+            action_is_pad = batch["action_is_pad"]
+            if self.config.compile_model:
+                # PI05Pytorch.forward is compiled independently; validate temporal padding order
+                # eagerly so the data-dependent error path does not split its Dynamo graph.
+                self.model._split_next_action_batch(actions, action_is_pad)
+            losses = self.model.forward(actions=actions, action_is_pad=action_is_pad)
+
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            losses = losses[:, :, :original_action_dim]
+            target_valid = ~action_is_pad.to(device=losses.device, dtype=torch.bool)[
+                :, self.config.next_action_context_steps :
+            ]
+            valid_elements = target_valid.unsqueeze(-1).expand_as(losses)
+            masked_losses = torch.where(valid_elements, losses, torch.zeros_like(losses))
+            valid_per_sample = valid_elements.sum(dim=(1, 2))
+            per_sample_loss = masked_losses.sum(dim=(1, 2)) / valid_per_sample.clamp_min(1)
+            valid_per_dim = target_valid.sum().clamp_min(1)
+            loss_per_dim = masked_losses.sum(dim=(0, 1)) / valid_per_dim
+            loss = masked_losses.sum() / valid_elements.sum().clamp_min(1)
+            valid_target_count = target_valid.sum()
+            total_target_count = target_valid.numel()
+            loss_dict = {
+                "loss": loss.detach().item(),
+                "next_action/loss": loss.detach().item(),
+                "next_action/valid_target_count": float(valid_target_count.item()),
+                "next_action/valid_target_fraction": float(valid_target_count.item() / total_target_count),
+                "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
+            }
+            if reduction == "none":
+                return per_sample_loss, loss_dict
+            return loss, loss_dict
+
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]

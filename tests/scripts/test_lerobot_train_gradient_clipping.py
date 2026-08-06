@@ -70,6 +70,12 @@ class _PolicyWithOptimizerStepControl(nn.Module):
         return {"action": 0.25}, {"cabo/action_scale": 0.25}
 
 
+class _PolicyWithInactiveOptimizerStepControl(_PolicyWithOptimizerStepControl):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(cabo_active=False)
+
+
 class _PolicyWithSkippingOptimizerStep(nn.Module):
     def __init__(self):
         super().__init__()
@@ -232,6 +238,28 @@ def test_update_policy_applies_post_preconditioner_group_scale_and_restores_lr()
     assert policy.control_calls == 1
     assert accelerator.no_sync_calls == 1
     assert output_dict == {"cabo/action_scale": 0.25}
+
+
+def test_update_policy_skips_inactive_cabo_controller():
+    policy = _PolicyWithInactiveOptimizerStepControl()
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
+    accelerator = _FakeAccelerator()
+    train_metrics = SimpleNamespace()
+
+    _, output_dict = update_policy(
+        train_metrics=train_metrics,
+        policy=policy,
+        batch=torch.tensor(1.0),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=accelerator,
+    )
+
+    assert policy.vlm_weight.item() == pytest.approx(-0.1)
+    assert policy.action_weight.item() == pytest.approx(-0.1)
+    assert policy.control_calls == 0
+    assert accelerator.no_sync_calls == 0
+    assert output_dict == {}
 
 
 def test_update_policy_structured_control_skips_optimizer_scheduler_and_policy_update():

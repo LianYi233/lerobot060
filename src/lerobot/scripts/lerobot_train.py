@@ -18,12 +18,14 @@
 Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb extras)
 """
 
+import copy
 import dataclasses
 import logging
 import sys
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +61,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -71,6 +74,8 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+_PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
 
 
 @torch.no_grad()
@@ -140,6 +145,9 @@ def _prepare_policy_optimizer_step_control(
         )
 
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    cabo_active = getattr(getattr(unwrapped_policy, "config", None), "cabo_active", None)
+    if cabo_active is False:
+        return OptimizerStepControl()
     if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
         return OptimizerStepControl()
 
@@ -292,6 +300,148 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
+    """Return whether this top-level run needs the integrated PI0.5 pretraining stage."""
+    policy_cfg = cfg.policy
+    return bool(
+        not cfg.resume
+        and not cfg.is_reward_model_training
+        and policy_cfg is not None
+        and policy_cfg.type == "pi05"
+        and getattr(policy_cfg, "next_action_pretraining_active", False)
+    )
+
+
+def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
+    """Build an isolated first-stage config without mutating the formal flow config."""
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
+
+    if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
+        raise ValueError("Integrated next-action pretraining requires a non-resumed PI0.5 flow run")
+    if cfg.output_dir is None:
+        raise ValueError("output_dir must be resolved before building the PI0.5 pretraining stage")
+    if cfg.policy.use_peft or cfg.peft is not None:
+        raise ValueError(
+            "Integrated PI0.5 next-action pretraining does not support PEFT. Use a standard PI0.5 "
+            "base/flow checkpoint as --policy.path and run full-parameter flow training."
+        )
+
+    pretrain_cfg = copy.deepcopy(cfg)
+    pretrain_steps = cfg.policy.next_action_pretrain_steps
+    pretrain_cfg.policy = dataclasses.replace(
+        pretrain_cfg.policy,
+        training_stage=PI05TrainingStage.NEXT_ACTION,
+        next_action_pretrain_steps=0,
+        time_sampling_offset=0.001,
+        # Stage 1 always uses the fixed optimization recipe from the pretraining design, independently
+        # of any flow-stage optimizer overrides in the user's one-command invocation.
+        optimizer_lr=2.5e-4,
+        optimizer_betas=(0.9, 0.95),
+        optimizer_eps=1e-8,
+        optimizer_weight_decay=0.01,
+        optimizer_grad_clip_norm=0.0,
+        scheduler_warmup_steps=1_000,
+        scheduler_decay_steps=30_000,
+        scheduler_decay_lr=2.5e-5,
+        push_to_hub=False,
+    )
+    pretrain_cfg.steps = pretrain_steps
+    pretrain_cfg.output_dir = (
+        cfg.output_dir.parent / f"{cfg.output_dir.name}_{_PI05_NEXT_ACTION_PRETRAIN_DIR}"
+    )
+    pretrain_cfg.job_name = f"{cfg.job_name}_next_action_pretrain"
+    pretrain_cfg.resume = False
+    pretrain_cfg.checkpoint_path = None
+    pretrain_cfg.env = None
+    pretrain_cfg.env_eval_freq = 0
+    pretrain_cfg.peft = None
+    pretrain_cfg.sample_weighting = None
+    pretrain_cfg.save_checkpoint = True
+    pretrain_cfg.save_freq = pretrain_steps
+    pretrain_cfg.save_checkpoint_to_hub = False
+    pretrain_cfg.wandb = dataclasses.replace(pretrain_cfg.wandb, enable=False, run_id=None)
+    pretrain_cfg.job = dataclasses.replace(pretrain_cfg.job, target="local")
+    pretrain_cfg.use_policy_training_preset = True
+    pretrain_cfg.optimizer = pretrain_cfg.policy.get_optimizer_preset()
+    pretrain_cfg.scheduler = pretrain_cfg.policy.get_scheduler_preset()
+    return pretrain_cfg
+
+
+def _pi05_next_action_pretrained_model_dir(pretrain_cfg: TrainPipelineConfig) -> Path:
+    """Return the deterministic final model directory produced by the first stage."""
+    if pretrain_cfg.output_dir is None:
+        raise ValueError("The PI0.5 pretraining output_dir is not configured")
+    checkpoint_dir = get_step_checkpoint_dir(
+        pretrain_cfg.output_dir,
+        pretrain_cfg.steps,
+        pretrain_cfg.steps,
+    )
+    return checkpoint_dir / PRETRAINED_MODEL_DIR
+
+
+def _make_training_accelerator(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator | None" = None,
+) -> "Accelerator":
+    """Create the one Accelerator shared by both PI0.5 objectives in an integrated run."""
+    if accelerator is not None:
+        return accelerator
+
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # Accelerate auto-detects the device based on the available hardware and ignores policy.device.
+    force_cpu = cfg.trainable_config.device == "cpu"
+    policy_dtype = getattr(cfg.trainable_config, "dtype", None)
+    mixed_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}.get(policy_dtype)
+    return Accelerator(
+        step_scheduler_with_optimizer=False,
+        mixed_precision=mixed_precision,
+        kwargs_handlers=[ddp_kwargs],
+        cpu=force_cpu,
+    )
+
+
+def _run_pi05_next_action_pretraining(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator",
+) -> None:
+    """Run Stage 1, then point the untouched formal config at its transferable weights."""
+    pretrain_cfg = _make_pi05_next_action_pretraining_config(cfg)
+    logging.info(
+        "Starting integrated PI0.5 next-action pretraining for %d steps; formal flow training "
+        "will start automatically afterwards.",
+        pretrain_cfg.steps,
+    )
+    _train_single_stage(pretrain_cfg, accelerator)
+    accelerator.wait_for_everyone()
+    pretrained_model_dir = _pi05_next_action_pretrained_model_dir(pretrain_cfg)
+    checkpoint_visible = pretrained_model_dir.is_dir()
+    num_processes = int(getattr(accelerator, "num_processes", 1))
+    if num_processes > 1:
+        visible_count = accelerator.reduce(
+            torch.tensor(int(checkpoint_visible), device=accelerator.device),
+            reduction="sum",
+        )
+        checkpoint_visible = int(visible_count.item()) == num_processes
+    if not checkpoint_visible:
+        raise RuntimeError(
+            "Integrated PI0.5 next-action pretraining finished without producing its final "
+            f"checkpoint at {pretrained_model_dir} on every rank. Distributed training requires "
+            "output_dir and its sibling pretraining directory to be on a filesystem shared by all ranks."
+        )
+    accelerator.free_memory()
+    cfg.policy.pretrained_path = pretrained_model_dir
+    cfg.policy.pretrained_revision = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logging.info(
+        "PI0.5 next-action pretraining complete; rebuilding the model, optimizer, scheduler, "
+        "and CABO state for formal flow training."
+    )
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     """
@@ -315,37 +465,32 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from lerobot.utils.import_utils import require_package
 
     require_package("accelerate", extra="training")
-    from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs, DistributedType
+    from accelerate.utils import DistributedType
 
     cfg.validate()
+    accelerator = _make_training_accelerator(cfg, accelerator)
 
-    # Create Accelerator if not provided
-    # It will automatically detect if running in distributed mode or single-process mode
-    # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
-    # We set find_unused_parameters=True to handle models with conditional computation
-    if accelerator is None:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
-        # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
-        force_cpu = cfg.trainable_config.device == "cpu"
-        # Drive Accelerate's autocast from policy.dtype (bf16/fp16 activate it; float32/absent -> launcher default).
-        policy_dtype = getattr(cfg.trainable_config, "dtype", None)
-        mixed_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}.get(policy_dtype)
-        accelerator = Accelerator(
-            step_scheduler_with_optimizer=False,
-            mixed_precision=mixed_precision,
-            kwargs_handlers=[ddp_kwargs],
-            cpu=force_cpu,
-        )
+    try:
+        if cfg.cabo_active and accelerator.distributed_type == DistributedType.FSDP:
+            raise NotImplementedError(
+                "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
+                "sharding is not yet supported."
+            )
 
-    if getattr(cfg.trainable_config, "cabo_enabled", False) and (
-        accelerator.distributed_type == DistributedType.FSDP
-    ):
-        raise NotImplementedError(
-            "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
-            "sharding is not yet supported."
-        )
+        if _pi05_next_action_pretraining_active(cfg):
+            _run_pi05_next_action_pretraining(cfg, accelerator)
+
+        return _train_single_stage(cfg, accelerator)
+    finally:
+        accelerator.end_training()
+
+
+def _train_single_stage(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator",
+):
+    """Train exactly one already-validated objective with freshly created training state."""
+    from accelerate.utils import DistributedType
 
     init_logging(accelerator=accelerator)
 
@@ -518,7 +663,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             )
         except ValueError as exc:
             incompatible_groups = "parameter group" in str(exc).lower() or "param_groups" in str(exc).lower()
-            if getattr(cfg.trainable_config, "cabo_enabled", False) and incompatible_groups:
+            if cfg.cabo_active and incompatible_groups:
                 raise ValueError(
                     "A non-CABO optimizer checkpoint cannot be resumed with CABO enabled because CABO "
                     "uses named VLM, action expert, and action projection parameter groups. Start a "
@@ -527,7 +672,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 ) from exc
             raise
 
-    if has_method(policy, "validate_optimizer_step_control"):
+    if cfg.cabo_active and has_method(policy, "validate_optimizer_step_control"):
         policy.validate_optimizer_step_control(optimizer)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -886,9 +1031,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
 
-    # Properly clean up the distributed process group
+    # Accelerator lifecycle is owned by train(): Stage 1 must leave it alive for the fresh flow model.
     accelerator.wait_for_everyone()
-    accelerator.end_training()
 
 
 def _remote_target_in_argv() -> bool:

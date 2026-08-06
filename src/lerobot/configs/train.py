@@ -146,6 +146,12 @@ class TrainPipelineConfig(HubMixin):
             return self.reward_model  # type: ignore[return-value]
         return self.policy  # type: ignore[return-value]
 
+    @property
+    def cabo_active(self) -> bool:
+        """Whether the active policy has CABO enabled for its current training stage."""
+        active_cfg = self.trainable_config
+        return bool(getattr(active_cfg, "cabo_active", getattr(active_cfg, "cabo_enabled", False)))
+
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.
 
@@ -252,7 +258,7 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if getattr(active_cfg, "cabo_enabled", False) and not self.use_policy_training_preset:
+        if self.cabo_active and not self.use_policy_training_preset:
             raise ValueError(
                 "PI0.5 CABO requires use_policy_training_preset=True so its named VLM, action "
                 "expert, and action projection optimizer groups are constructed correctly."

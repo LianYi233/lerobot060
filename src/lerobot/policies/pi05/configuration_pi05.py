@@ -16,6 +16,7 @@
 
 import math
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -25,6 +26,13 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 DEFAULT_IMAGE_SIZE = 224
+
+
+class PI05TrainingStage(StrEnum):
+    """Training objectives supported by PI0.5."""
+
+    FLOW = "flow"
+    NEXT_ACTION = "next_action"
 
 
 @PreTrainedConfig.register_subclass("pi05")
@@ -37,6 +45,16 @@ class PI05Config(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
+
+    # Training objective. ``next_action`` pretrains the action expert by using the first part of an
+    # action chunk to predict the second part; ``flow`` keeps the standard PI0.5 objective.
+    # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
+    training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
+    next_action_context_steps: int = 25
+    next_action_prediction_steps: int = 25
+    # Number of next-action steps automatically run before a flow-training invocation. Set to 0 to
+    # start flow training immediately. This is orchestration metadata and does not alter either loss.
+    next_action_pretrain_steps: int = 3_000
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -129,6 +147,35 @@ class PI05Config(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
 
+        try:
+            self.training_stage = PI05TrainingStage(self.training_stage)
+        except ValueError as exc:
+            raise ValueError(
+                f"training_stage must be 'flow' or 'next_action', got {self.training_stage!r}"
+            ) from exc
+        if self.next_action_pretrain_steps < 0:
+            raise ValueError(
+                f"next_action_pretrain_steps must be non-negative, got {self.next_action_pretrain_steps}"
+            )
+        if self.training_stage == "next_action":
+            if self.next_action_context_steps <= 0:
+                raise ValueError(
+                    "next_action_context_steps must be greater than 0 for next_action training, "
+                    f"got {self.next_action_context_steps}"
+                )
+            if self.next_action_prediction_steps <= 0:
+                raise ValueError(
+                    "next_action_prediction_steps must be greater than 0 for next_action training, "
+                    f"got {self.next_action_prediction_steps}"
+                )
+            configured_horizon = self.next_action_context_steps + self.next_action_prediction_steps
+            if configured_horizon != self.chunk_size:
+                raise ValueError(
+                    "next_action_context_steps + next_action_prediction_steps must equal chunk_size "
+                    f"for next_action training, got {self.next_action_context_steps} + "
+                    f"{self.next_action_prediction_steps} != {self.chunk_size}"
+                )
+
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
 
@@ -151,23 +198,30 @@ class PI05Config(PreTrainedConfig):
                 raise ValueError(f"{name} must be finite and greater than 0, got {value}")
         if not 0.0 <= self.cabo_vlm_update_ema_decay < 1.0:
             raise ValueError(
-                "cabo_vlm_update_ema_decay must be in [0, 1), "
-                f"got {self.cabo_vlm_update_ema_decay}"
+                f"cabo_vlm_update_ema_decay must be in [0, 1), got {self.cabo_vlm_update_ema_decay}"
             )
         if self.cabo_update_warmup_steps < 0:
             raise ValueError(
-                "cabo_update_warmup_steps must be non-negative, "
-                f"got {self.cabo_update_warmup_steps}"
+                f"cabo_update_warmup_steps must be non-negative, got {self.cabo_update_warmup_steps}"
             )
         if not 0.0 <= self.cabo_vlm_update_floor_ratio <= 1.0:
             raise ValueError(
-                "cabo_vlm_update_floor_ratio must be in [0, 1], "
-                f"got {self.cabo_vlm_update_floor_ratio}"
+                f"cabo_vlm_update_floor_ratio must be in [0, 1], got {self.cabo_vlm_update_floor_ratio}"
             )
-        if self.cabo_enabled and self.train_expert_only:
+        if self.cabo_active and self.train_expert_only:
             raise ValueError(
                 "CABO requires trainable VLM parameters and is incompatible with train_expert_only=True"
             )
+
+    @property
+    def cabo_active(self) -> bool:
+        """Whether CABO participates in the current training objective."""
+        return self.cabo_enabled and self.training_stage == "flow"
+
+    @property
+    def next_action_pretraining_active(self) -> bool:
+        """Whether a flow-training invocation should first run next-action pretraining."""
+        return self.training_stage == "flow" and self.next_action_pretrain_steps > 0
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -199,7 +253,9 @@ class PI05Config(PreTrainedConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
-            grad_clip_norm=self.optimizer_grad_clip_norm,
+            # Next-action pretraining deliberately performs no gradient clipping, even if a config
+            # loaded from another run carries a non-zero flow-training clipping value.
+            grad_clip_norm=0.0 if self.training_stage == "next_action" else self.optimizer_grad_clip_norm,
         )
 
     def get_scheduler_preset(self):
