@@ -24,7 +24,11 @@ from torch import nn
 pytest.importorskip("datasets")
 
 from lerobot.optim.cabo import OptimizerStepControl  # noqa: E402
-from lerobot.scripts.lerobot_train import _clip_policy_gradients, update_policy  # noqa: E402
+from lerobot.scripts.lerobot_train import (  # noqa: E402
+    _clip_policy_gradients,
+    _normalize_policy_loss_for_distributed_training,
+    update_policy,
+)
 
 
 class _PolicyWithCustomGradientClipping(nn.Module):
@@ -145,6 +149,81 @@ class _FakeAccelerator:
         _ = policy
         self.no_sync_calls += 1
         return nullcontext()
+
+
+class _PolicyWithDistributedLossNormalizer(nn.Module):
+    def __init__(self, local_normalizer: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        self.local_normalizer = local_normalizer
+
+    def get_distributed_loss_normalizer(self, batch):
+        _ = batch
+        return self.weight.new_tensor(self.local_normalizer)
+
+
+class _FakeDistributedLossAccelerator:
+    num_processes = 2
+
+    def __init__(self, global_normalizer: float):
+        self.global_normalizer = global_normalizer
+        self.local_normalizers = []
+
+    def unwrap_model(self, policy, keep_fp32_wrapper=True):
+        _ = keep_fp32_wrapper
+        return policy
+
+    def reduce(self, value, reduction):
+        assert reduction == "sum"
+        self.local_normalizers.append(value.item())
+        return value.new_tensor(self.global_normalizer)
+
+
+def test_distributed_loss_normalizer_recovers_global_valid_element_mean_gradient():
+    rank_0 = _PolicyWithDistributedLossNormalizer(local_normalizer=1)
+    rank_1 = _PolicyWithDistributedLossNormalizer(local_normalizer=3)
+    accelerator_0 = _FakeDistributedLossAccelerator(global_normalizer=4)
+    accelerator_1 = _FakeDistributedLossAccelerator(global_normalizer=4)
+
+    rank_0_loss = _normalize_policy_loss_for_distributed_training(
+        rank_0,
+        batch={},
+        loss=rank_0.weight * 2,
+        accelerator=accelerator_0,
+    )
+    rank_1_loss = _normalize_policy_loss_for_distributed_training(
+        rank_1,
+        batch={},
+        loss=rank_1.weight * 4,
+        accelerator=accelerator_1,
+    )
+    rank_0_loss.backward()
+    rank_1_loss.backward()
+
+    ddp_averaged_gradient = (rank_0.weight.grad + rank_1.weight.grad) / 2
+    expected_global_gradient = torch.tensor((1 * 2 + 3 * 4) / 4)
+    torch.testing.assert_close(ddp_averaged_gradient, expected_global_gradient)
+    assert accelerator_0.local_normalizers == [1.0]
+    assert accelerator_1.local_normalizers == [3.0]
+
+
+@pytest.mark.parametrize("global_normalizer", [0.0, 3.0])
+def test_distributed_loss_normalizer_keeps_all_padding_rank_graph_connected(global_normalizer):
+    policy = _PolicyWithDistributedLossNormalizer(local_normalizer=0)
+    accelerator = _FakeDistributedLossAccelerator(global_normalizer=global_normalizer)
+
+    loss = _normalize_policy_loss_for_distributed_training(
+        policy,
+        batch={},
+        loss=policy.weight * 0,
+        accelerator=accelerator,
+    )
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert loss.requires_grad
+    assert policy.weight.grad is not None
+    assert policy.weight.grad.item() == 0.0
 
 
 def test_policy_specific_hook_replaces_global_gradient_clipping():

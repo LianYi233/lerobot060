@@ -116,6 +116,54 @@ def _gradient_l2_norm_and_numel(parameters: list[nn.Parameter]) -> tuple[Tensor 
     return torch.stack(gradient_norms).norm(2), sum(parameter.grad.numel() for parameter in parameters)
 
 
+def _valid_action_steps(batch: dict[str, Tensor]) -> Tensor:
+    """Return the action timesteps that contain real, non-padding targets."""
+    actions = batch[ACTION]
+    if actions.ndim < 2:
+        raise ValueError(f"{ACTION} must include batch and horizon dimensions, got {tuple(actions.shape)}")
+
+    batch_size, action_horizon = actions.shape[:2]
+    padding_key = f"{ACTION}_is_pad"
+    if padding_key not in batch:
+        return torch.ones((batch_size, action_horizon), dtype=torch.bool, device=actions.device)
+    action_is_pad = batch[padding_key]
+    if not isinstance(action_is_pad, Tensor):
+        raise TypeError(f"{padding_key} must be a tensor, got {type(action_is_pad).__name__}")
+    expected_shape = (batch_size, action_horizon)
+    if action_is_pad.shape != expected_shape:
+        raise ValueError(
+            f"{ACTION}_is_pad must have shape {expected_shape}, got {tuple(action_is_pad.shape)}"
+        )
+
+    return ~action_is_pad.to(device=actions.device, dtype=torch.bool)
+
+
+def _reduce_action_losses(
+    losses: Tensor,
+    valid_steps: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reduce elementwise action losses while excluding padded episode tails."""
+    if losses.ndim != 3:
+        raise ValueError(
+            f"PI0.5 losses must have shape (batch, horizon, action_dim), got {tuple(losses.shape)}"
+        )
+    if valid_steps.shape != losses.shape[:2]:
+        raise ValueError(
+            "PI0.5 valid-step mask must match the loss batch and horizon dimensions; "
+            f"got loss shape={tuple(losses.shape)}, mask shape={tuple(valid_steps.shape)}"
+        )
+
+    valid_elements = valid_steps.to(device=losses.device, dtype=torch.bool).unsqueeze(-1).expand_as(losses)
+    masked_losses = torch.where(valid_elements, losses, torch.zeros_like(losses))
+
+    valid_per_sample = valid_elements.sum(dim=(1, 2))
+    per_sample_loss = masked_losses.sum(dim=(1, 2)) / valid_per_sample.clamp_min(1)
+    valid_per_dim = valid_elements.sum(dim=(0, 1))
+    loss_per_dim = masked_losses.sum(dim=(0, 1)) / valid_per_dim.clamp_min(1)
+    scalar_loss = masked_losses.sum() / valid_elements.sum().clamp_min(1)
+    return scalar_loss, per_sample_loss, loss_per_dim
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -492,13 +540,13 @@ class PaliGemmaWithExpertModel(
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
         image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        features = image_outputs.pooler_output
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.model.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -755,9 +803,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process language tokens
         def lang_embed_func(tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
+            return self.paligemma_with_expert.embed_language_tokens(tokens)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
         embs.append(lang_emb)
@@ -1914,13 +1960,7 @@ class PI05Policy(PreTrainedPolicy):
             target_valid = ~action_is_pad.to(device=losses.device, dtype=torch.bool)[
                 :, self.config.next_action_context_steps :
             ]
-            valid_elements = target_valid.unsqueeze(-1).expand_as(losses)
-            masked_losses = torch.where(valid_elements, losses, torch.zeros_like(losses))
-            valid_per_sample = valid_elements.sum(dim=(1, 2))
-            per_sample_loss = masked_losses.sum(dim=(1, 2)) / valid_per_sample.clamp_min(1)
-            valid_per_dim = target_valid.sum().clamp_min(1)
-            loss_per_dim = masked_losses.sum(dim=(0, 1)) / valid_per_dim
-            loss = masked_losses.sum() / valid_elements.sum().clamp_min(1)
+            loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, target_valid)
             valid_target_count = target_valid.sum()
             total_target_count = target_valid.numel()
             loss_dict = {
@@ -1946,21 +1986,29 @@ class PI05Policy(PreTrainedPolicy):
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        valid_steps = _valid_action_steps(batch)
+        loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, valid_steps)
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
+            "valid_action_fraction": valid_steps.float().mean().item(),
+            "all_padding_samples": float((~valid_steps.any(dim=1)).sum().item()),
         }
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def get_distributed_loss_normalizer(self, batch: dict[str, Tensor]) -> Tensor:
+        """Return the local number of valid scalar loss terms for DDP reweighting."""
+        valid_steps = _valid_action_steps(batch)
+        if self.config.training_stage == "next_action":
+            valid_steps = valid_steps[:, self.config.next_action_context_steps :]
+        action_dim = self.config.output_features[ACTION].shape[0]
+        return valid_steps.sum(dtype=torch.float32) * action_dim
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""

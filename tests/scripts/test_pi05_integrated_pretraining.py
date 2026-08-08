@@ -24,6 +24,7 @@ pytest.importorskip("transformers")
 
 from lerobot.configs.default import DatasetConfig, PeftConfig  # noqa: E402
 from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
+from lerobot.datasets import EpisodeAwareSampler  # noqa: E402
 from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: E402
 from lerobot.scripts import lerobot_train as train_module  # noqa: E402
 
@@ -88,10 +89,12 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert cfg.steps == 123
     assert cfg.output_dir == tmp_path / "flow"
     assert cfg.optimizer.lr == pytest.approx(7.5e-5)
+    assert cfg.policy.drop_n_last_frames == 0
 
     assert pretrain_cfg.policy.training_stage == "next_action"
     assert pretrain_cfg.policy.next_action_pretrain_steps == 0
     assert not pretrain_cfg.policy.next_action_pretraining_active
+    assert pretrain_cfg.policy.drop_n_last_frames == 25
     assert not pretrain_cfg.cabo_active
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.001)
     assert pretrain_cfg.steps == 3_000
@@ -120,6 +123,24 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
 
     assert train_module._pi05_next_action_pretrained_model_dir(pretrain_cfg) == (
         tmp_path / "flow_next_action_pretrain" / "checkpoints" / "003000" / "pretrained_model"
+    )
+
+
+def test_next_action_sampler_keeps_only_anchors_with_a_future_target(tmp_path):
+    cfg = _make_flow_config(tmp_path)
+    cfg.validate()
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+
+    sampler = EpisodeAwareSampler(
+        dataset_from_indices=[0, 25, 51],
+        dataset_to_indices=[25, 51, 78],
+        drop_n_last_frames=pretrain_cfg.policy.drop_n_last_frames,
+    )
+
+    assert sampler.indices == [25, 51, 52]
+    assert all(
+        anchor + pretrain_cfg.policy.next_action_context_steps < episode_end
+        for anchor, episode_end in ((25, 51), (51, 78), (52, 78))
     )
 
 
@@ -220,6 +241,26 @@ def test_integrated_pretraining_rejects_peft(tmp_path, peft_mode):
 
     with pytest.raises(ValueError, match="does not support PEFT"):
         train_module._make_pi05_next_action_pretraining_config(cfg)
+
+
+def test_integrated_pretraining_rejects_streaming_dataset(tmp_path):
+    cfg = _make_flow_config(tmp_path)
+    cfg.dataset.streaming = True
+
+    with pytest.raises(ValueError, match="requires a map-style dataset"):
+        train_module._make_pi05_next_action_pretraining_config(cfg)
+
+
+def test_direct_next_action_training_rejects_streaming_dataset(tmp_path):
+    cfg = _make_flow_config(
+        tmp_path,
+        training_stage="next_action",
+        next_action_pretrain_steps=0,
+    )
+    cfg.dataset.streaming = True
+
+    with pytest.raises(ValueError, match="requires a map-style dataset"):
+        train_module._train_single_stage(cfg, _FakeAccelerator())
 
 
 def test_reward_model_training_never_activates_pi05_pretraining(tmp_path):

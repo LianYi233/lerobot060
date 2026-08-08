@@ -29,7 +29,11 @@ from lerobot.policies.pi05 import (  # noqa: E402
     PI05Policy,
     modeling_pi05,
 )
-from lerobot.utils.constants import ACTION  # noqa: E402
+from lerobot.utils.constants import (  # noqa: E402
+    ACTION,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+)
 
 _WIDTH = 8
 _ACTION_DIM = 3
@@ -230,6 +234,126 @@ def test_next_action_all_padded_targets_return_graph_connected_zero():
     assert all(
         parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in policy.parameters()
     )
+
+
+def test_flow_masked_loss_uses_only_valid_timesteps_and_actual_action_dims(monkeypatch):
+    policy = _make_policy("flow")
+    raw_losses = torch.ones(2, 50, _MAX_ACTION_DIM, requires_grad=True)
+    with torch.no_grad():
+        raw_losses[1, :2, :_ACTION_DIM] = 2.0
+        raw_losses[1, 2:, :_ACTION_DIM] = torch.nan
+        raw_losses[:, :, _ACTION_DIM:] = torch.nan
+    action_is_pad = torch.zeros(2, 50, dtype=torch.bool)
+    action_is_pad[1, 2:] = True
+    batch = {
+        ACTION: torch.randn(2, 50, _ACTION_DIM),
+        "action_is_pad": action_is_pad,
+        OBS_LANGUAGE_TOKENS: torch.zeros(2, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 1, dtype=torch.bool),
+    }
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+    monkeypatch.setattr(policy.model, "forward", lambda *_args, **_kwargs: raw_losses)
+
+    loss, metrics = policy.forward(batch)
+    per_sample, _ = policy.forward(batch, reduction="none")
+    loss.backward()
+
+    expected_loss = torch.tensor((50 * _ACTION_DIM + 2 * 2 * _ACTION_DIM) / (52 * _ACTION_DIM))
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(per_sample, torch.tensor([1.0, 2.0]))
+    assert torch.isfinite(loss)
+    assert metrics["valid_action_fraction"] == pytest.approx(52 / 100)
+    assert metrics["all_padding_samples"] == 0.0
+    assert metrics["loss_per_dim"] == pytest.approx([54 / 52] * _ACTION_DIM)
+    assert raw_losses.grad is not None
+    assert torch.count_nonzero(raw_losses.grad[1, 2:, :_ACTION_DIM]) == 0
+    assert torch.count_nonzero(raw_losses.grad[:, :, _ACTION_DIM:]) == 0
+
+
+def test_flow_all_padded_actions_return_graph_connected_zero(monkeypatch):
+    policy = _make_policy("flow")
+    raw_losses = torch.randn(2, 50, _MAX_ACTION_DIM, requires_grad=True)
+    batch = {
+        ACTION: torch.randn(2, 50, _ACTION_DIM),
+        "action_is_pad": torch.ones(2, 50, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: torch.zeros(2, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 1, dtype=torch.bool),
+    }
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+    monkeypatch.setattr(policy.model, "forward", lambda *_args, **_kwargs: raw_losses)
+
+    loss, metrics = policy.forward(batch)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert loss.requires_grad
+    assert metrics["valid_action_fraction"] == 0.0
+    assert metrics["all_padding_samples"] == 2.0
+    assert raw_losses.grad is not None
+    assert torch.count_nonzero(raw_losses.grad) == 0
+
+
+def test_flow_without_padding_mask_preserves_unmasked_mean(monkeypatch):
+    policy = _make_policy("flow")
+    raw_losses = torch.arange(2 * 50 * _MAX_ACTION_DIM, dtype=torch.float32).reshape(2, 50, _MAX_ACTION_DIM)
+    batch = {
+        ACTION: torch.randn(2, 50, _ACTION_DIM),
+        OBS_LANGUAGE_TOKENS: torch.zeros(2, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 1, dtype=torch.bool),
+    }
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+    monkeypatch.setattr(policy.model, "forward", lambda *_args, **_kwargs: raw_losses)
+
+    loss, metrics = policy.forward(batch)
+
+    torch.testing.assert_close(loss, raw_losses[:, :, :_ACTION_DIM].mean())
+    assert metrics["valid_action_fraction"] == 1.0
+
+
+def test_flow_padding_mask_shape_is_validated(monkeypatch):
+    policy = _make_policy("flow")
+    batch = {
+        ACTION: torch.randn(2, 50, _ACTION_DIM),
+        "action_is_pad": torch.zeros(50, 2, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: torch.zeros(2, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 1, dtype=torch.bool),
+    }
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+    monkeypatch.setattr(
+        policy.model,
+        "forward",
+        lambda *_args, **_kwargs: torch.zeros(2, 50, _MAX_ACTION_DIM, requires_grad=True),
+    )
+
+    with pytest.raises(ValueError, match="action_is_pad must have shape"):
+        policy.forward(batch)
+
+
+def test_pi05_next_action_sampler_drop_matches_context_horizon():
+    assert _make_config("flow").drop_n_last_frames == 0
+    next_action_config = PI05Config(
+        training_stage="next_action",
+        chunk_size=12,
+        n_action_steps=12,
+        next_action_context_steps=7,
+        next_action_prediction_steps=5,
+    )
+
+    assert next_action_config.drop_n_last_frames == 7
+
+
+def test_pi05_distributed_loss_normalizer_counts_valid_actual_action_elements():
+    batch = {
+        ACTION: torch.randn(2, 50, _ACTION_DIM),
+        "action_is_pad": torch.zeros(2, 50, dtype=torch.bool),
+    }
+    batch["action_is_pad"][1, 27:] = True
+
+    next_action_normalizer = _make_policy("next_action").get_distributed_loss_normalizer(batch)
+    flow_normalizer = _make_policy("flow").get_distributed_loss_normalizer(batch)
+
+    assert next_action_normalizer.item() == (25 + 2) * _ACTION_DIM
+    assert flow_normalizer.item() == (50 + 27) * _ACTION_DIM
 
 
 def test_next_action_validates_padding_mask_and_temporal_order():

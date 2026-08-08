@@ -169,6 +169,37 @@ def _prepare_policy_optimizer_step_control(
     return OptimizerStepControl(group_scales=group_scales or {}, metrics=metrics or {})
 
 
+def _normalize_policy_loss_for_distributed_training(
+    policy: PreTrainedPolicy,
+    batch: Any,
+    loss: torch.Tensor,
+    accelerator: "Accelerator",
+) -> torch.Tensor:
+    """Reweight a locally normalized loss so DDP optimizes the global valid-element mean.
+
+    DDP averages one gradient per rank. For masked objectives whose number of valid elements differs
+    by rank, equally averaging local means is biased. A policy can expose its local denominator via
+    ``get_distributed_loss_normalizer``; multiplying by ``world_size * local / global`` makes DDP's
+    subsequent gradient average equal the gradient of the global numerator divided by the global
+    denominator. The returned value remains graph-connected for ranks whose local denominator is zero.
+    """
+    num_processes = int(getattr(accelerator, "num_processes", 1))
+    if num_processes <= 1:
+        return loss
+
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if not has_method(unwrapped_policy, "get_distributed_loss_normalizer"):
+        return loss
+
+    local_normalizer = unwrapped_policy.get_distributed_loss_normalizer(batch)
+    if not isinstance(local_normalizer, torch.Tensor) or local_normalizer.numel() != 1:
+        raise TypeError("get_distributed_loss_normalizer must return a scalar tensor")
+    local_normalizer = local_normalizer.detach().to(device=loss.device, dtype=torch.float32).reshape(())
+    global_normalizer = accelerator.reduce(local_normalizer, reduction="sum")
+    scale = num_processes * local_normalizer / global_normalizer.clamp_min(1)
+    return loss * scale.to(dtype=loss.dtype)
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -237,6 +268,14 @@ def update_policy(
             loss, output_dict = policy.forward(batch)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+    if sample_weights is None:
+        loss = _normalize_policy_loss_for_distributed_training(
+            policy=policy,
+            batch=batch,
+            loss=loss,
+            accelerator=accelerator,
+        )
 
     # Use accelerator's backward method
     accelerator.backward(loss)
@@ -324,6 +363,11 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
         raise ValueError(
             "Integrated PI0.5 next-action pretraining does not support PEFT. Use a standard PI0.5 "
             "base/flow checkpoint as --policy.path and run full-parameter flow training."
+        )
+    if cfg.dataset.streaming:
+        raise ValueError(
+            "PI0.5 next-action pretraining requires a map-style dataset so episode-tail anchors "
+            "without future targets can be excluded"
         )
 
     pretrain_cfg = copy.deepcopy(cfg)
@@ -492,6 +536,17 @@ def _train_single_stage(
     """Train exactly one already-validated objective with freshly created training state."""
     from accelerate.utils import DistributedType
 
+    active_cfg = cfg.trainable_config
+    if (
+        cfg.dataset.streaming
+        and getattr(active_cfg, "type", None) == "pi05"
+        and getattr(active_cfg, "training_stage", None) == "next_action"
+    ):
+        raise ValueError(
+            "PI0.5 next-action pretraining requires a map-style dataset so episode-tail anchors "
+            "without future targets can be excluded"
+        )
+
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
@@ -582,7 +637,6 @@ def _train_single_stage(
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
-    active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
 
     processor_kwargs = {}
@@ -911,6 +965,12 @@ def _train_single_stage(
                             eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
                     eval_batch = preprocessor(eval_batch)
                     loss, _ = policy.forward(eval_batch)
+                    loss = _normalize_policy_loss_for_distributed_training(
+                        policy=policy,
+                        batch=eval_batch,
+                        loss=loss,
+                        accelerator=accelerator,
+                    )
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)

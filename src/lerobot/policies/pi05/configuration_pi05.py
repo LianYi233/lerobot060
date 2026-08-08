@@ -275,5 +275,12 @@ class PI05Config(PreTrainedConfig):
         return list(range(self.chunk_size))
 
     @property
+    def drop_n_last_frames(self) -> int:
+        """Drop anchors with no valid future target during next-action pretraining."""
+        if self.training_stage == PI05TrainingStage.NEXT_ACTION:
+            return self.next_action_context_steps
+        return 0
+
+    @property
     def reward_delta_indices(self) -> None:
         return None
