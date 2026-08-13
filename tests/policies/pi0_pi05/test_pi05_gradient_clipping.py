@@ -45,6 +45,7 @@ def _make_policy_with_gradients(
         _make_module(),
         _make_module(),
         _make_module(),
+        nn.Embedding(1, 2),
     ]
     model = SimpleNamespace(
         paligemma_with_expert=paligemma_with_expert,
@@ -52,6 +53,7 @@ def _make_policy_with_gradients(
         action_out_proj=action_modules[2],
         time_mlp_in=action_modules[3],
         time_mlp_out=action_modules[4],
+        inpainting_visible_action_embedding=action_modules[5],
     )
     policy = SimpleNamespace(
         model=model,
@@ -105,6 +107,7 @@ def test_pi05_optimizer_and_cabo_defaults():
     assert config.cabo_enabled
     assert config.cabo_active
     assert config.training_stage == "flow"
+    assert config.next_action_masked_steps == 25
     assert config.next_action_context_steps == 25
     assert config.next_action_prediction_steps == 25
     assert config.cabo_expert_update_ratio == pytest.approx(2.0)
@@ -130,16 +133,16 @@ def test_pi05_next_action_stage_disables_cabo_and_gradient_clipping():
     [
         ({"training_stage": "invalid"}, "training_stage"),
         (
-            {"training_stage": "next_action", "next_action_context_steps": 0},
-            "next_action_context_steps",
+            {"training_stage": "next_action", "next_action_masked_steps": 0},
+            "next_action_masked_steps",
         ),
         (
-            {"training_stage": "next_action", "next_action_prediction_steps": 0},
-            "next_action_prediction_steps",
+            {"training_stage": "next_action", "next_action_masked_steps": 51},
+            "cannot exceed chunk_size",
         ),
         (
-            {"training_stage": "next_action", "next_action_prediction_steps": 24},
-            "must equal chunk_size",
+            {"next_action_full_mask_probability": 1.1},
+            "next_action_full_mask_probability",
         ),
     ],
 )
@@ -148,11 +151,11 @@ def test_pi05_rejects_invalid_next_action_configuration(kwargs, match):
         PI05Config(**kwargs)
 
 
-def test_pi05_flow_stage_does_not_require_next_action_split_to_match_chunk_size():
+def test_pi05_flow_stage_does_not_require_masked_steps_to_fit_chunk_size():
     config = PI05Config(chunk_size=40, n_action_steps=40)
 
     assert config.training_stage == "flow"
-    assert config.next_action_context_steps + config.next_action_prediction_steps != config.chunk_size
+    assert config.next_action_masked_steps == 25
 
 
 @pytest.mark.parametrize(

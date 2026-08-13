@@ -356,18 +356,13 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 
     if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
-        raise ValueError("Integrated next-action pretraining requires a non-resumed PI0.5 flow run")
+        raise ValueError("Integrated flow-inpainting pretraining requires a non-resumed PI0.5 flow run")
     if cfg.output_dir is None:
         raise ValueError("output_dir must be resolved before building the PI0.5 pretraining stage")
     if cfg.policy.use_peft or cfg.peft is not None:
         raise ValueError(
-            "Integrated PI0.5 next-action pretraining does not support PEFT. Use a standard PI0.5 "
+            "Integrated PI0.5 flow-inpainting pretraining does not support PEFT. Use a standard PI0.5 "
             "base/flow checkpoint as --policy.path and run full-parameter flow training."
-        )
-    if cfg.dataset.streaming:
-        raise ValueError(
-            "PI0.5 next-action pretraining requires a map-style dataset so episode-tail anchors "
-            "without future targets can be excluded"
         )
 
     pretrain_cfg = copy.deepcopy(cfg)
@@ -376,7 +371,6 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
         pretrain_cfg.policy,
         training_stage=PI05TrainingStage.NEXT_ACTION,
         next_action_pretrain_steps=0,
-        time_sampling_offset=0.001,
         # Stage 1 always uses the fixed optimization recipe from the pretraining design, independently
         # of any flow-stage optimizer overrides in the user's one-command invocation.
         optimizer_lr=2.5e-4,
@@ -454,7 +448,7 @@ def _run_pi05_next_action_pretraining(
     """Run Stage 1, then point the untouched formal config at its transferable weights."""
     pretrain_cfg = _make_pi05_next_action_pretraining_config(cfg)
     logging.info(
-        "Starting integrated PI0.5 next-action pretraining for %d steps; formal flow training "
+        "Starting integrated PI0.5 flow-inpainting pretraining for %d steps; formal flow training "
         "will start automatically afterwards.",
         pretrain_cfg.steps,
     )
@@ -471,7 +465,7 @@ def _run_pi05_next_action_pretraining(
         checkpoint_visible = int(visible_count.item()) == num_processes
     if not checkpoint_visible:
         raise RuntimeError(
-            "Integrated PI0.5 next-action pretraining finished without producing its final "
+            "Integrated PI0.5 flow-inpainting pretraining finished without producing its final "
             f"checkpoint at {pretrained_model_dir} on every rank. Distributed training requires "
             "output_dir and its sibling pretraining directory to be on a filesystem shared by all ranks."
         )
@@ -481,7 +475,7 @@ def _run_pi05_next_action_pretraining(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
-        "PI0.5 next-action pretraining complete; rebuilding the model, optimizer, scheduler, "
+        "PI0.5 flow-inpainting pretraining complete; rebuilding the model, optimizer, scheduler, "
         "and CABO state for formal flow training."
     )
 
@@ -537,16 +531,6 @@ def _train_single_stage(
     from accelerate.utils import DistributedType
 
     active_cfg = cfg.trainable_config
-    if (
-        cfg.dataset.streaming
-        and getattr(active_cfg, "type", None) == "pi05"
-        and getattr(active_cfg, "training_stage", None) == "next_action"
-    ):
-        raise ValueError(
-            "PI0.5 next-action pretraining requires a map-style dataset so episode-tail anchors "
-            "without future targets can be excluded"
-        )
-
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)

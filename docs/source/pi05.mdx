@@ -69,6 +69,20 @@ lerobot-train \
     --batch_size=32
 ```
 
+By default, a fresh flow run first performs 3,000 action-only flow-inpainting updates, then
+performs the requested `--steps` observation-conditioned flow updates. Stage 1 randomly masks 25
+valid positions in each 50-action chunk (with 10% fully masked chunks), keeps the remaining actions
+as clean bidirectional context, and predicts the flow velocity only at masked positions. It trains
+the same action expert, input/output projections, and timestep MLP used by Stage 2; no temporary
+prediction head is created or discarded.
+
+Set `--policy.next_action_pretrain_steps=0` to skip Stage 1. The compatibility name
+`training_stage=next_action` now denotes flow-inpainting rather than the former 25-to-25 MSE
+regression objective. The mask size and full-mask fraction can be changed with
+`--policy.next_action_masked_steps` and `--policy.next_action_full_mask_probability`.
+The legacy `next_action_context_steps` and `next_action_prediction_steps` fields are accepted only
+for loading older checkpoints and no longer affect training.
+
 ### Key Training Parameters
 
 - **`--policy.compile_model=true`**: Enables model compilation for faster training

@@ -46,13 +46,22 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
-    # Training objective. ``next_action`` pretrains the action expert by using the first part of an
-    # action chunk to predict the second part; ``flow`` keeps the standard PI0.5 objective.
+    # Training objective. ``next_action`` is kept as the public name for backwards compatibility,
+    # but now performs masked action flow inpainting over the complete chunk. ``flow`` keeps the
+    # standard observation-conditioned PI0.5 objective.
     # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
     training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
+    # Number of valid temporal action tokens to hide and reconstruct per sample. The mask is sampled
+    # uniformly without replacement; short padded chunks mask all available valid tokens.
+    next_action_masked_steps: int = 25
+    # Deprecated compatibility fields retained only so checkpoints produced by the former 25-to-25
+    # MSE objective remain config-loadable. Flow inpainting does not use either split.
     next_action_context_steps: int = 25
     next_action_prediction_steps: int = 25
-    # Number of next-action steps automatically run before a flow-training invocation. Set to 0 to
+    # A small fraction of Stage-1 batches mask the complete valid chunk, exactly matching the
+    # action-side corruption used by Stage 2 while the remaining batches learn inpainting.
+    next_action_full_mask_probability: float = 0.1
+    # Number of flow-inpainting steps automatically run before a flow-training invocation. Set to 0 to
     # start flow training immediately. This is orchestration metadata and does not alter either loss.
     next_action_pretrain_steps: int = 3_000
 
@@ -157,23 +166,21 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"next_action_pretrain_steps must be non-negative, got {self.next_action_pretrain_steps}"
             )
+        if not 0.0 <= self.next_action_full_mask_probability <= 1.0:
+            raise ValueError(
+                "next_action_full_mask_probability must be in [0, 1], "
+                f"got {self.next_action_full_mask_probability}"
+            )
         if self.training_stage == "next_action":
-            if self.next_action_context_steps <= 0:
+            if self.next_action_masked_steps <= 0:
                 raise ValueError(
-                    "next_action_context_steps must be greater than 0 for next_action training, "
-                    f"got {self.next_action_context_steps}"
+                    "next_action_masked_steps must be greater than 0 for next_action training, "
+                    f"got {self.next_action_masked_steps}"
                 )
-            if self.next_action_prediction_steps <= 0:
+            if self.next_action_masked_steps > self.chunk_size:
                 raise ValueError(
-                    "next_action_prediction_steps must be greater than 0 for next_action training, "
-                    f"got {self.next_action_prediction_steps}"
-                )
-            configured_horizon = self.next_action_context_steps + self.next_action_prediction_steps
-            if configured_horizon != self.chunk_size:
-                raise ValueError(
-                    "next_action_context_steps + next_action_prediction_steps must equal chunk_size "
-                    f"for next_action training, got {self.next_action_context_steps} + "
-                    f"{self.next_action_prediction_steps} != {self.chunk_size}"
+                    "next_action_masked_steps cannot exceed chunk_size for next_action training, "
+                    f"got {self.next_action_masked_steps} > {self.chunk_size}"
                 )
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
@@ -220,7 +227,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def next_action_pretraining_active(self) -> bool:
-        """Whether a flow-training invocation should first run next-action pretraining."""
+        """Whether a flow-training invocation should first run flow-inpainting pretraining."""
         return self.training_stage == "flow" and self.next_action_pretrain_steps > 0
 
     def validate_features(self) -> None:
@@ -276,9 +283,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def drop_n_last_frames(self) -> int:
-        """Drop anchors with no valid future target during next-action pretraining."""
-        if self.training_stage == PI05TrainingStage.NEXT_ACTION:
-            return self.next_action_context_steps
+        """Keep padded tails: inpainting samples only from valid actions in each chunk."""
         return 0
 
     @property

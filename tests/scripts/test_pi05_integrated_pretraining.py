@@ -94,9 +94,9 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.training_stage == "next_action"
     assert pretrain_cfg.policy.next_action_pretrain_steps == 0
     assert not pretrain_cfg.policy.next_action_pretraining_active
-    assert pretrain_cfg.policy.drop_n_last_frames == 25
+    assert pretrain_cfg.policy.drop_n_last_frames == 0
     assert not pretrain_cfg.cabo_active
-    assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.001)
+    assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
     assert pretrain_cfg.steps == 3_000
     assert pretrain_cfg.output_dir == tmp_path / "flow_next_action_pretrain"
     assert pretrain_cfg.save_checkpoint
@@ -126,7 +126,7 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     )
 
 
-def test_next_action_sampler_keeps_only_anchors_with_a_future_target(tmp_path):
+def test_flow_inpainting_sampler_keeps_episode_tail_anchors(tmp_path):
     cfg = _make_flow_config(tmp_path)
     cfg.validate()
     pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
@@ -137,11 +137,7 @@ def test_next_action_sampler_keeps_only_anchors_with_a_future_target(tmp_path):
         drop_n_last_frames=pretrain_cfg.policy.drop_n_last_frames,
     )
 
-    assert sampler.indices == [25, 51, 52]
-    assert all(
-        anchor + pretrain_cfg.policy.next_action_context_steps < episode_end
-        for anchor, episode_end in ((25, 51), (51, 78), (52, 78))
-    )
+    assert sampler.indices == list(range(78))
 
 
 def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeypatch, tmp_path):
@@ -243,24 +239,14 @@ def test_integrated_pretraining_rejects_peft(tmp_path, peft_mode):
         train_module._make_pi05_next_action_pretraining_config(cfg)
 
 
-def test_integrated_pretraining_rejects_streaming_dataset(tmp_path):
+def test_integrated_pretraining_accepts_streaming_dataset(tmp_path):
     cfg = _make_flow_config(tmp_path)
     cfg.dataset.streaming = True
 
-    with pytest.raises(ValueError, match="requires a map-style dataset"):
-        train_module._make_pi05_next_action_pretraining_config(cfg)
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
 
-
-def test_direct_next_action_training_rejects_streaming_dataset(tmp_path):
-    cfg = _make_flow_config(
-        tmp_path,
-        training_stage="next_action",
-        next_action_pretrain_steps=0,
-    )
-    cfg.dataset.streaming = True
-
-    with pytest.raises(ValueError, match="requires a map-style dataset"):
-        train_module._train_single_stage(cfg, _FakeAccelerator())
+    assert pretrain_cfg.dataset.streaming
+    assert pretrain_cfg.policy.training_stage == "next_action"
 
 
 def test_reward_model_training_never_activates_pi05_pretraining(tmp_path):
@@ -270,8 +256,10 @@ def test_reward_model_training_never_activates_pi05_pretraining(tmp_path):
     assert not train_module._pi05_next_action_pretraining_active(cfg)
 
 
-def test_integrated_pretraining_revalidates_25_plus_25_split(tmp_path):
+def test_integrated_pretraining_supports_non_default_chunk_when_mask_count_fits(tmp_path):
     cfg = _make_flow_config(tmp_path, chunk_size=40, n_action_steps=40)
 
-    with pytest.raises(ValueError, match="must equal chunk_size"):
-        train_module._make_pi05_next_action_pretraining_config(cfg)
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+
+    assert pretrain_cfg.policy.chunk_size == 40
+    assert pretrain_cfg.policy.next_action_masked_steps == 25

@@ -679,13 +679,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # These parameters deliberately exist only in next-action checkpoints. Keeping the
-        # prediction head separate prevents the temporary regression objective from overwriting
-        # the flow-matching output projection that is used by the second training stage.
+        # Persist the Stage-1 role signal in both stages so their state dicts remain identical. It is
+        # only used and trained by inpainting; generated/noisy tokens intentionally receive zero role
+        # offset, making the all-masked path identical to Stage 2's ordinary action-flow suffix.
+        self.inpainting_visible_action_embedding = nn.Embedding(1, action_expert_config.width)
+        nn.init.zeros_(self.inpainting_visible_action_embedding.weight)
+        self.inpainting_visible_action_embedding.requires_grad_(config.training_stage == "next_action")
         if config.training_stage == "next_action":
-            self.next_action_query = nn.Parameter(self.action_in_proj.bias.detach().clone())
-            self.next_action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
-            self.initialize_next_action_parameters_from_flow()
             self._freeze_for_next_action_pretraining()
 
         # Initialize gradient checkpointing flag
@@ -698,33 +698,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-    @torch.no_grad()
-    def initialize_next_action_parameters_from_flow(self) -> None:
-        """Initialize the stage-only parameters from the corresponding flow projections."""
-        if self.config.training_stage != "next_action":
-            raise RuntimeError("Next-action parameters only exist in training_stage='next_action'")
-        self.next_action_query.copy_(self.action_in_proj.bias)
-        self.next_action_out_proj.load_state_dict(self.action_out_proj.state_dict())
-
     def _freeze_for_next_action_pretraining(self) -> None:
-        """Keep only the expert, action input projection, query, and temporary head trainable."""
+        """Freeze the VLM and train the complete action-flow path used by Stage 2."""
         for parameter in self.parameters():
             parameter.requires_grad = False
         for module in (
             self.paligemma_with_expert.gemma_expert,
             self.action_in_proj,
-            self.next_action_out_proj,
+            self.action_out_proj,
+            self.time_mlp_in,
+            self.time_mlp_out,
+            self.inpainting_visible_action_embedding,
         ):
             for parameter in module.parameters():
                 parameter.requires_grad = True
-        self.next_action_query.requires_grad = True
         self._keep_next_action_frozen_modules_in_eval_mode()
 
     def _keep_next_action_frozen_modules_in_eval_mode(self) -> None:
         self.paligemma_with_expert.paligemma.eval()
-        self.time_mlp_in.eval()
-        self.time_mlp_out.eval()
-        self.action_out_proj.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -868,87 +859,83 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def embed_next_action_suffix(
-        self, context_actions: Tensor, context_is_pad: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed action context followed by a block of shared future-query tokens."""
-        batch_size, context_steps = context_actions.shape[:2]
-        prediction_steps = self.config.next_action_prediction_steps
-
-        context_embs = self._apply_checkpoint(self.action_in_proj, context_actions)
-        query_embs = self.next_action_query.view(1, 1, -1).expand(batch_size, prediction_steps, -1)
-        suffix_embs = torch.cat((context_embs, query_embs), dim=1)
-
-        query_is_pad = torch.zeros(
-            batch_size, prediction_steps, dtype=torch.bool, device=context_actions.device
-        )
-        suffix_pad_masks = ~torch.cat((context_is_pad, query_is_pad), dim=1)
-
-        # Two bidirectional blocks: context tokens share block one, while future queries share
-        # block two and can attend to the complete (valid) context. No target action is embedded.
-        block_starts = [1] + [0] * (context_steps - 1) + [1] + [0] * (prediction_steps - 1)
-        suffix_att_masks = (
-            torch.tensor(block_starts, dtype=torch.bool, device=context_actions.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-
-        timestep = torch.full(
-            (batch_size,),
-            self.config.time_sampling_offset,
-            dtype=torch.float32,
-            device=context_actions.device,
-        )
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=timestep.device,
-        ).to(dtype=timestep.dtype)
-        adarms_cond = self.time_mlp_out(F.silu(self.time_mlp_in(time_emb)))
-        adarms_cond = F.silu(adarms_cond)
-        return suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond
-
-    def predict_next_actions(self, context_actions: Tensor, context_is_pad: Tensor) -> Tensor:
-        """Predict the future action block using only the preceding action block."""
-        if self.config.training_stage != "next_action":
-            raise RuntimeError("predict_next_actions is only available in training_stage='next_action'")
-        expected_action_shape = (
-            "batch",
-            self.config.next_action_context_steps,
-            self.config.max_action_dim,
-        )
-        if context_actions.ndim != 3 or context_actions.shape[1:] != expected_action_shape[1:]:
+    def _validate_inpainting_inputs(
+        self,
+        actions: Tensor,
+        action_is_pad: Tensor | None,
+        inpainting_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        if action_is_pad is None:
+            raise ValueError("action_is_pad is required for flow-inpainting pretraining")
+        if actions.ndim != 3 or actions.shape[1] != self.config.chunk_size:
             raise ValueError(
-                f"context_actions must have shape {expected_action_shape}, got {tuple(context_actions.shape)}"
+                f"actions must have shape [batch, {self.config.chunk_size}, action_dim], "
+                f"got {tuple(actions.shape)}"
             )
-        expected_shape = (context_actions.shape[0], self.config.next_action_context_steps)
-        if context_is_pad.shape != expected_shape:
+        expected_mask_shape = actions.shape[:2]
+        if action_is_pad.shape != expected_mask_shape:
             raise ValueError(
-                f"context_is_pad must have shape {expected_shape}, got {tuple(context_is_pad.shape)}"
+                f"action_is_pad must have shape {expected_mask_shape}, got {tuple(action_is_pad.shape)}"
             )
-        context_is_pad = context_is_pad.to(device=context_actions.device, dtype=torch.bool)
-        # Padding values are semantically absent and may contain NaNs. Zero them before the input
-        # projection so masked context cannot contaminate attention activations or zero-loss gradients.
-        context_actions = torch.where(
-            context_is_pad.unsqueeze(-1),
-            torch.zeros_like(context_actions),
-            context_actions,
-        )
+        action_is_pad = action_is_pad.to(device=actions.device, dtype=torch.bool)
+        if inpainting_mask is not None:
+            if inpainting_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    f"inpainting_mask must have shape {expected_mask_shape}, "
+                    f"got {tuple(inpainting_mask.shape)}"
+                )
+            inpainting_mask = inpainting_mask.to(device=actions.device, dtype=torch.bool)
+            masks_padding = inpainting_mask & action_is_pad
+            if not torch.compiler.is_compiling() and masks_padding.any():
+                invalid_samples = masks_padding.any(dim=1).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(
+                    "inpainting_mask cannot select padded action positions; "
+                    f"invalid batch indices {invalid_samples}"
+                )
+        return action_is_pad, inpainting_mask
 
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_next_action_suffix(
-            context_actions, context_is_pad
+    def sample_inpainting_mask(self, action_is_pad: Tensor) -> Tensor:
+        """Uniformly mask up to ``next_action_masked_steps`` valid time positions per sample."""
+        if action_is_pad.ndim != 2 or action_is_pad.shape[1] != self.config.chunk_size:
+            raise ValueError(
+                f"action_is_pad must have shape [batch, {self.config.chunk_size}], "
+                f"got {tuple(action_is_pad.shape)}"
+            )
+        valid = ~action_is_pad.to(dtype=torch.bool)
+        random_scores = torch.rand(valid.shape, device=valid.device)
+        random_scores = random_scores.masked_fill(~valid, torch.inf)
+        ranks = random_scores.argsort(dim=1).argsort(dim=1)
+        num_to_mask = valid.sum(dim=1).clamp(max=self.config.next_action_masked_steps)
+        inpainting_mask = valid & (ranks < num_to_mask[:, None])
+        if self.config.next_action_full_mask_probability > 0.0:
+            full_mask = (
+                torch.rand(valid.shape[0], device=valid.device)
+                < self.config.next_action_full_mask_probability
+            )
+            inpainting_mask = torch.where(full_mask[:, None], valid, inpainting_mask)
+        return inpainting_mask
+
+    def predict_inpainting_velocity(
+        self,
+        x_t: Tensor,
+        time: Tensor,
+        action_is_pad: Tensor,
+        inpainting_mask: Tensor,
+    ) -> Tensor:
+        """Predict the masked-action flow without a VLM prefix using the formal flow modules."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        visible = (~action_is_pad.to(device=x_t.device, dtype=torch.bool)) & (~inpainting_mask)
+        suffix_embs = suffix_embs + visible.unsqueeze(-1).to(suffix_embs.dtype) * (
+            self.inpainting_visible_action_embedding.weight[0].to(suffix_embs.dtype)
         )
+        suffix_pad_masks = ~action_is_pad.to(device=x_t.device, dtype=torch.bool)
         expert_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
         suffix_embs = suffix_embs.to(dtype=expert_dtype)
         att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        # Keep semantic positions stable even when an episode tail pads part of the context: the
-        # future queries must always occupy positions context_steps..chunk_size-1.
         position_ids = (
-            torch.arange(self.config.chunk_size, dtype=torch.long, device=context_actions.device)
+            torch.arange(self.config.chunk_size, dtype=torch.long, device=x_t.device)
             .unsqueeze(0)
-            .expand(context_actions.shape[0], -1)
+            .expand(x_t.shape[0], -1)
         )
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
@@ -965,41 +952,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = self._apply_checkpoint(
             forward_func, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
-        query_out = suffix_out[:, -self.config.next_action_prediction_steps :].to(torch.float32)
-        return self._apply_checkpoint(self.next_action_out_proj, query_out)
-
-    def _split_next_action_batch(
-        self, actions: Tensor, action_is_pad: Tensor | None
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        if action_is_pad is None:
-            raise ValueError("action_is_pad is required for next-action pretraining")
-        if actions.ndim != 3 or actions.shape[1] != self.config.chunk_size:
-            raise ValueError(
-                f"actions must have shape [batch, {self.config.chunk_size}, action_dim], "
-                f"got {tuple(actions.shape)}"
-            )
-        expected_mask_shape = actions.shape[:2]
-        if action_is_pad.shape != expected_mask_shape:
-            raise ValueError(
-                f"action_is_pad must have shape {expected_mask_shape}, got {tuple(action_is_pad.shape)}"
-            )
-        action_is_pad = action_is_pad.to(device=actions.device, dtype=torch.bool)
-        context_steps = self.config.next_action_context_steps
-        context_actions = actions[:, :context_steps]
-        targets = actions[:, context_steps:]
-        context_is_pad = action_is_pad[:, :context_steps]
-        target_valid = ~action_is_pad[:, context_steps:]
-        invalid_order = target_valid.any(dim=1) & context_is_pad.any(dim=1)
-        # The policy performs this data-dependent validation eagerly before invoking a compiled
-        # forward. Skipping it only while Dynamo is tracing keeps the training graph contiguous.
-        if not torch.compiler.is_compiling() and invalid_order.any():
-            invalid_samples = invalid_order.nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(
-                "action_is_pad is inconsistent: target actions are valid after padded context "
-                f"for batch indices {invalid_samples}"
-            )
-        return context_actions, targets, context_is_pad, target_valid
+        ).to(dtype=torch.float32)
+        return self._apply_checkpoint(self.action_out_proj, suffix_out)
 
     def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
         """Predict flow velocity for explicit noisy actions and timesteps."""
@@ -1054,23 +1008,35 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         time=None,
         action_is_pad=None,
+        inpainting_mask=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if actions is None:
             raise ValueError("actions are required")
         if self.config.training_stage == "next_action":
-            context, targets, context_is_pad, target_valid = self._split_next_action_batch(
-                actions, action_is_pad
+            action_is_pad, inpainting_mask = self._validate_inpainting_inputs(
+                actions, action_is_pad, inpainting_mask
             )
-            predictions = self.predict_next_actions(context, context_is_pad)
-            valid_elements = target_valid.unsqueeze(-1)
-            safe_targets = torch.where(valid_elements, targets, torch.zeros_like(targets))
-            safe_predictions = torch.where(
-                valid_elements,
-                predictions,
-                torch.zeros_like(predictions),
-            )
-            return F.mse_loss(safe_targets, safe_predictions, reduction="none")
+            if inpainting_mask is None:
+                inpainting_mask = self.sample_inpainting_mask(action_is_pad)
+            if noise is None:
+                noise = self.sample_noise(actions.shape, actions.device)
+            if time is None:
+                time = self.sample_time(actions.shape[0], actions.device)
+
+            valid_elements = (~action_is_pad).unsqueeze(-1)
+            safe_actions = torch.where(valid_elements, actions, torch.zeros_like(actions))
+            safe_noise = torch.where(valid_elements, noise, torch.zeros_like(noise))
+            time_expanded = time[:, None, None]
+            noisy_actions = time_expanded * safe_noise + (1 - time_expanded) * safe_actions
+            masked_elements = inpainting_mask.unsqueeze(-1)
+            # Visible actions stay clean and act as bidirectional conditioning. Only hidden positions
+            # follow the flow path, so the scalar timestep describes precisely the variables generated.
+            x_t = torch.where(masked_elements, noisy_actions, safe_actions)
+            u_t = safe_noise - safe_actions
+            v_t = self.predict_inpainting_velocity(x_t, time, action_is_pad, inpainting_mask)
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+            return torch.where(masked_elements, losses, torch.zeros_like(losses))
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -1100,7 +1066,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Do a full inference forward and compute the action."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         if num_steps is None:
@@ -1222,13 +1188,14 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
-    _NEXT_ACTION_CHECKPOINT_KEYS = frozenset(
+    _LEGACY_NEXT_ACTION_CHECKPOINT_KEYS = frozenset(
         {
             "model.next_action_query",
             "model.next_action_out_proj.weight",
             "model.next_action_out_proj.bias",
         }
     )
+    _INPAINTING_ROLE_KEY = "model.inpainting_visible_action_embedding.weight"
 
     def __init__(
         self,
@@ -1344,46 +1311,38 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            temporary_keys = cls._NEXT_ACTION_CHECKPOINT_KEYS
-            present_temporary_keys = temporary_keys.intersection(remapped_state_dict)
-            if present_temporary_keys and present_temporary_keys != temporary_keys:
-                missing_temporary_keys = sorted(temporary_keys - present_temporary_keys)
-                raise RuntimeError(
-                    "Invalid PI0.5 next-action checkpoint: stage-only parameters must be all present "
-                    f"or all absent; missing={missing_temporary_keys}"
+            legacy_keys = cls._LEGACY_NEXT_ACTION_CHECKPOINT_KEYS
+            present_legacy_keys = legacy_keys.intersection(remapped_state_dict)
+            if present_legacy_keys:
+                if present_legacy_keys != legacy_keys:
+                    raise RuntimeError(
+                        "Invalid legacy PI0.5 next-action checkpoint: temporary parameters must be "
+                        f"all present or all absent; missing={sorted(legacy_keys - present_legacy_keys)}"
+                    )
+                logging.warning(
+                    "Loading a legacy PI0.5 next-action checkpoint: its temporary regression query/head "
+                    "are discarded because flow inpainting now trains the formal flow head directly."
                 )
-
-            target_is_next_action = config.training_stage == "next_action"
-            source_is_next_action = present_temporary_keys == temporary_keys
-            if source_is_next_action and not target_is_next_action:
-                # The stage-specific query/head are intentionally discarded when transferring to
-                # flow matching. No other unexpected checkpoint key is silently filtered.
                 remapped_state_dict = {
-                    key: value for key, value in remapped_state_dict.items() if key not in temporary_keys
+                    key: value for key, value in remapped_state_dict.items() if key not in legacy_keys
                 }
 
-            # Always inspect incompatibilities ourselves so the two explicitly supported stage
-            # transitions can remain strict without weakening unrelated checkpoint validation.
+            if cls._INPAINTING_ROLE_KEY not in remapped_state_dict:
+                # Official and pre-inpainting PI0.5 checkpoints predate this zero-initialized role
+                # embedding. It has no effect on ordinary flow, so adding the model default is exact.
+                remapped_state_dict[cls._INPAINTING_ROLE_KEY] = model.state_dict()[
+                    cls._INPAINTING_ROLE_KEY
+                ]
+
+            # Inpainting and formal flow deliberately use an identical parameter set. Loading stays
+            # strict across stages so no action-flow head can be silently dropped or reinitialized.
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
-            allowed_missing_keys = (
-                temporary_keys if target_is_next_action and not source_is_next_action else frozenset()
-            )
-            disallowed_missing_keys = set(missing_keys) - allowed_missing_keys
-            missing_allowed_keys = allowed_missing_keys - set(missing_keys)
-            if strict and (disallowed_missing_keys or unexpected_keys or missing_allowed_keys):
+            if strict and (missing_keys or unexpected_keys):
                 raise RuntimeError(
                     "PI0.5 checkpoint is incompatible with the requested training stage: "
-                    f"missing={sorted(disallowed_missing_keys)}, "
-                    f"unexpected={sorted(unexpected_keys)}, "
-                    f"expected_stage_missing={sorted(missing_allowed_keys)}"
+                    f"missing={sorted(missing_keys)}, unexpected={sorted(unexpected_keys)}"
                 )
-
-            if target_is_next_action and not source_is_next_action:
-                model.model.initialize_next_action_parameters_from_flow()
-
-            if missing_keys and set(missing_keys) == allowed_missing_keys:
-                print("Initialized PI0.5 next-action query and prediction head from flow projections")
-            elif missing_keys:
+            if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 5:
                     for key in missing_keys:
@@ -1482,27 +1441,23 @@ class PI05Policy(PreTrainedPolicy):
         return [self.model.paligemma_with_expert.gemma_expert]
 
     def _action_projection_modules(self) -> list[nn.Module]:
-        modules = [
+        return [
             self.model.action_in_proj,
             self.model.action_out_proj,
             self.model.time_mlp_in,
             self.model.time_mlp_out,
+            self.model.inpainting_visible_action_embedding,
         ]
-        if getattr(self.config, "training_stage", "flow") == "next_action":
-            modules.append(self.model.next_action_out_proj)
-        return modules
 
     def _action_modules(self) -> list[nn.Module]:
-        modules = [
+        return [
             self.model.paligemma_with_expert.gemma_expert,
             self.model.action_in_proj,
             self.model.action_out_proj,
             self.model.time_mlp_in,
             self.model.time_mlp_out,
+            self.model.inpainting_visible_action_embedding,
         ]
-        if getattr(self.config, "training_stage", "flow") == "next_action":
-            modules.append(self.model.next_action_out_proj)
-        return modules
 
     def _is_cabo_active(self) -> bool:
         # The fallback keeps policy hook unit-test stand-ins compatible while the real PI05Config
@@ -1865,7 +1820,7 @@ class PI05Policy(PreTrainedPolicy):
         """Select a single action given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         assert not self._rtc_enabled(), (
@@ -1887,7 +1842,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1912,7 +1867,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict actions and return a pooled contextual PI0.5 prefix representation."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a next-action pretraining checkpoint; "
+                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1947,27 +1902,32 @@ class PI05Policy(PreTrainedPolicy):
         if self.config.training_stage == "next_action":
             actions = self.prepare_action(batch)
             if "action_is_pad" not in batch:
-                raise ValueError("action_is_pad is required for next-action pretraining")
-            action_is_pad = batch["action_is_pad"]
-            if self.config.compile_model:
-                # PI05Pytorch.forward is compiled independently; validate temporal padding order
-                # eagerly so the data-dependent error path does not split its Dynamo graph.
-                self.model._split_next_action_batch(actions, action_is_pad)
-            losses = self.model.forward(actions=actions, action_is_pad=action_is_pad)
+                raise ValueError("action_is_pad is required for flow-inpainting pretraining")
+            action_is_pad = batch["action_is_pad"].to(device=actions.device, dtype=torch.bool)
+            self.model._validate_inpainting_inputs(actions, action_is_pad)
+            inpainting_mask = self.model.sample_inpainting_mask(action_is_pad)
+            # The trainer queries the DDP denominator immediately after forward. Exposing this
+            # ephemeral mask on the current batch keeps normalization exact for optional full masks.
+            batch["pi05_inpainting_mask"] = inpainting_mask
+            losses = self.model.forward(
+                actions=actions,
+                action_is_pad=action_is_pad,
+                inpainting_mask=inpainting_mask,
+            )
 
             original_action_dim = self.config.output_features[ACTION].shape[0]
             losses = losses[:, :, :original_action_dim]
-            target_valid = ~action_is_pad.to(device=losses.device, dtype=torch.bool)[
-                :, self.config.next_action_context_steps :
-            ]
-            loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, target_valid)
-            valid_target_count = target_valid.sum()
-            total_target_count = target_valid.numel()
+            masked_valid = inpainting_mask.to(device=losses.device)
+            loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, masked_valid)
+            masked_valid_count = masked_valid.sum()
+            valid_action_count = (~action_is_pad).sum()
             loss_dict = {
                 "loss": loss.detach().item(),
-                "next_action/loss": loss.detach().item(),
-                "next_action/valid_target_count": float(valid_target_count.item()),
-                "next_action/valid_target_fraction": float(valid_target_count.item() / total_target_count),
+                "flow_inpainting/loss": loss.detach().item(),
+                "flow_inpainting/masked_valid_count": float(masked_valid_count.item()),
+                "flow_inpainting/masked_valid_fraction": float(
+                    masked_valid_count.item() / max(valid_action_count.item(), 1)
+                ),
                 "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
             }
             if reduction == "none":
@@ -2006,7 +1966,14 @@ class PI05Policy(PreTrainedPolicy):
         """Return the local number of valid scalar loss terms for DDP reweighting."""
         valid_steps = _valid_action_steps(batch)
         if self.config.training_stage == "next_action":
-            valid_steps = valid_steps[:, self.config.next_action_context_steps :]
+            if "pi05_inpainting_mask" in batch:
+                valid_count = batch["pi05_inpainting_mask"].to(dtype=torch.bool).sum(dim=1)
+            else:
+                # Before the first forward (or in standalone diagnostics), fall back to the ordinary
+                # fixed-size inpainting denominator.
+                valid_count = valid_steps.sum(dim=1).clamp(max=self.config.next_action_masked_steps)
+            action_dim = self.config.output_features[ACTION].shape[0]
+            return valid_count.sum(dtype=torch.float32) * action_dim
         action_dim = self.config.output_features[ACTION].shape[0]
         return valid_steps.sum(dtype=torch.float32) * action_dim
 
