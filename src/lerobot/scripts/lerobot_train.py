@@ -76,6 +76,7 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 _PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
+_PI05_STAGE2_SAVE_FREQ = 3_000
 
 
 @torch.no_grad()
@@ -373,14 +374,14 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
         next_action_pretrain_steps=0,
         # Stage 1 always uses the fixed optimization recipe from the pretraining design, independently
         # of any flow-stage optimizer overrides in the user's one-command invocation.
-        optimizer_lr=2.5e-4,
+        optimizer_lr=2.5e-5,
         optimizer_betas=(0.9, 0.95),
         optimizer_eps=1e-8,
         optimizer_weight_decay=0.01,
         optimizer_grad_clip_norm=0.0,
         scheduler_warmup_steps=1_000,
         scheduler_decay_steps=30_000,
-        scheduler_decay_lr=2.5e-5,
+        scheduler_decay_lr=2.5e-6,
         push_to_hub=False,
     )
     pretrain_cfg.steps = pretrain_steps
@@ -472,11 +473,15 @@ def _run_pi05_next_action_pretraining(
     accelerator.free_memory()
     cfg.policy.pretrained_path = pretrained_model_dir
     cfg.policy.pretrained_revision = None
+    # Stage 1 keeps only its final transfer checkpoint. Once it succeeds, persist the formal
+    # observation-conditioned flow stage at a finer, fixed cadence (plus the existing final save).
+    cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
         "PI0.5 flow-inpainting pretraining complete; rebuilding the model, optimizer, scheduler, "
-        "and CABO state for formal flow training."
+        "and CABO state for formal flow training with checkpoints every %d steps.",
+        cfg.save_freq,
     )
 
 

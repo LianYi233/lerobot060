@@ -680,11 +680,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         # Persist the Stage-1 role signal in both stages so their state dicts remain identical. It is
-        # only used and trained by inpainting; generated/noisy tokens intentionally receive zero role
-        # offset, making the all-masked path identical to Stage 2's ordinary action-flow suffix.
+        # only used by inpainting and remains frozen; generated/noisy tokens intentionally receive zero
+        # role offset, making the all-masked path identical to Stage 2's ordinary action-flow suffix.
         self.inpainting_visible_action_embedding = nn.Embedding(1, action_expert_config.width)
         nn.init.zeros_(self.inpainting_visible_action_embedding.weight)
-        self.inpainting_visible_action_embedding.requires_grad_(config.training_stage == "next_action")
+        self.inpainting_visible_action_embedding.requires_grad_(False)
         if config.training_stage == "next_action":
             self._freeze_for_next_action_pretraining()
 
@@ -699,16 +699,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_for_next_action_pretraining(self) -> None:
-        """Freeze the VLM and train the complete action-flow path used by Stage 2."""
+        """Train only the action expert and input projection during Stage 1."""
         for parameter in self.parameters():
             parameter.requires_grad = False
         for module in (
             self.paligemma_with_expert.gemma_expert,
             self.action_in_proj,
-            self.action_out_proj,
-            self.time_mlp_in,
-            self.time_mlp_out,
-            self.inpainting_visible_action_embedding,
         ):
             for parameter in module.parameters():
                 parameter.requires_grad = True
@@ -1330,9 +1326,7 @@ class PI05Policy(PreTrainedPolicy):
             if cls._INPAINTING_ROLE_KEY not in remapped_state_dict:
                 # Official and pre-inpainting PI0.5 checkpoints predate this zero-initialized role
                 # embedding. It has no effect on ordinary flow, so adding the model default is exact.
-                remapped_state_dict[cls._INPAINTING_ROLE_KEY] = model.state_dict()[
-                    cls._INPAINTING_ROLE_KEY
-                ]
+                remapped_state_dict[cls._INPAINTING_ROLE_KEY] = model.state_dict()[cls._INPAINTING_ROLE_KEY]
 
             # Inpainting and formal flow deliberately use an identical parameter set. Loading stays
             # strict across stages so no action-flow head can be silently dropped or reinitialized.

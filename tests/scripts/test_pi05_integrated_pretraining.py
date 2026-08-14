@@ -111,13 +111,13 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.job.target == "local"
 
     assert pretrain_cfg.optimizer is not cfg.optimizer
-    assert pretrain_cfg.optimizer.lr == pytest.approx(2.5e-4)
+    assert pretrain_cfg.optimizer.lr == pytest.approx(2.5e-5)
     assert pretrain_cfg.optimizer.betas == (0.9, 0.95)
     assert pretrain_cfg.optimizer.eps == pytest.approx(1e-8)
     assert pretrain_cfg.optimizer.weight_decay == pytest.approx(0.01)
     assert pretrain_cfg.optimizer.grad_clip_norm == 0.0
-    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(2.5e-4)
-    assert pretrain_cfg.scheduler.decay_lr == pytest.approx(2.5e-5)
+    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(2.5e-5)
+    assert pretrain_cfg.scheduler.decay_lr == pytest.approx(2.5e-6)
     assert pretrain_cfg.scheduler.num_warmup_steps == 1_000
     assert pretrain_cfg.scheduler.num_decay_steps == 30_000
 
@@ -138,6 +138,28 @@ def test_flow_inpainting_sampler_keeps_episode_tail_anchors(tmp_path):
     )
 
     assert sampler.indices == list(range(78))
+
+
+def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_path):
+    cfg = _make_flow_config(tmp_path, next_action_pretrain_steps=1_200)
+    cfg.save_freq = 137
+    cfg.validate()
+    accelerator = _FakeAccelerator()
+
+    def fake_train_single_stage(stage_cfg, stage_accelerator):
+        assert stage_accelerator is accelerator
+        assert stage_cfg.policy.training_stage == "next_action"
+        assert stage_cfg.save_freq == 1_200
+        train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    monkeypatch.setattr(train_module, "_train_single_stage", fake_train_single_stage)
+
+    train_module._run_pi05_next_action_pretraining(cfg, accelerator)
+
+    assert cfg.save_freq == 3_000
 
 
 def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeypatch, tmp_path):
@@ -172,6 +194,8 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[0][0].optimizer is not cfg.optimizer
     assert stages[1][0] is cfg
     assert stages[1][0].cabo_active
+    assert stages[1][0].save_checkpoint
+    assert stages[1][0].save_freq == 3_000
     expected_model_dir = (
         tmp_path / "flow_next_action_pretrain" / "checkpoints" / "003000" / "pretrained_model"
     )
@@ -197,6 +221,7 @@ def test_zero_pretraining_steps_runs_only_flow(monkeypatch, tmp_path):
     train_module.train(cfg, accelerator=accelerator)
 
     assert [stage_cfg.policy.training_stage for stage_cfg, _ in stages] == ["flow"]
+    assert stages[0][0].save_freq == 10_000
     assert accelerator.free_memory_calls == 0
     assert accelerator.end_training_calls == 1
 
@@ -262,4 +287,5 @@ def test_integrated_pretraining_supports_non_default_chunk_when_mask_count_fits(
     pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
 
     assert pretrain_cfg.policy.chunk_size == 40
-    assert pretrain_cfg.policy.next_action_masked_steps == 25
+    assert pretrain_cfg.policy.next_action_masked_steps == 40
+    assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(0.0)

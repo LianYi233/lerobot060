@@ -53,14 +53,14 @@ class PI05Config(PreTrainedConfig):
     training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
     # Number of valid temporal action tokens to hide and reconstruct per sample. The mask is sampled
     # uniformly without replacement; short padded chunks mask all available valid tokens.
-    next_action_masked_steps: int = 25
+    next_action_masked_steps: int = 40
     # Deprecated compatibility fields retained only so checkpoints produced by the former 25-to-25
     # MSE objective remain config-loadable. Flow inpainting does not use either split.
     next_action_context_steps: int = 25
     next_action_prediction_steps: int = 25
-    # A small fraction of Stage-1 batches mask the complete valid chunk, exactly matching the
-    # action-side corruption used by Stage 2 while the remaining batches learn inpainting.
-    next_action_full_mask_probability: float = 0.1
+    # Stage 1 defaults to fixed-count inpainting: 40 hidden action tokens and 10 visible tokens for
+    # a standard 50-step chunk. Complete-chunk masking remains available as an explicit override.
+    next_action_full_mask_probability: float = 0.0
     # Number of flow-inpainting steps automatically run before a flow-training invocation. Set to 0 to
     # start flow training immediately. This is orchestration metadata and does not alter either loss.
     next_action_pretrain_steps: int = 3_000

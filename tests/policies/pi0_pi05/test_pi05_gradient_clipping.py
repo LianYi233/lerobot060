@@ -107,7 +107,8 @@ def test_pi05_optimizer_and_cabo_defaults():
     assert config.cabo_enabled
     assert config.cabo_active
     assert config.training_stage == "flow"
-    assert config.next_action_masked_steps == 25
+    assert config.next_action_masked_steps == 40
+    assert config.next_action_full_mask_probability == pytest.approx(0.0)
     assert config.next_action_context_steps == 25
     assert config.next_action_prediction_steps == 25
     assert config.cabo_expert_update_ratio == pytest.approx(2.0)
@@ -152,10 +153,10 @@ def test_pi05_rejects_invalid_next_action_configuration(kwargs, match):
 
 
 def test_pi05_flow_stage_does_not_require_masked_steps_to_fit_chunk_size():
-    config = PI05Config(chunk_size=40, n_action_steps=40)
+    config = PI05Config(chunk_size=20, n_action_steps=20)
 
     assert config.training_stage == "flow"
-    assert config.next_action_masked_steps == 25
+    assert config.next_action_masked_steps == 40
 
 
 @pytest.mark.parametrize(

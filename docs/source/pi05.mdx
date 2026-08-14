@@ -70,11 +70,12 @@ lerobot-train \
 ```
 
 By default, a fresh flow run first performs 3,000 action-only flow-inpainting updates, then
-performs the requested `--steps` observation-conditioned flow updates. Stage 1 randomly masks 25
-valid positions in each 50-action chunk (with 10% fully masked chunks), keeps the remaining actions
-as clean bidirectional context, and predicts the flow velocity only at masked positions. It trains
-the same action expert, input/output projections, and timestep MLP used by Stage 2; no temporary
-prediction head is created or discarded.
+performs the requested `--steps` observation-conditioned flow updates. For a complete 50-action
+chunk, Stage 1 randomly masks 40 valid positions, keeps 10 actions as clean bidirectional context,
+and predicts the flow velocity only at masked positions. Complete-chunk masking is disabled by
+default. Stage 1 trains only the action expert and action input projection; the VLM, action output
+projection, timestep MLP, and inpainting role embedding remain frozen. No temporary prediction head
+is created or discarded.
 
 Set `--policy.next_action_pretrain_steps=0` to skip Stage 1. The compatibility name
 `training_stage=next_action` now denotes flow-inpainting rather than the former 25-to-25 MSE
@@ -98,6 +99,10 @@ for loading older checkpoints and no longer affect training.
 Fresh π₀.₅ configurations use one AdamW learning rate for all trainable VLM and action-side
 parameters. After warmup, the learning rate follows a cosine decay from `2.5e-4` to a floor of
 `2.5e-5`. Loading or resuming a checkpoint preserves the optimizer values saved in that checkpoint.
+The integrated Stage 1 uses its own fixed, lower-rate schedule: `2.5e-5` peak learning rate and a
+`2.5e-6` decay floor. Its optimizer state is not carried into Stage 2. During an integrated
+two-stage run, Stage 2 saves a checkpoint every 3,000 updates when checkpointing is enabled, and
+once more at the final update when the total step count is not divisible by 3,000.
 
 Without CABO, gradient clipping is policy-specific. The action-side gradient RMS is capped at 10
 times the VLM gradient RMS, and only action-side gradients are rescaled when that cap is exceeded.
