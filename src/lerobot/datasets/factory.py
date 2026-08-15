@@ -130,8 +130,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             if key in dataset.meta.depth_keys:
                 continue  # Exclude depth keys from ImageNet stats
+            # Some converted datasets declare a camera feature but do not
+            # contain a corresponding entry in meta.stats.
+            dataset.meta.stats.setdefault(key, {})
+
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                dataset.meta.stats[key][stats_type] = torch.tensor(
+                    stats,
+                    dtype=torch.float32,
+                )
 
     return dataset
 
