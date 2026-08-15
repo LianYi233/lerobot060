@@ -28,7 +28,7 @@ def test_pi05_integrated_next_action_pretraining_defaults_to_3000_steps():
 
     assert config.next_action_pretrain_steps == 3_000
     assert config.next_action_masked_steps == 40
-    assert config.next_action_full_mask_probability == pytest.approx(0.0)
+    assert config.next_action_full_mask_probability == pytest.approx(1.0)
     assert config.next_action_pretraining_active
 
 

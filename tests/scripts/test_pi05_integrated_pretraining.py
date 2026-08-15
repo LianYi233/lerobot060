@@ -194,6 +194,8 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[0][0].optimizer is not cfg.optimizer
     assert stages[1][0] is cfg
     assert stages[1][0].cabo_active
+    assert not stages[1][0].policy.train_expert_only
+    assert not stages[1][0].policy.freeze_vision_encoder
     assert stages[1][0].save_checkpoint
     assert stages[1][0].save_freq == 3_000
     expected_model_dir = (
@@ -288,4 +290,4 @@ def test_integrated_pretraining_supports_non_default_chunk_when_mask_count_fits(
 
     assert pretrain_cfg.policy.chunk_size == 40
     assert pretrain_cfg.policy.next_action_masked_steps == 40
-    assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(0.0)
+    assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(1.0)

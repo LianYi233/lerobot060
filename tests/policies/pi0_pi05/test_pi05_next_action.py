@@ -141,14 +141,16 @@ def _save_checkpoint(path, policy: PI05Policy, state_dict=None) -> None:
     save_file(tensors, path / "model.safetensors")
 
 
-def test_flow_inpainting_default_mask_keeps_exactly_ten_visible_actions():
+def test_action_only_flow_default_masks_every_valid_action():
     core = _make_policy().model
     action_is_pad = torch.zeros(3, _HORIZON, dtype=torch.bool)
+    action_is_pad[1, 7:] = True
+    action_is_pad[2] = True
 
     inpainting_mask = core.sample_inpainting_mask(action_is_pad)
 
-    assert inpainting_mask.sum(dim=1).tolist() == [40, 40, 40]
-    assert ((~inpainting_mask) & (~action_is_pad)).sum(dim=1).tolist() == [10, 10, 10]
+    assert torch.equal(inpainting_mask, ~action_is_pad)
+    assert not ((~inpainting_mask) & (~action_is_pad)).any()
 
 
 def test_flow_inpainting_random_mask_selects_exact_valid_steps_only():
@@ -186,6 +188,47 @@ def test_flow_inpainting_can_sample_exact_full_flow_corruption():
     inpainting_mask = core.sample_inpainting_mask(action_is_pad)
 
     assert torch.equal(inpainting_mask, ~action_is_pad)
+
+
+def test_action_only_flow_default_noises_every_valid_action_and_sanitizes_padding(monkeypatch):
+    core = _make_policy().model
+    actions = torch.linspace(-1.0, 1.0, _HORIZON * _MAX_ACTION_DIM).reshape(1, _HORIZON, _MAX_ACTION_DIM)
+    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
+    action_is_pad[:, -2:] = True
+    actions[:, -2:] = torch.nan
+    noise = torch.full_like(actions, 0.75)
+    time = torch.tensor([0.25])
+    captured = {}
+
+    def predict_velocity(x_t, predicted_time, predicted_action_is_pad, predicted_inpainting_mask):
+        captured["x_t"] = x_t.detach().clone()
+        captured["time"] = predicted_time.detach().clone()
+        captured["action_is_pad"] = predicted_action_is_pad.detach().clone()
+        captured["inpainting_mask"] = predicted_inpainting_mask.detach().clone()
+        return torch.zeros_like(x_t)
+
+    monkeypatch.setattr(core, "predict_inpainting_velocity", predict_velocity)
+
+    losses = core.forward(
+        actions=actions,
+        noise=noise,
+        time=time,
+        action_is_pad=action_is_pad,
+    )
+
+    valid = ~action_is_pad
+    safe_actions = torch.where(valid.unsqueeze(-1), actions, torch.zeros_like(actions))
+    safe_noise = torch.where(valid.unsqueeze(-1), noise, torch.zeros_like(noise))
+    expected_x_t = time[:, None, None] * safe_noise + (1 - time[:, None, None]) * safe_actions
+    expected_losses = torch.where(
+        valid.unsqueeze(-1),
+        (safe_noise - safe_actions).square(),
+        torch.zeros_like(actions),
+    )
+    assert torch.equal(captured["inpainting_mask"], valid)
+    torch.testing.assert_close(captured["x_t"], expected_x_t)
+    torch.testing.assert_close(losses, expected_losses)
+    assert torch.count_nonzero(captured["x_t"][action_is_pad]) == 0
 
 
 def test_flow_inpainting_explicit_mask_controls_noising_and_elementwise_loss(monkeypatch):
@@ -265,6 +308,24 @@ def test_flow_inpainting_action_block_is_bidirectional_and_padding_is_removed():
     torch.testing.assert_close(call["suffix_embs"], expected_embs)
 
 
+def test_action_only_full_mask_never_applies_visible_action_role():
+    core = _make_policy().model
+    x_t = torch.randn(1, _HORIZON, _MAX_ACTION_DIM)
+    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
+    action_is_pad[:, -3:] = True
+    x_t[:, -3:] = 0
+    inpainting_mask = ~action_is_pad
+    with torch.no_grad():
+        core.inpainting_visible_action_embedding.weight.fill_(123.0)
+
+    core.predict_inpainting_velocity(x_t, torch.tensor([0.5]), action_is_pad, inpainting_mask)
+
+    torch.testing.assert_close(
+        core.paligemma_with_expert.last_call["suffix_embs"],
+        core.action_in_proj(x_t),
+    )
+
+
 def test_flow_inpainting_policy_samples_mask_and_reduces_only_masked_actual_dimensions(monkeypatch):
     policy = _make_policy()
     action_is_pad = torch.zeros(2, _HORIZON, dtype=torch.bool)
@@ -324,7 +385,8 @@ def test_flow_inpainting_all_padded_actions_return_graph_connected_zero():
     assert loss.requires_grad
     assert metrics["flow_inpainting/masked_valid_count"] == 0
     assert metrics["flow_inpainting/masked_valid_fraction"] == 0.0
-    assert policy.model.action_out_proj.weight.grad is None
+    assert policy.model.action_out_proj.weight.grad is not None
+    assert torch.count_nonzero(policy.model.action_out_proj.weight.grad) == 0
     assert policy.model.action_in_proj.weight.grad is not None
     assert torch.count_nonzero(policy.model.action_in_proj.weight.grad) == 0
     assert all(
@@ -359,7 +421,7 @@ def test_flow_inpainting_validates_padding_and_explicit_masks():
         )
 
 
-def test_flow_inpainting_trains_only_expert_and_action_input_projection():
+def test_action_only_flow_trains_complete_action_path_and_freezes_vlm():
     torch.manual_seed(5)
     policy = _make_policy()
     core = policy.model
@@ -378,31 +440,31 @@ def test_flow_inpainting_trains_only_expert_and_action_input_projection():
     losses[inpainting_mask].mean().backward()
 
     trainable = {name for name, parameter in policy.named_parameters() if parameter.requires_grad}
-    assert trainable == {
+    expected_prefixes = (
+        "model.paligemma_with_expert.gemma_expert.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+        "model.time_mlp_in.",
+        "model.time_mlp_out.",
+    )
+    assert trainable
+    assert all(name.startswith(expected_prefixes) for name in trainable)
+    assert all(any(name.startswith(prefix) for name in trainable) for prefix in expected_prefixes)
+    for parameter_name in (
         "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
         "model.action_in_proj.weight",
-        "model.action_in_proj.bias",
-    }
-    for parameter_name in trainable:
+        "model.action_out_proj.weight",
+        "model.time_mlp_in.weight",
+        "model.time_mlp_out.weight",
+    ):
         gradient = dict(policy.named_parameters())[parameter_name].grad
         assert gradient is not None
         assert torch.isfinite(gradient).all()
         assert torch.count_nonzero(gradient) > 0
 
-    frozen_stage1_path = (
-        "model.action_out_proj.weight",
-        "model.action_out_proj.bias",
-        "model.time_mlp_in.weight",
-        "model.time_mlp_in.bias",
-        "model.time_mlp_out.weight",
-        "model.time_mlp_out.bias",
-        "model.inpainting_visible_action_embedding.weight",
-    )
-    named_parameters = dict(policy.named_parameters())
-    for parameter_name in frozen_stage1_path:
-        parameter = named_parameters[parameter_name]
-        assert not parameter.requires_grad
-        assert parameter.grad is None
+    role_parameter = dict(policy.named_parameters())["model.inpainting_visible_action_embedding.weight"]
+    assert not role_parameter.requires_grad
+    assert role_parameter.grad is None
 
     vlm_parameters = [
         parameter
@@ -440,9 +502,9 @@ def test_flow_inpainting_forward_supports_gradient_checkpointing():
         policy.model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.grad
         is not None
     )
-    assert policy.model.action_out_proj.weight.grad is None
-    assert policy.model.time_mlp_in.weight.grad is None
-    assert policy.model.time_mlp_out.weight.grad is None
+    assert policy.model.action_out_proj.weight.grad is not None
+    assert policy.model.time_mlp_in.weight.grad is not None
+    assert policy.model.time_mlp_out.weight.grad is not None
     assert policy.model.inpainting_visible_action_embedding.weight.grad is None
 
 
@@ -591,6 +653,7 @@ def test_legacy_next_action_split_fields_remain_config_loadable_but_do_not_contr
     )
 
     assert config.next_action_masked_steps == 40
+    assert config.next_action_full_mask_probability == pytest.approx(1.0)
     assert config.drop_n_last_frames == 0
 
 
@@ -604,7 +667,7 @@ def test_pi05_distributed_loss_normalizer_counts_masked_actual_action_elements()
     inpainting_normalizer = _make_policy("next_action").get_distributed_loss_normalizer(batch)
     flow_normalizer = _make_policy("flow").get_distributed_loss_normalizer(batch)
 
-    assert inpainting_normalizer.item() == (40 + 7) * _ACTION_DIM
+    assert inpainting_normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
     assert flow_normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
 
 
@@ -633,7 +696,7 @@ def test_pi05_distributed_loss_normalizer_uses_actual_full_mask_from_forward():
 def test_flow_inpainting_checkpoint_rejects_action_inference_before_preprocessing(method_name):
     policy = _make_policy()
 
-    with pytest.raises(RuntimeError, match="flow-inpainting pretraining checkpoint"):
+    with pytest.raises(RuntimeError, match="action-only flow pretraining checkpoint"):
         getattr(policy, method_name)({})
 
 

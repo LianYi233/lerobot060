@@ -679,9 +679,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # Persist the Stage-1 role signal in both stages so their state dicts remain identical. It is
-        # only used by inpainting and remains frozen; generated/noisy tokens intentionally receive zero
-        # role offset, making the all-masked path identical to Stage 2's ordinary action-flow suffix.
+        # Persist the former inpainting role signal so Stage-1 and Stage-2 state dicts remain identical.
+        # It stays zero and frozen because the default full-mask objective has no visible action role.
         self.inpainting_visible_action_embedding = nn.Embedding(1, action_expert_config.width)
         nn.init.zeros_(self.inpainting_visible_action_embedding.weight)
         self.inpainting_visible_action_embedding.requires_grad_(False)
@@ -699,12 +698,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_for_next_action_pretraining(self) -> None:
-        """Train only the action expert and input projection during Stage 1."""
+        """Freeze the VLM and train the complete unconditional action-flow path."""
         for parameter in self.parameters():
             parameter.requires_grad = False
         for module in (
             self.paligemma_with_expert.gemma_expert,
             self.action_in_proj,
+            self.action_out_proj,
+            self.time_mlp_in,
+            self.time_mlp_out,
         ):
             for parameter in module.parameters():
                 parameter.requires_grad = True
@@ -862,7 +864,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         inpainting_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         if action_is_pad is None:
-            raise ValueError("action_is_pad is required for flow-inpainting pretraining")
+            raise ValueError("action_is_pad is required for action-only flow pretraining")
         if actions.ndim != 3 or actions.shape[1] != self.config.chunk_size:
             raise ValueError(
                 f"actions must have shape [batch, {self.config.chunk_size}, action_dim], "
@@ -891,13 +893,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return action_is_pad, inpainting_mask
 
     def sample_inpainting_mask(self, action_is_pad: Tensor) -> Tensor:
-        """Uniformly mask up to ``next_action_masked_steps`` valid time positions per sample."""
+        """Mask all valid actions by default, with partial masks retained for ablations."""
         if action_is_pad.ndim != 2 or action_is_pad.shape[1] != self.config.chunk_size:
             raise ValueError(
                 f"action_is_pad must have shape [batch, {self.config.chunk_size}], "
                 f"got {tuple(action_is_pad.shape)}"
             )
         valid = ~action_is_pad.to(dtype=torch.bool)
+        if self.config.next_action_full_mask_probability == 1.0:
+            return valid
+
         random_scores = torch.rand(valid.shape, device=valid.device)
         random_scores = random_scores.masked_fill(~valid, torch.inf)
         ranks = random_scores.argsort(dim=1).argsort(dim=1)
@@ -1026,8 +1031,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             time_expanded = time[:, None, None]
             noisy_actions = time_expanded * safe_noise + (1 - time_expanded) * safe_actions
             masked_elements = inpainting_mask.unsqueeze(-1)
-            # Visible actions stay clean and act as bidirectional conditioning. Only hidden positions
-            # follow the flow path, so the scalar timestep describes precisely the variables generated.
+            # Under the default full mask, every valid action follows the flow path and no clean action
+            # is exposed. Explicit partial-mask ablations retain clean visible actions as conditioning.
             x_t = torch.where(masked_elements, noisy_actions, safe_actions)
             u_t = safe_noise - safe_actions
             v_t = self.predict_inpainting_velocity(x_t, time, action_is_pad, inpainting_mask)
@@ -1062,7 +1067,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Do a full inference forward and compute the action."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
+                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         if num_steps is None:
@@ -1317,7 +1322,7 @@ class PI05Policy(PreTrainedPolicy):
                     )
                 logging.warning(
                     "Loading a legacy PI0.5 next-action checkpoint: its temporary regression query/head "
-                    "are discarded because flow inpainting now trains the formal flow head directly."
+                    "are discarded because action-only flow now trains the formal flow head directly."
                 )
                 remapped_state_dict = {
                     key: value for key, value in remapped_state_dict.items() if key not in legacy_keys
@@ -1814,7 +1819,7 @@ class PI05Policy(PreTrainedPolicy):
         """Select a single action given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
+                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         assert not self._rtc_enabled(), (
@@ -1836,7 +1841,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
+                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1861,7 +1866,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict actions and return a pooled contextual PI0.5 prefix representation."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for a flow-inpainting pretraining checkpoint; "
+                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1896,7 +1901,7 @@ class PI05Policy(PreTrainedPolicy):
         if self.config.training_stage == "next_action":
             actions = self.prepare_action(batch)
             if "action_is_pad" not in batch:
-                raise ValueError("action_is_pad is required for flow-inpainting pretraining")
+                raise ValueError("action_is_pad is required for action-only flow pretraining")
             action_is_pad = batch["action_is_pad"].to(device=actions.device, dtype=torch.bool)
             self.model._validate_inpainting_inputs(actions, action_is_pad)
             inpainting_mask = self.model.sample_inpainting_mask(action_is_pad)
@@ -1962,9 +1967,11 @@ class PI05Policy(PreTrainedPolicy):
         if self.config.training_stage == "next_action":
             if "pi05_inpainting_mask" in batch:
                 valid_count = batch["pi05_inpainting_mask"].to(dtype=torch.bool).sum(dim=1)
+            elif self.config.next_action_full_mask_probability == 1.0:
+                valid_count = valid_steps.sum(dim=1)
             else:
-                # Before the first forward (or in standalone diagnostics), fall back to the ordinary
-                # fixed-size inpainting denominator.
+                # Before the first forward (or in standalone diagnostics), partial-mask objectives
+                # fall back to their fixed-size inpainting denominator.
                 valid_count = valid_steps.sum(dim=1).clamp(max=self.config.next_action_masked_steps)
             action_dim = self.config.output_features[ACTION].shape[0]
             return valid_count.sum(dtype=torch.float32) * action_dim

@@ -341,7 +341,7 @@ def update_policy(
 
 
 def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
-    """Return whether this top-level run needs the integrated PI0.5 pretraining stage."""
+    """Return whether this run needs integrated PI0.5 action-only flow pretraining."""
     policy_cfg = cfg.policy
     return bool(
         not cfg.resume
@@ -353,16 +353,16 @@ def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
 
 
 def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
-    """Build an isolated first-stage config without mutating the formal flow config."""
+    """Build an isolated full-mask action-only stage without mutating the formal flow config."""
     from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 
     if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
-        raise ValueError("Integrated flow-inpainting pretraining requires a non-resumed PI0.5 flow run")
+        raise ValueError("Integrated action-only flow pretraining requires a non-resumed PI0.5 flow run")
     if cfg.output_dir is None:
         raise ValueError("output_dir must be resolved before building the PI0.5 pretraining stage")
     if cfg.policy.use_peft or cfg.peft is not None:
         raise ValueError(
-            "Integrated PI0.5 flow-inpainting pretraining does not support PEFT. Use a standard PI0.5 "
+            "Integrated PI0.5 action-only flow pretraining does not support PEFT. Use a standard PI0.5 "
             "base/flow checkpoint as --policy.path and run full-parameter flow training."
         )
 
@@ -449,7 +449,7 @@ def _run_pi05_next_action_pretraining(
     """Run Stage 1, then point the untouched formal config at its transferable weights."""
     pretrain_cfg = _make_pi05_next_action_pretraining_config(cfg)
     logging.info(
-        "Starting integrated PI0.5 flow-inpainting pretraining for %d steps; formal flow training "
+        "Starting integrated PI0.5 full-mask action-only flow pretraining for %d steps; formal flow training "
         "will start automatically afterwards.",
         pretrain_cfg.steps,
     )
@@ -466,7 +466,7 @@ def _run_pi05_next_action_pretraining(
         checkpoint_visible = int(visible_count.item()) == num_processes
     if not checkpoint_visible:
         raise RuntimeError(
-            "Integrated PI0.5 flow-inpainting pretraining finished without producing its final "
+            "Integrated PI0.5 action-only flow pretraining finished without producing its final "
             f"checkpoint at {pretrained_model_dir} on every rank. Distributed training requires "
             "output_dir and its sibling pretraining directory to be on a filesystem shared by all ranks."
         )
@@ -479,7 +479,7 @@ def _run_pi05_next_action_pretraining(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
-        "PI0.5 flow-inpainting pretraining complete; rebuilding the model, optimizer, scheduler, "
+        "PI0.5 action-only flow pretraining complete; rebuilding the model, optimizer, scheduler, "
         "and CABO state for formal flow training with checkpoints every %d steps.",
         cfg.save_freq,
     )
