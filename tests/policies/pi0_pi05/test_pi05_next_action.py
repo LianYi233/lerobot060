@@ -141,7 +141,7 @@ def _save_checkpoint(path, policy: PI05Policy, state_dict=None) -> None:
     save_file(tensors, path / "model.safetensors")
 
 
-def test_action_only_flow_default_masks_every_valid_action():
+def test_action_only_flow_default_masks_40_valid_actions():
     core = _make_policy().model
     action_is_pad = torch.zeros(3, _HORIZON, dtype=torch.bool)
     action_is_pad[1, 7:] = True
@@ -149,8 +149,9 @@ def test_action_only_flow_default_masks_every_valid_action():
 
     inpainting_mask = core.sample_inpainting_mask(action_is_pad)
 
-    assert torch.equal(inpainting_mask, ~action_is_pad)
-    assert not ((~inpainting_mask) & (~action_is_pad)).any()
+    assert inpainting_mask.sum(dim=1).tolist() == [40, 7, 0]
+    assert ((~inpainting_mask) & (~action_is_pad)).sum(dim=1).tolist() == [10, 0, 0]
+    assert not (inpainting_mask & action_is_pad).any()
 
 
 def test_flow_inpainting_random_mask_selects_exact_valid_steps_only():
@@ -190,7 +191,7 @@ def test_flow_inpainting_can_sample_exact_full_flow_corruption():
     assert torch.equal(inpainting_mask, ~action_is_pad)
 
 
-def test_action_only_flow_default_noises_every_valid_action_and_sanitizes_padding(monkeypatch):
+def test_action_only_flow_default_noises_only_masked_actions_and_sanitizes_padding(monkeypatch):
     core = _make_policy().model
     actions = torch.linspace(-1.0, 1.0, _HORIZON * _MAX_ACTION_DIM).reshape(1, _HORIZON, _MAX_ACTION_DIM)
     action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
@@ -217,15 +218,18 @@ def test_action_only_flow_default_noises_every_valid_action_and_sanitizes_paddin
     )
 
     valid = ~action_is_pad
+    inpainting_mask = captured["inpainting_mask"]
     safe_actions = torch.where(valid.unsqueeze(-1), actions, torch.zeros_like(actions))
     safe_noise = torch.where(valid.unsqueeze(-1), noise, torch.zeros_like(noise))
-    expected_x_t = time[:, None, None] * safe_noise + (1 - time[:, None, None]) * safe_actions
+    noisy_actions = time[:, None, None] * safe_noise + (1 - time[:, None, None]) * safe_actions
+    expected_x_t = torch.where(inpainting_mask.unsqueeze(-1), noisy_actions, safe_actions)
     expected_losses = torch.where(
-        valid.unsqueeze(-1),
+        inpainting_mask.unsqueeze(-1),
         (safe_noise - safe_actions).square(),
         torch.zeros_like(actions),
     )
-    assert torch.equal(captured["inpainting_mask"], valid)
+    assert inpainting_mask.sum().item() == 40
+    assert not (inpainting_mask & action_is_pad).any()
     torch.testing.assert_close(captured["x_t"], expected_x_t)
     torch.testing.assert_close(losses, expected_losses)
     assert torch.count_nonzero(captured["x_t"][action_is_pad]) == 0
@@ -653,7 +657,7 @@ def test_legacy_next_action_split_fields_remain_config_loadable_but_do_not_contr
     )
 
     assert config.next_action_masked_steps == 40
-    assert config.next_action_full_mask_probability == pytest.approx(1.0)
+    assert config.next_action_full_mask_probability == pytest.approx(0.0)
     assert config.drop_n_last_frames == 0
 
 
@@ -667,7 +671,7 @@ def test_pi05_distributed_loss_normalizer_counts_masked_actual_action_elements()
     inpainting_normalizer = _make_policy("next_action").get_distributed_loss_normalizer(batch)
     flow_normalizer = _make_policy("flow").get_distributed_loss_normalizer(batch)
 
-    assert inpainting_normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
+    assert inpainting_normalizer.item() == (40 + 7) * _ACTION_DIM
     assert flow_normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
 
 

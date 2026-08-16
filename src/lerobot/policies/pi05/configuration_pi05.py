@@ -47,20 +47,20 @@ class PI05Config(PreTrainedConfig):
     n_action_steps: int = 50  # Number of action steps to execute
 
     # Training objective. ``next_action`` is kept as the public name for backwards compatibility,
-    # but now defaults to unconditional action-only flow generation over the complete valid chunk.
-    # ``flow`` keeps the standard observation-conditioned PI0.5 objective.
+    # but now performs action-only flow inpainting over the complete chunk. ``flow`` keeps the
+    # standard observation-conditioned PI0.5 objective.
     # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
     training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
-    # Number of valid temporal action tokens to hide when partial inpainting is explicitly enabled.
-    # This compatibility setting is ignored by the default full-mask action-only objective.
+    # Number of valid temporal action tokens to hide and reconstruct per sample. The mask is sampled
+    # uniformly without replacement; short padded chunks mask all available valid tokens.
     next_action_masked_steps: int = 40
     # Deprecated compatibility fields retained only so checkpoints produced by the former 25-to-25
     # MSE objective remain config-loadable. Flow inpainting does not use either split.
     next_action_context_steps: int = 25
     next_action_prediction_steps: int = 25
-    # Stage 1 hides every valid action by default, so its only inputs are action noise and the flow
-    # timestep. Values below 1.0 retain the former partial-inpainting behavior for controlled ablations.
-    next_action_full_mask_probability: float = 1.0
+    # Stage 1 defaults to fixed-count inpainting: 40 hidden action tokens and 10 visible tokens for
+    # a standard 50-step chunk. Complete-chunk masking remains available as an explicit override.
+    next_action_full_mask_probability: float = 0.0
     # Number of action-only flow steps automatically run before a flow-training invocation. Set to 0
     # to start flow training immediately. This is orchestration metadata and does not alter either loss.
     next_action_pretrain_steps: int = 3_000

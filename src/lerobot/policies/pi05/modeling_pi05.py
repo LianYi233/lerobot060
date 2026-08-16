@@ -680,7 +680,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         # Persist the former inpainting role signal so Stage-1 and Stage-2 state dicts remain identical.
-        # It stays zero and frozen because the default full-mask objective has no visible action role.
+        # It stays zero and frozen for checkpoint compatibility; visible actions remain clean while
+        # masked actions follow the sampled flow path.
         self.inpainting_visible_action_embedding = nn.Embedding(1, action_expert_config.width)
         nn.init.zeros_(self.inpainting_visible_action_embedding.weight)
         self.inpainting_visible_action_embedding.requires_grad_(False)
@@ -698,7 +699,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_for_next_action_pretraining(self) -> None:
-        """Freeze the VLM and train the complete unconditional action-flow path."""
+        """Freeze the VLM and train the complete action-flow path."""
         for parameter in self.parameters():
             parameter.requires_grad = False
         for module in (
@@ -893,7 +894,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return action_is_pad, inpainting_mask
 
     def sample_inpainting_mask(self, action_is_pad: Tensor) -> Tensor:
-        """Mask all valid actions by default, with partial masks retained for ablations."""
+        """Uniformly mask up to ``next_action_masked_steps`` valid time positions per sample."""
         if action_is_pad.ndim != 2 or action_is_pad.shape[1] != self.config.chunk_size:
             raise ValueError(
                 f"action_is_pad must have shape [batch, {self.config.chunk_size}], "
@@ -1031,8 +1032,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             time_expanded = time[:, None, None]
             noisy_actions = time_expanded * safe_noise + (1 - time_expanded) * safe_actions
             masked_elements = inpainting_mask.unsqueeze(-1)
-            # Under the default full mask, every valid action follows the flow path and no clean action
-            # is exposed. Explicit partial-mask ablations retain clean visible actions as conditioning.
+            # Masked actions follow the flow path while visible actions stay clean and provide
+            # bidirectional context. Padding is sanitized above and never contributes to the loss.
             x_t = torch.where(masked_elements, noisy_actions, safe_actions)
             u_t = safe_noise - safe_actions
             v_t = self.predict_inpainting_velocity(x_t, time, action_is_pad, inpainting_mask)
@@ -1906,7 +1907,7 @@ class PI05Policy(PreTrainedPolicy):
             self.model._validate_inpainting_inputs(actions, action_is_pad)
             inpainting_mask = self.model.sample_inpainting_mask(action_is_pad)
             # The trainer queries the DDP denominator immediately after forward. Exposing this
-            # ephemeral mask on the current batch keeps normalization exact for optional full masks.
+            # ephemeral mask on the current batch keeps normalization exact for the sampled mask.
             batch["pi05_inpainting_mask"] = inpainting_mask
             losses = self.model.forward(
                 actions=actions,

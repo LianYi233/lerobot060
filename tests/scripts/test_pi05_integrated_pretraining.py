@@ -290,4 +290,4 @@ def test_integrated_pretraining_supports_non_default_chunk_when_mask_count_fits(
 
     assert pretrain_cfg.policy.chunk_size == 40
     assert pretrain_cfg.policy.next_action_masked_steps == 40
-    assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(1.0)
+    assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(0.0)

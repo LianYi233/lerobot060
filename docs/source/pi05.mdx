@@ -69,20 +69,20 @@ lerobot-train \
     --batch_size=32
 ```
 
-By default, a fresh flow run first performs 3,000 full-mask action-only flow updates, then performs
-the requested `--steps` observation-conditioned flow updates. Stage 1 hides every valid action: all
-action tokens follow the sampled flow path between ground-truth actions and noise, and no clean
-action token is available as context. It therefore learns an unconditional action generator rather
-than an action interpolator. Stage 1 trains the complete action path (the action expert, input/output
-projections, and timestep MLP) while the VLM and the legacy inpainting role embedding remain frozen.
-No temporary prediction head is created or discarded. After Stage 1, Stage 2 rebuilds the policy
-with the observation-conditioned flow configuration and unfreezes the complete VLM, including the
-vision encoder, unless the user explicitly overrides the corresponding finetuning flags.
+By default, a fresh flow run first performs 3,000 action-only flow-inpainting updates, then performs
+the requested `--steps` observation-conditioned flow updates. For a complete 50-action chunk,
+Stage 1 randomly masks 40 valid positions without replacement, keeps 10 clean actions as
+bidirectional context, and predicts flow velocity only at the masked positions. If a padded chunk
+has fewer than 40 valid positions, all of its valid positions are masked. Stage 1 trains the complete
+action path (the action expert, input/output projections, and timestep MLP) while the VLM and the
+legacy inpainting role embedding remain frozen. No temporary prediction head is created or
+discarded. After Stage 1, Stage 2 rebuilds the policy with the observation-conditioned flow
+configuration and unfreezes the complete VLM, including the vision encoder, unless the user
+explicitly overrides the corresponding finetuning flags.
 
 Set `--policy.next_action_pretrain_steps=0` to skip Stage 1. The compatibility name
-`training_stage=next_action` now denotes action-only flow generation rather than the former 25-to-25
-MSE regression objective. Full masking is the default. For controlled partial-inpainting ablations,
-the mask size and full-mask fraction can be changed with
+`training_stage=next_action` now denotes action-only flow inpainting rather than the former 25-to-25
+MSE regression objective. The mask size and optional full-mask fraction can be changed with
 `--policy.next_action_masked_steps` and `--policy.next_action_full_mask_probability`.
 The legacy `next_action_context_steps` and `next_action_prediction_steps` fields are accepted only
 for loading older checkpoints and no longer affect training.

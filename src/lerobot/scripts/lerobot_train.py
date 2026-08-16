@@ -353,7 +353,7 @@ def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
 
 
 def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
-    """Build an isolated full-mask action-only stage without mutating the formal flow config."""
+    """Build an isolated action-only inpainting stage without mutating the formal flow config."""
     from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 
     if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
@@ -449,7 +449,7 @@ def _run_pi05_next_action_pretraining(
     """Run Stage 1, then point the untouched formal config at its transferable weights."""
     pretrain_cfg = _make_pi05_next_action_pretraining_config(cfg)
     logging.info(
-        "Starting integrated PI0.5 full-mask action-only flow pretraining for %d steps; formal flow training "
+        "Starting integrated PI0.5 action-only flow-inpainting pretraining for %d steps; formal flow training "
         "will start automatically afterwards.",
         pretrain_cfg.steps,
     )
