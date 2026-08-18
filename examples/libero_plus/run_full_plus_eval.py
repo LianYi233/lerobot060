@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,21 @@ CATEGORY_TO_COL = {
     "Objects Layout": "Layout",
 }
 LEADERBOARD_COLS = ("Camera", "Robot", "Language", "Light", "Background", "Noise", "Layout")
+
+
+def _numpy2_compat() -> None:
+    """LIBERO-plus sensor-noise fog() still uses NumPy 1 aliases (np.float_)."""
+    if not hasattr(np, "float_"):
+        np.float_ = np.float64  # type: ignore[attr-defined]
+    if not hasattr(np, "int_"):
+        np.int_ = np.int64  # type: ignore[attr-defined]
+
+
+def _close_quiet(env: Any) -> None:
+    try:
+        env.close()
+    except Exception:
+        pass
 
 
 def _utc_now() -> str:
@@ -251,10 +267,12 @@ def _find_classification_json() -> Path | None:
 
 
 def main() -> None:
+    _numpy2_compat()
     args = parse_args()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_path = output_dir / "progress.jsonl"
+    errors_path = output_dir / "errors.jsonl"
     eval_info_path = output_dir / "eval_info.json"
     summary_path = output_dir / "summary.txt"
 
@@ -326,25 +344,53 @@ def main() -> None:
                 for tid in range(n_tasks):
                     vec = envs[suite_name][tid]
                     if (suite_name, tid) in done_keys:
-                        vec.close()
+                        _close_quiet(vec)
                         continue
                     t0 = time.time()
-                    try:
-                        metrics = eval_one(
-                            vec,
-                            policy=policy,
-                            env_preprocessor=env_preprocessor,
-                            env_postprocessor=env_postprocessor,
-                            preprocessor=preprocessor,
-                            postprocessor=postprocessor,
-                            n_episodes=args.n_episodes,
-                            max_episodes_rendered=0,
-                            videos_dir=None,
-                            return_episode_data=False,
-                            start_seed=args.seed,
+                    metrics = None
+                    last_error: str | None = None
+                    for attempt in range(2):
+                        try:
+                            metrics = eval_one(
+                                vec,
+                                policy=policy,
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                n_episodes=args.n_episodes,
+                                max_episodes_rendered=0,
+                                videos_dir=None,
+                                return_episode_data=False,
+                                start_seed=args.seed,
+                            )
+                            break
+                        except Exception as exc:
+                            last_error = f"{type(exc).__name__}: {exc}"
+                            traceback.print_exc()
+                            _close_quiet(vec)
+                            print(
+                                f"[{_utc_now()}] {suite_name} task {tid} "
+                                f"attempt {attempt + 1}/2 failed: {last_error}",
+                                flush=True,
+                            )
+                    _close_quiet(vec)
+                    if metrics is None:
+                        _append_jsonl(
+                            errors_path,
+                            {
+                                "suite": suite_name,
+                                "task_id": tid,
+                                "error": last_error,
+                                "finished_at": _utc_now(),
+                            },
                         )
-                    finally:
-                        vec.close()
+                        print(
+                            f"[{_utc_now()}] {suite_name} task {tid} skipped after errors; "
+                            f"see {errors_path}",
+                            flush=True,
+                        )
+                        continue
 
                     row = {
                         "suite": suite_name,
@@ -384,10 +430,7 @@ def main() -> None:
                     )
             finally:
                 for vec in envs.get(suite_name, {}).values():
-                    try:
-                        vec.close()
-                    except Exception:
-                        pass
+                    _close_quiet(vec)
 
     elapsed = prior_eval_s + (time.time() - started)
     info = build_eval_info(done_rows, classification, elapsed)
