@@ -4,7 +4,7 @@
 # Defaults match the wyn workstation layout:
 #   repo:       /home/wyn/myStudy/2601-data_in_lerobot_format
 #   conda env:  lerobot5
-#   checkpoint: /media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm819-12k
+#   checkpoint: /media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm816-12k
 #
 # Hugging Face's LIBERO-plus page still documents the vanilla 10-task table and
 # `n_episodes=10` (400 episodes). That is **not** the complete plus benchmark.
@@ -20,7 +20,7 @@ set -euo pipefail
 MODE="${1:-${MODE:-smoke}}"
 REPO_HINT="${REPO_HINT:-/home/wyn/myStudy/2601-data_in_lerobot_format}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-lerobot5}"
-CHKPT_ROOT="${CHKPT_ROOT:-/media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm819-12k}"
+CHKPT_ROOT="${CHKPT_ROOT:-/media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm816-12k}"
 EVAL_ROOT="${EVAL_ROOT:-/media/wyn/data/10-EmbodiedAI/2601-lerobot/eval}"
 LIBERO_PLUS_ROOT="${LIBERO_PLUS_ROOT:-${HOME}/myStudy/LIBERO-PLUS/LIBERO-plus}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -238,9 +238,9 @@ log "MUJOCO_GL=${MUJOCO_GL}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 if [[ "${MODE}" == "full-plus" ]]; then
-  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm819-12k-libero-plus-full}"
+  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm816-12k-libero-plus-full}"
 else
-  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm819-12k-libero-plus-${MODE}-${STAMP}}"
+  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm816-12k-libero-plus-${MODE}-${STAMP}}"
 fi
 mkdir -p "${OUTPUT_DIR}"
 log "output_dir=${OUTPUT_DIR}"
