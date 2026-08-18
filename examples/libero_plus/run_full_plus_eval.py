@@ -56,6 +56,46 @@ def _numpy2_compat() -> None:
         np.int_ = np.int64  # type: ignore[attr-defined]
 
 
+def _patch_libero_plus_noise_corruptions() -> None:
+    """Make LIBERO-plus ImageNet-C fog() work on 360x360 LeRobot images.
+
+    Upstream ``plasma_fractal`` defaults to 256 and NumPy 1's ``np.float_``.
+    """
+    _numpy2_compat()
+    try:
+        from libero.libero.envs import env_wrapper
+    except Exception as exc:
+        print(f"[{_utc_now()}] skip libero-plus noise patch: {exc}", flush=True)
+        return
+
+    orig_plasma = env_wrapper.plasma_fractal
+
+    def fog(x, severity=1):
+        table = [
+            (0.5, 3),
+            (1.0, 2.8),
+            (1.5, 2.5),
+            (2.0, 2.2),
+            (2.5, 2.0),
+            (3.0, 1.8),
+            (3.5, 1.6),
+            (4.0, 1.5),
+            (4.5, 1.4),
+            (5.0, 1.3),
+        ]
+        c = table[severity - 1]
+        arr = np.array(x) / 255.0
+        max_val = arr.max()
+        height_x, width_x = int(arr.shape[0]), int(arr.shape[1])
+        mapsize = 1 << (max(height_x, width_x) - 1).bit_length()
+        fractal = orig_plasma(mapsize=mapsize, wibbledecay=c[1])[:height_x, :width_x]
+        arr = arr + c[0] * fractal[..., np.newaxis]
+        return np.clip(arr * max_val / (max_val + c[0]), 0, 1) * 255
+
+    env_wrapper.fog = fog
+    print(f"[{_utc_now()}] patched libero-plus fog() for non-256 images / NumPy 2", flush=True)
+
+
 def _close_quiet(env: Any) -> None:
     try:
         env.close()
@@ -267,7 +307,7 @@ def _find_classification_json() -> Path | None:
 
 
 def main() -> None:
-    _numpy2_compat()
+    _patch_libero_plus_noise_corruptions()
     args = parse_args()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
