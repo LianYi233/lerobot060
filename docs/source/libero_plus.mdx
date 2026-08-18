@@ -148,7 +148,20 @@ LIBERO-plus supports two control modes — `relative` (default) and `absolute`. 
 
 ### Recommended evaluation episodes
 
-For reproducible benchmarking, use **10 episodes per task** across all four standard suites (Spatial, Object, Goal, Long). This gives 400 total episodes and matches the protocol used for published results.
+Hugging Face's copy-paste vanilla protocol (10 original tasks × 10 episodes = 400)
+is **not** complete LIBERO-plus. The plus fork expands each suite to ~2,400–2,600
+perturbation tasks (~10,030 total). Official plus eval uses **1 trial per
+perturbation task** (`num_trials_per_task=1`). Omit `--env.task_ids` and set
+`--eval.n_episodes=1`.
+
+For a long full-plus run that can resume after a crash, use
+`examples/libero_plus/run_full_plus_eval.py` (also wrapped as
+`eval_flow_mask_checkpoint.sh full-plus`).
+
+Creating every plus task up front with `SyncVectorEnv` will OOM. LeRobot now
+lazy-wraps LIBERO vector envs so only the current task's simulator is alive.
+Still prefer **one suite per process** for a 10k-task run, and disable videos
+(`--eval.max_episodes_rendered=0`).
 
 ## Training
 

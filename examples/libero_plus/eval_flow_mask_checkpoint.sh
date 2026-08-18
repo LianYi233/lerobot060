@@ -6,9 +6,13 @@
 #   conda env:  lerobot5
 #   checkpoint: /media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm819-12k
 #
+# Hugging Face's LIBERO-plus page still documents the vanilla 10-task table and
+# `n_episodes=10` (400 episodes). That is **not** the complete plus benchmark.
+# Official plus (sylvestf/LIBERO-plus) is ~10,030 perturbation tasks × 1 trial.
+#
 # Usage:
 #   bash examples/libero_plus/eval_flow_mask_checkpoint.sh smoke
-#   bash examples/libero_plus/eval_flow_mask_checkpoint.sh full
+#   bash examples/libero_plus/eval_flow_mask_checkpoint.sh full-plus
 #   MODE=smoke TASK=libero_spatial N_EPISODES=1 bash examples/libero_plus/eval_flow_mask_checkpoint.sh
 
 set -euo pipefail
@@ -18,14 +22,18 @@ REPO_HINT="${REPO_HINT:-/home/wyn/myStudy/2601-data_in_lerobot_format}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-lerobot5}"
 CHKPT_ROOT="${CHKPT_ROOT:-/media/wyn/data/10-EmbodiedAI/2601-lerobot/chkpt/fmm819-12k}"
 EVAL_ROOT="${EVAL_ROOT:-/media/wyn/data/10-EmbodiedAI/2601-lerobot/eval}"
-LIBERO_PLUS_ROOT="${LIBERO_PLUS_ROOT:-${HOME}/LIBERO-plus}"
+LIBERO_PLUS_ROOT="${LIBERO_PLUS_ROOT:-${HOME}/myStudy/LIBERO-PLUS/LIBERO-plus}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 BRANCH="${BRANCH:-flow-mask}"
 GPU_ID="${GPU_ID:-0}"
 CONTROL_MODE="${CONTROL_MODE:-relative}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-10}"
 
-if [[ "${MODE}" == "full" ]]; then
+if [[ "${MODE}" == "full-plus" ]]; then
+  TASK="${TASK:-libero_spatial,libero_object,libero_goal,libero_10}"
+  N_EPISODES="${N_EPISODES:-1}"
+  TASK_IDS="${TASK_IDS:-}"
+elif [[ "${MODE}" == "full" ]]; then
   TASK="${TASK:-libero_spatial,libero_object,libero_goal,libero_10}"
   N_EPISODES="${N_EPISODES:-10}"
   TASK_IDS="${TASK_IDS:-}"
@@ -57,6 +65,8 @@ find_repo() {
 source_conda() {
   local candidate
   for candidate in \
+    "${HOME}/miniforge3/etc/profile.d/conda.sh" \
+    "${HOME}/mambaforge/etc/profile.d/conda.sh" \
     "${HOME}/anaconda3/etc/profile.d/conda.sh" \
     "${HOME}/miniconda3/etc/profile.d/conda.sh" \
     "/opt/conda/etc/profile.d/conda.sh" \
@@ -107,12 +117,14 @@ REPO="$(find_repo "${REPO_HINT}")"
 log "repo=${REPO}"
 cd "${REPO}"
 
-git fetch origin "${BRANCH}"
-git checkout "${BRANCH}"
-if [[ -n "$(git status --porcelain)" ]]; then
-  log "warning: working tree is dirty; not fast-forwarding ${BRANCH}"
-else
-  git merge --ff-only "origin/${BRANCH}" || log "could not fast-forward ${BRANCH}; continuing on current HEAD"
+if [[ "${SKIP_GIT:-0}" != "1" ]]; then
+  git fetch origin "${BRANCH}"
+  git checkout "${BRANCH}"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    log "warning: working tree is dirty; not fast-forwarding ${BRANCH}"
+  else
+    git merge --ff-only "origin/${BRANCH}" || log "could not fast-forward ${BRANCH}; continuing on current HEAD"
+  fi
 fi
 log "git HEAD=$(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
 
@@ -152,7 +164,8 @@ python - <<'PY' || need_libero_plus=1
 from pathlib import Path
 import libero
 from libero.libero import get_libero_path
-root = Path(libero.__file__).resolve().parent
+file_ = getattr(libero, "__file__", None)
+root = Path(file_).resolve().parent if file_ else Path(next(iter(libero.__path__)))
 assets = Path(get_libero_path("assets"))
 print("libero=", root)
 print("assets=", assets, "exists=", assets.exists())
@@ -210,7 +223,11 @@ print("wrote", cfg_dir / "config.yaml")
 PY
 fi
 
-export LIBERO_CONFIG_PATH="${HOME}/.libero"
+if [[ -d "${HOME}/.libero_plus" ]]; then
+  export LIBERO_CONFIG_PATH="${HOME}/.libero_plus"
+else
+  export LIBERO_CONFIG_PATH="${HOME}/.libero"
+fi
 MUJOCO_GL_VALUE="${MUJOCO_GL:-$(choose_mujoco_gl)}"
 export MUJOCO_GL="${MUJOCO_GL_VALUE}"
 if [[ "${MUJOCO_GL}" == "osmesa" ]]; then
@@ -220,9 +237,14 @@ fi
 log "MUJOCO_GL=${MUJOCO_GL}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUTPUT_DIR="${EVAL_ROOT}/fmm819-12k-libero-plus-${MODE}-${STAMP}"
+if [[ "${MODE}" == "full-plus" ]]; then
+  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm819-12k-libero-plus-full}"
+else
+  OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_ROOT}/fmm819-12k-libero-plus-${MODE}-${STAMP}}"
+fi
 mkdir -p "${OUTPUT_DIR}"
 log "output_dir=${OUTPUT_DIR}"
+log "LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH}"
 
 TASK_IDS_ARG=()
 if [[ -n "${TASK_IDS}" ]]; then
@@ -231,21 +253,36 @@ fi
 
 nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv || true
 
-set -x
-lerobot-eval \
-  --policy.path="${PRETRAINED}" \
-  --output_dir="${OUTPUT_DIR}" \
-  --env.type=libero_plus \
-  --env.task="${TASK}" \
-  --env.control_mode="${CONTROL_MODE}" \
-  --env.max_parallel_tasks=1 \
-  --eval.batch_size=1 \
-  --eval.n_episodes="${N_EPISODES}" \
-  --policy.n_action_steps="${N_ACTION_STEPS}" \
-  --policy.use_amp=false \
-  --policy.device=cuda \
-  ${TASK_IDS_ARG[@]+"${TASK_IDS_ARG[@]}"}
-set +x
+if [[ "${MODE}" == "full-plus" ]]; then
+  set -x
+  python "${REPO}/examples/libero_plus/run_full_plus_eval.py" \
+    --policy.path="${PRETRAINED}" \
+    --output_dir="${OUTPUT_DIR}" \
+    --env.task="${TASK}" \
+    --env.control_mode="${CONTROL_MODE}" \
+    --eval.n_episodes="${N_EPISODES}" \
+    --policy.n_action_steps="${N_ACTION_STEPS}" \
+    --policy.use_amp=false \
+    --policy.device=cuda
+  set +x
+else
+  set -x
+  lerobot-eval \
+    --policy.path="${PRETRAINED}" \
+    --output_dir="${OUTPUT_DIR}" \
+    --env.type=libero_plus \
+    --env.task="${TASK}" \
+    --env.control_mode="${CONTROL_MODE}" \
+    --env.max_parallel_tasks=1 \
+    --eval.batch_size=1 \
+    --eval.n_episodes="${N_EPISODES}" \
+    --eval.max_episodes_rendered="${MAX_EPISODES_RENDERED:-10}" \
+    --policy.n_action_steps="${N_ACTION_STEPS}" \
+    --policy.use_amp=false \
+    --policy.device=cuda \
+    ${TASK_IDS_ARG[@]+"${TASK_IDS_ARG[@]}"}
+  set +x
+fi
 
 python - <<PY
 import json

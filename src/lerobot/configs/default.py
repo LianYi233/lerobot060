@@ -93,6 +93,9 @@ class EvalConfig:
     recording_repo_id: str | None = None
     # Whether the pushed recording repositories should be private.
     recording_private: bool = False
+    # Number of eval episodes to encode as mp4 videos. ``0`` disables dumping.
+    # ``None`` keeps the historical default: 0 when recording a dataset, else 10.
+    max_episodes_rendered: int | None = None
 
     def __post_init__(self) -> None:
         if self.recording_repo_id is not None and not self.recording:
