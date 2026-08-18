@@ -56,6 +56,7 @@ def _make_dummy_inputs(config):
         "actions": torch.randn(1, config.chunk_size, config.max_action_dim, device=device),
         "noise": torch.randn(1, config.chunk_size, config.max_action_dim, device=device),
         "time": torch.rand(1, device=device),
+        "action_is_pad": torch.arange(config.chunk_size, device=device).unsqueeze(0) >= config.chunk_size - 3,
     }
     sample_kwargs = {
         **common,
