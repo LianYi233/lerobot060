@@ -31,7 +31,7 @@ from lerobot.envs.factory import make_env_pre_post_processors
 from lerobot.envs.libero import _get_suite, create_libero_envs
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_eval import eval_one
-from lerobot.utils.utils import set_seed
+from lerobot.utils.random_utils import set_seed
 
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 
