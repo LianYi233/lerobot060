@@ -91,13 +91,7 @@ class _TinyPaliGemmaWithExpert(nn.Module):
         transformed = self.gemma_expert.model.layers[0].self_attn.q_proj(suffix_embs)
         # The real expert uses the complete bidirectional block and AdaRMS conditioning. Preserve
         # both dependencies so the tests exercise every transferable Stage-1 module.
-        suffix_len = transformed.shape[1]
-        suffix_attention = attention_mask[:, 0, -suffix_len:, -suffix_len:].eq(0)
-        suffix_context = torch.matmul(suffix_attention.to(transformed.dtype), transformed)
-        suffix_context = suffix_context / suffix_attention.sum(dim=-1, keepdim=True).clamp_min(1).to(
-            transformed.dtype
-        )
-        suffix_out = transformed + suffix_context + adarms_cond[1].unsqueeze(1)
+        suffix_out = transformed + transformed.mean(dim=1, keepdim=True) + adarms_cond[1].unsqueeze(1)
         self.last_call = {
             "attention_mask": attention_mask.detach().clone(),
             "position_ids": position_ids.detach().clone(),
@@ -547,38 +541,6 @@ def test_flow_inpainting_forward_supports_torch_compile(monkeypatch):
     assert losses.shape == (1, _HORIZON, _MAX_ACTION_DIM)
 
 
-@pytest.mark.skipif(
-    not hasattr(torch, "compile") or not torch._dynamo.is_dynamo_supported(),
-    reason="torch.compile is unavailable on this platform",
-)
-def test_formal_flow_forward_with_padding_supports_torch_compile(monkeypatch):
-    core = _make_policy("flow").model
-
-    def simple_predict(images, img_masks, tokens, masks, x_t, time, action_is_pad):
-        del images, img_masks, tokens, masks, time, action_is_pad
-        return core.action_out_proj(core.action_in_proj(x_t))
-
-    monkeypatch.setattr(core, "predict_velocity", simple_predict)
-    actions = torch.randn(1, _HORIZON, _MAX_ACTION_DIM)
-    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
-    action_is_pad[:, -3:] = True
-    forward_kwargs = {
-        "actions": actions,
-        "noise": torch.randn_like(actions),
-        "time": torch.tensor([0.4]),
-        "action_is_pad": action_is_pad,
-    }
-    explanation = torch._dynamo.explain(core.forward)(**forward_kwargs)
-    compiled_forward = torch.compile(core.forward, backend="eager")
-
-    losses = compiled_forward(**forward_kwargs)
-
-    assert explanation.graph_count == 1
-    assert explanation.graph_break_count == 0
-    assert losses.shape == (1, _HORIZON, _MAX_ACTION_DIM)
-    assert torch.count_nonzero(losses[action_is_pad]) == 0
-
-
 def test_flow_masked_loss_uses_only_valid_timesteps_and_actual_action_dims(monkeypatch):
     policy = _make_policy("flow")
     raw_losses = torch.ones(2, _HORIZON, _MAX_ACTION_DIM, requires_grad=True)
@@ -611,111 +573,6 @@ def test_flow_masked_loss_uses_only_valid_timesteps_and_actual_action_dims(monke
     assert raw_losses.grad is not None
     assert torch.count_nonzero(raw_losses.grad[1, 2:, :_ACTION_DIM]) == 0
     assert torch.count_nonzero(raw_losses.grad[:, :, _ACTION_DIM:]) == 0
-
-
-def test_formal_flow_sanitizes_padding_before_building_noisy_actions(monkeypatch):
-    core = _make_policy("flow").model
-    actions = torch.randn(1, _HORIZON, _MAX_ACTION_DIM)
-    noise = torch.randn_like(actions)
-    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
-    action_is_pad[:, 3:] = True
-    actions[:, 3:] = torch.nan
-    noise[:, 3:] = torch.nan
-    captured = {}
-
-    def predict_velocity(images, img_masks, tokens, masks, x_t, time, action_is_pad):
-        del images, img_masks, tokens, masks
-        captured["x_t"] = x_t.detach().clone()
-        captured["time"] = time.detach().clone()
-        captured["action_is_pad"] = action_is_pad.detach().clone()
-        return torch.zeros_like(x_t)
-
-    monkeypatch.setattr(core, "predict_velocity", predict_velocity)
-
-    losses = core.forward(
-        images=[],
-        img_masks=[],
-        tokens=torch.zeros(1, 1, dtype=torch.long),
-        masks=torch.ones(1, 1, dtype=torch.bool),
-        actions=actions,
-        noise=noise,
-        time=torch.tensor([0.4]),
-        action_is_pad=action_is_pad,
-    )
-
-    assert torch.equal(captured["action_is_pad"], action_is_pad)
-    assert torch.count_nonzero(captured["x_t"][action_is_pad]) == 0
-    assert torch.isfinite(captured["x_t"]).all()
-    assert torch.isfinite(losses).all()
-    assert torch.count_nonzero(losses[action_is_pad]) == 0
-
-
-def test_formal_flow_padding_cannot_affect_valid_action_outputs(monkeypatch):
-    policy = _make_policy("flow")
-    core = policy.model
-    expert_layers = core.paligemma_with_expert.gemma_expert.model.layers
-    monkeypatch.setattr(
-        core.paligemma_with_expert.paligemma,
-        "model",
-        SimpleNamespace(language_model=SimpleNamespace(layers=expert_layers)),
-        raising=False,
-    )
-
-    def empty_prefix(_images, _img_masks, tokens, _masks):
-        batch_size = tokens.shape[0]
-        device = tokens.device
-        return (
-            torch.empty(batch_size, 0, _WIDTH, device=device),
-            torch.empty(batch_size, 0, dtype=torch.bool, device=device),
-            torch.empty(batch_size, 0, dtype=torch.bool, device=device),
-        )
-
-    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
-    monkeypatch.setattr(core, "embed_prefix", empty_prefix)
-    fixed_noise = torch.randn(1, _HORIZON, _MAX_ACTION_DIM)
-    monkeypatch.setattr(core, "sample_noise", lambda _shape, _device: fixed_noise.clone())
-    monkeypatch.setattr(core, "sample_time", lambda _batch_size, _device: torch.tensor([0.4]))
-
-    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
-    action_is_pad[:, 2:] = True
-    actions_a = torch.randn(1, _HORIZON, _ACTION_DIM)
-    actions_b = actions_a.clone()
-    actions_a[:, 2:] = 1_000.0
-    actions_b[:, 2:] = torch.nan
-
-    def make_batch(actions):
-        return {
-            ACTION: actions,
-            "action_is_pad": action_is_pad,
-            OBS_LANGUAGE_TOKENS: torch.zeros(1, 1, dtype=torch.long),
-            OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 1, dtype=torch.bool),
-        }
-
-    loss_a, _ = policy.forward(make_batch(actions_a))
-    loss_b, _ = policy.forward(make_batch(actions_b))
-
-    assert torch.isfinite(loss_a)
-    assert torch.isfinite(loss_b)
-    torch.testing.assert_close(loss_a, loss_b)
-    loss_b.backward()
-    for parameter in (
-        core.action_in_proj.weight,
-        core.time_mlp_in.weight,
-        core.time_mlp_out.weight,
-        core.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight,
-        core.action_out_proj.weight,
-    ):
-        assert parameter.grad is not None
-        assert torch.isfinite(parameter.grad).all()
-    call = core.paligemma_with_expert.last_call
-    allowed = call["attention_mask"][:, 0].eq(0)
-    assert allowed[:, :2, :2].all()
-    assert not allowed[:, :2, 2:].any()
-    assert not allowed[:, 2:, :].any()
-    torch.testing.assert_close(
-        call["position_ids"][:, :2],
-        torch.arange(2, dtype=torch.long).unsqueeze(0),
-    )
 
 
 def test_flow_all_padded_actions_return_graph_connected_zero(monkeypatch):

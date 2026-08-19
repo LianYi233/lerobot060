@@ -19,8 +19,8 @@ It is designed as a **Vision-Language-Action model with open-world generalizatio
 
 ## Training Defaults
 
-Fresh π₀.₅ configurations use a unified AdamW learning rate of `2.5e-4` for the VLM and action-side
-parameters, followed by cosine decay to a `2.5e-5` floor. Checkpoint loads and resumed runs preserve
+Fresh π₀.₅ configurations use a unified AdamW learning rate of `1e-4` for the VLM and action-side
+parameters, followed by cosine decay to a `1e-5` floor. Checkpoint loads and resumed runs preserve
 their saved optimizer values. The policy-specific clipping enforces
 `action_rms <= 10 * vlm_rms`: only action-side gradients are rescaled, while VLM gradients remain
 unchanged. Global gradient clipping is disabled (`optimizer_grad_clip_norm=0.0`).

@@ -111,13 +111,13 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.job.target == "local"
 
     assert pretrain_cfg.optimizer is not cfg.optimizer
-    assert pretrain_cfg.optimizer.lr == pytest.approx(2.5e-5)
+    assert pretrain_cfg.optimizer.lr == pytest.approx(1e-4)
     assert pretrain_cfg.optimizer.betas == (0.9, 0.95)
     assert pretrain_cfg.optimizer.eps == pytest.approx(1e-8)
     assert pretrain_cfg.optimizer.weight_decay == pytest.approx(0.01)
     assert pretrain_cfg.optimizer.grad_clip_norm == 0.0
-    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(2.5e-5)
-    assert pretrain_cfg.scheduler.decay_lr == pytest.approx(2.5e-6)
+    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(1e-4)
+    assert pretrain_cfg.scheduler.decay_lr == pytest.approx(1e-5)
     assert pretrain_cfg.scheduler.num_warmup_steps == 1_000
     assert pretrain_cfg.scheduler.num_decay_steps == 30_000
 

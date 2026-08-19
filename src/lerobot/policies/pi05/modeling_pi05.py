@@ -957,28 +957,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         ).to(dtype=torch.float32)
         return self._apply_checkpoint(self.action_out_proj, suffix_out)
 
-    def predict_velocity(
-        self,
-        images,
-        img_masks,
-        tokens,
-        masks,
-        x_t,
-        time,
-        action_is_pad: Tensor | None = None,
-    ) -> Tensor:
+    def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
         """Predict flow velocity for explicit noisy actions and timesteps."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
-        if action_is_pad is not None:
-            expected_mask_shape = x_t.shape[:2]
-            if action_is_pad.shape != expected_mask_shape:
-                raise ValueError(
-                    f"action_is_pad must have shape {expected_mask_shape}, got {tuple(action_is_pad.shape)}"
-                )
-            # Action tokens share one bidirectional block, so padded keys and queries must be
-            # removed here rather than only excluded from the final loss reduction.
-            suffix_pad_masks = ~action_is_pad.to(device=x_t.device, dtype=torch.bool)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1064,36 +1046,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        expected_mask_shape = actions.shape[:2]
-        if action_is_pad is None:
-            action_is_pad = torch.zeros(expected_mask_shape, dtype=torch.bool, device=actions.device)
-        else:
-            if action_is_pad.shape != expected_mask_shape:
-                raise ValueError(
-                    f"action_is_pad must have shape {expected_mask_shape}, got {tuple(action_is_pad.shape)}"
-                )
-            action_is_pad = action_is_pad.to(device=actions.device, dtype=torch.bool)
-
-        valid_elements = (~action_is_pad).unsqueeze(-1)
-        # Dataset padding repeats episode-edge actions. Sanitize both flow endpoints before
-        # interpolation so padded values (including NaNs) never reach the action projection.
-        safe_actions = torch.where(valid_elements, actions, torch.zeros_like(actions))
-        safe_noise = torch.where(valid_elements, noise, torch.zeros_like(noise))
         time_expanded = time[:, None, None]
-        x_t = time_expanded * safe_noise + (1 - time_expanded) * safe_actions
-        u_t = safe_noise - safe_actions
-        v_t = self.predict_velocity(
-            images=images,
-            img_masks=img_masks,
-            tokens=tokens,
-            masks=masks,
-            x_t=x_t,
-            time=time,
-            action_is_pad=action_is_pad,
-        )
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        v_t = self.predict_velocity(images, img_masks, tokens, masks, x_t, time)
 
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return torch.where(valid_elements, losses, torch.zeros_like(losses))
+        return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1981,21 +1939,14 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
-        valid_steps = _valid_action_steps(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(
-            images=images,
-            img_masks=img_masks,
-            tokens=tokens,
-            masks=masks,
-            actions=actions,
-            action_is_pad=~valid_steps,
-        )
+        losses = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        valid_steps = _valid_action_steps(batch)
         loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, valid_steps)
 
         loss_dict = {
