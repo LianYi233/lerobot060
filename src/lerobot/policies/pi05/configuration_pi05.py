@@ -110,7 +110,7 @@ class PI05Config(PreTrainedConfig):
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
     # Optimizer settings. Action and VLM parameters share this single AdamW learning rate.
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 2.5e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01

@@ -374,7 +374,7 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
         next_action_pretrain_steps=0,
         # Stage 1 always uses the fixed optimization recipe from the pretraining design, independently
         # of any flow-stage optimizer overrides in the user's one-command invocation.
-        optimizer_lr=1e-4,
+        optimizer_lr=2.5e-4,
         optimizer_betas=(0.9, 0.95),
         optimizer_eps=1e-8,
         optimizer_weight_decay=0.01,
