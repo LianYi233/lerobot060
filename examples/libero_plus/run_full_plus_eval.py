@@ -334,12 +334,19 @@ def main() -> None:
     print(f"[{_utc_now()}] loading policy from {args.policy_path}", flush=True)
     policy = make_policy(cfg=policy_cfg, env_cfg=env_cfg)
     policy.eval()
+    preprocessor_overrides: dict[str, Any] = {
+        "device_processor": {"device": str(policy.config.device)},
+    }
+    # Hub snapshot of pi05 still names google/paligemma-3b-pt-224; that repo is gated
+    # and hf-mirror 403s a fine-grained token. fmm816 eval used a local checkout.
+    tok_path = os.environ.get("PALIGEMMA_TOKENIZER", "/data/models/paligemma-3b-pt-224")
+    if tok_path and Path(tok_path).exists():
+        preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tok_path}
+        print(f"[{_utc_now()}] using local paligemma tokenizer {tok_path}", flush=True)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
         pretrained_path=str(args.policy_path),
-        preprocessor_overrides={
-            "device_processor": {"device": str(policy.config.device)},
-        },
+        preprocessor_overrides=preprocessor_overrides,
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
         env_cfg=env_cfg, policy_cfg=policy_cfg
