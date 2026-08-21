@@ -23,10 +23,10 @@ from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
 from lerobot.policies.pi05 import PI05Config  # noqa: E402
 
 
-def test_pi05_integrated_next_action_pretraining_defaults_to_1000_steps():
+def test_pi05_integrated_next_action_pretraining_defaults_to_500_steps():
     config = PI05Config()
 
-    assert config.next_action_pretrain_steps == 1_000
+    assert config.next_action_pretrain_steps == 500
     assert config.next_action_masked_steps == 40
     assert config.next_action_full_mask_probability == pytest.approx(0.0)
     assert config.next_action_pretraining_active
@@ -36,7 +36,7 @@ def test_pi05_integrated_next_action_pretraining_defaults_to_1000_steps():
     ("kwargs", "expected_steps"),
     [
         ({"next_action_pretrain_steps": 0}, 0),
-        ({"training_stage": "next_action"}, 1_000),
+        ({"training_stage": "next_action"}, 500),
     ],
 )
 def test_pi05_integrated_next_action_pretraining_can_be_disabled_and_never_recurses(kwargs, expected_steps):
