@@ -97,10 +97,10 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.drop_n_last_frames == 0
     assert not pretrain_cfg.cabo_active
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
-    assert pretrain_cfg.steps == 3_000
+    assert pretrain_cfg.steps == 1_000
     assert pretrain_cfg.output_dir == tmp_path / "flow_next_action_pretrain"
     assert pretrain_cfg.save_checkpoint
-    assert pretrain_cfg.save_freq == 3_000
+    assert pretrain_cfg.save_freq == 1_000
     assert not pretrain_cfg.save_checkpoint_to_hub
     assert not pretrain_cfg.policy.push_to_hub
     assert not pretrain_cfg.wandb.enable
@@ -111,18 +111,18 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.job.target == "local"
 
     assert pretrain_cfg.optimizer is not cfg.optimizer
-    assert pretrain_cfg.optimizer.lr == pytest.approx(2.5e-4)
+    assert pretrain_cfg.optimizer.lr == pytest.approx(2.5e-5)
     assert pretrain_cfg.optimizer.betas == (0.9, 0.95)
     assert pretrain_cfg.optimizer.eps == pytest.approx(1e-8)
     assert pretrain_cfg.optimizer.weight_decay == pytest.approx(0.01)
     assert pretrain_cfg.optimizer.grad_clip_norm == 0.0
-    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(2.5e-4)
+    assert pretrain_cfg.scheduler.peak_lr == pytest.approx(2.5e-5)
     assert pretrain_cfg.scheduler.decay_lr == pytest.approx(1e-5)
     assert pretrain_cfg.scheduler.num_warmup_steps == 1_000
     assert pretrain_cfg.scheduler.num_decay_steps == 30_000
 
     assert train_module._pi05_next_action_pretrained_model_dir(pretrain_cfg) == (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "003000" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
 
 
@@ -199,7 +199,7 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[1][0].save_checkpoint
     assert stages[1][0].save_freq == 3_000
     expected_model_dir = (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "003000" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
     assert cfg.policy.pretrained_path == expected_model_dir
     assert cfg.policy.pretrained_revision is None

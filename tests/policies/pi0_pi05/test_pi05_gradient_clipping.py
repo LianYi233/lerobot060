@@ -88,17 +88,17 @@ def test_pi05_optimizer_and_cabo_defaults():
 
     assert config.optimizer_grad_clip_norm == 0.0
     assert optimizer_config.grad_clip_norm == 0.0
-    assert optimizer_config.lr == pytest.approx(2.5e-4)
+    assert optimizer_config.lr == pytest.approx(2.5e-5)
     assert isinstance(optimizer, torch.optim.AdamW)
     assert len(optimizer.param_groups) == 1
     assert [id(parameter) for parameter in optimizer.param_groups[0]["params"]] == [
         id(parameter) for parameter in parameters
     ]
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.5e-4)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.5e-5)
     assert optimizer.param_groups[0]["betas"] == pytest.approx((0.9, 0.95))
     assert optimizer.param_groups[0]["eps"] == pytest.approx(1e-8)
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.01)
-    assert scheduler.peak_lr == pytest.approx(2.5e-4)
+    assert scheduler.peak_lr == pytest.approx(2.5e-5)
     assert scheduler.decay_lr == pytest.approx(1e-5)
     assert scheduler.num_warmup_steps == 1_000
     assert scheduler.num_decay_steps == 30_000

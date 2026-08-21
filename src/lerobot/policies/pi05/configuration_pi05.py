@@ -63,7 +63,7 @@ class PI05Config(PreTrainedConfig):
     next_action_full_mask_probability: float = 0.0
     # Number of action-only flow steps automatically run before a flow-training invocation. Set to 0
     # to start flow training immediately. This is orchestration metadata and does not alter either loss.
-    next_action_pretrain_steps: int = 3_000
+    next_action_pretrain_steps: int = 1_000
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -110,7 +110,7 @@ class PI05Config(PreTrainedConfig):
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
     # Optimizer settings. Action and VLM parameters share this single AdamW learning rate.
-    optimizer_lr: float = 2.5e-4
+    optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01

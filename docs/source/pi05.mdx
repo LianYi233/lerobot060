@@ -69,7 +69,7 @@ lerobot-train \
     --batch_size=32
 ```
 
-By default, a fresh flow run first performs 3,000 action-only flow-inpainting updates, then performs
+By default, a fresh flow run first performs 1,000 action-only flow-inpainting updates, then performs
 the requested `--steps` observation-conditioned flow updates. For a complete 50-action chunk,
 Stage 1 randomly masks 40 valid positions without replacement, keeps 10 clean actions as
 bidirectional context, and predicts flow velocity only at the masked positions. If a padded chunk
@@ -100,9 +100,9 @@ for loading older checkpoints and no longer affect training.
 ### Training Parameters Explained
 
 Fresh π₀.₅ configurations use one AdamW learning rate for all trainable VLM and action-side
-parameters. After warmup, the learning rate follows a cosine decay from `2.5e-4` to a floor of
+parameters. After warmup, the learning rate follows a cosine decay from `2.5e-5` to a floor of
 `1e-5`. Loading or resuming a checkpoint preserves the optimizer values saved in that checkpoint.
-The integrated Stage 1 uses a fixed `2.5e-4` peak learning rate and `1e-5` decay floor, matching the
+The integrated Stage 1 uses a fixed `2.5e-5` peak learning rate and `1e-5` decay floor, matching the
 fresh Stage 2 defaults. Its optimizer state is not carried into Stage 2. During an integrated
 two-stage run, Stage 2 saves a checkpoint every 3,000 updates when checkpointing is enabled, and
 once more at the final update when the total step count is not divisible by 3,000.
@@ -163,7 +163,7 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 
 | Parameter                       | Default  | Description                                                |
 | ------------------------------- | -------- | ---------------------------------------------------------- |
-| `optimizer_lr`                  | `2.5e-4` | Unified AdamW learning rate for VLM and action parameters   |
+| `optimizer_lr`                  | `2.5e-5` | Unified AdamW learning rate for VLM and action parameters   |
 | `scheduler_decay_lr`            | `1e-5`   | Learning-rate floor after cosine decay                      |
 | `save_freq`                     | `10000`  | Save every 10,000 steps and always save the final checkpoint |
 | `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
