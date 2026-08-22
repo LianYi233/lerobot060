@@ -29,6 +29,7 @@ from lerobot.policies.pi05 import (  # noqa: E402
     PI05Policy,
     modeling_pi05,
 )
+from lerobot.policies.pi05.configuration_pi05 import PI05TrainingObjective  # noqa: E402
 from lerobot.utils.constants import (  # noqa: E402
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -152,6 +153,56 @@ def test_action_only_flow_default_masks_40_valid_actions():
     assert inpainting_mask.sum(dim=1).tolist() == [40, 7, 0]
     assert ((~inpainting_mask) & (~action_is_pad)).sum(dim=1).tolist() == [10, 0, 0]
     assert not (inpainting_mask & action_is_pad).any()
+
+
+def test_stage1_training_progress_switches_exactly_after_750_updates():
+    policy = _make_policy(next_action_bridge_steps=250)
+
+    policy.set_training_progress(step=749, total_steps=1_000)
+    assert not policy._stage1_bridge_active
+
+    policy.set_training_progress(step=750, total_steps=1_000)
+    assert policy._stage1_bridge_active
+
+    with pytest.raises(ValueError, match="cannot exceed the Stage-1 training steps"):
+        policy.set_training_progress(step=0, total_steps=249)
+
+
+def test_stage1_observation_flow_override_matches_formal_flow(monkeypatch):
+    stage1_core = _make_policy("next_action").model
+    flow_core = _make_policy("flow").model
+    flow_core.load_state_dict(stage1_core.state_dict())
+    actions = torch.randn(2, _HORIZON, _MAX_ACTION_DIM)
+    noise = torch.randn_like(actions)
+    time = torch.tensor([0.2, 0.8])
+
+    def zero_velocity(_images, _img_masks, _tokens, _masks, x_t, _time):
+        return torch.zeros_like(x_t)
+
+    monkeypatch.setattr(stage1_core, "predict_velocity", zero_velocity)
+    monkeypatch.setattr(flow_core, "predict_velocity", zero_velocity)
+
+    bridge_losses = stage1_core.forward(
+        images=[],
+        img_masks=[],
+        tokens=torch.zeros(2, 1, dtype=torch.long),
+        masks=torch.ones(2, 1, dtype=torch.bool),
+        actions=actions,
+        noise=noise,
+        time=time,
+        objective=PI05TrainingObjective.OBSERVATION_FLOW,
+    )
+    flow_losses = flow_core.forward(
+        images=[],
+        img_masks=[],
+        tokens=torch.zeros(2, 1, dtype=torch.long),
+        masks=torch.ones(2, 1, dtype=torch.bool),
+        actions=actions,
+        noise=noise,
+        time=time,
+    )
+
+    torch.testing.assert_close(bridge_losses, flow_losses, rtol=0, atol=0)
 
 
 def test_flow_inpainting_random_mask_selects_exact_valid_steps_only():
@@ -541,6 +592,52 @@ def test_flow_inpainting_forward_supports_torch_compile(monkeypatch):
     assert losses.shape == (1, _HORIZON, _MAX_ACTION_DIM)
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "compile") or not torch._dynamo.is_dynamo_supported(),
+    reason="torch.compile is unavailable on this platform",
+)
+def test_compiled_stage1_forward_supports_both_curriculum_objectives(monkeypatch):
+    core = _make_policy().model
+
+    def simple_inpainting_velocity(x_t, _time, _action_is_pad, _inpainting_mask):
+        return core.action_out_proj(core.action_in_proj(x_t))
+
+    def simple_observation_velocity(_images, _img_masks, _tokens, _masks, x_t, _time):
+        return core.action_out_proj(core.action_in_proj(x_t))
+
+    monkeypatch.setattr(core, "predict_inpainting_velocity", simple_inpainting_velocity)
+    monkeypatch.setattr(core, "predict_velocity", simple_observation_velocity)
+    compiled_forward = torch.compile(core.forward, backend="eager")
+    actions = torch.randn(1, _HORIZON, _MAX_ACTION_DIM)
+    noise = torch.randn_like(actions)
+    time = torch.tensor([0.4])
+    action_is_pad = torch.zeros(1, _HORIZON, dtype=torch.bool)
+    inpainting_mask = torch.arange(_HORIZON).unsqueeze(0).remainder(2).eq(0)
+
+    inpainting_losses = compiled_forward(
+        actions=actions,
+        noise=noise,
+        time=time,
+        action_is_pad=action_is_pad,
+        inpainting_mask=inpainting_mask,
+        objective=PI05TrainingObjective.ACTION_INPAINTING,
+    )
+    flow_losses = compiled_forward(
+        images=[],
+        img_masks=[],
+        tokens=torch.zeros(1, 1, dtype=torch.long),
+        masks=torch.ones(1, 1, dtype=torch.bool),
+        actions=actions,
+        noise=noise,
+        time=time,
+        objective=PI05TrainingObjective.OBSERVATION_FLOW,
+    )
+
+    assert inpainting_losses.shape == flow_losses.shape == (1, _HORIZON, _MAX_ACTION_DIM)
+    assert torch.isfinite(inpainting_losses).all()
+    assert torch.isfinite(flow_losses).all()
+
+
 def test_flow_masked_loss_uses_only_valid_timesteps_and_actual_action_dims(monkeypatch):
     policy = _make_policy("flow")
     raw_losses = torch.ones(2, _HORIZON, _MAX_ACTION_DIM, requires_grad=True)
@@ -573,6 +670,154 @@ def test_flow_masked_loss_uses_only_valid_timesteps_and_actual_action_dims(monke
     assert raw_losses.grad is not None
     assert torch.count_nonzero(raw_losses.grad[1, 2:, :_ACTION_DIM]) == 0
     assert torch.count_nonzero(raw_losses.grad[:, :, _ACTION_DIM:]) == 0
+
+
+def test_stage1_bridge_uses_full_flow_loss_and_overwrites_inpainting_denominator(monkeypatch):
+    policy = _make_policy("next_action", next_action_bridge_steps=250)
+    policy.set_training_progress(step=750, total_steps=1_000)
+    raw_losses = torch.ones(2, _HORIZON, _MAX_ACTION_DIM, requires_grad=True)
+    action_is_pad = torch.zeros(2, _HORIZON, dtype=torch.bool)
+    action_is_pad[1, 7:] = True
+    stale_inpainting_mask = torch.zeros_like(action_is_pad)
+    stale_inpainting_mask[:, :2] = True
+    images = [torch.randn(2, 3, 8, 8)]
+    image_masks = [torch.ones(2, dtype=torch.bool)]
+    batch = {
+        ACTION: torch.randn(2, _HORIZON, _ACTION_DIM),
+        "action_is_pad": action_is_pad,
+        "pi05_inpainting_mask": stale_inpainting_mask,
+        "pi05_loss_valid_steps": stale_inpainting_mask,
+        OBS_LANGUAGE_TOKENS: torch.zeros(2, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 1, dtype=torch.bool),
+    }
+    captured = {}
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: (images, image_masks))
+
+    def fake_forward(*args, **kwargs):
+        captured["args"] = args
+        captured["objective"] = kwargs["objective"]
+        return raw_losses
+
+    monkeypatch.setattr(policy.model, "forward", fake_forward)
+
+    pre_forward_normalizer = policy.get_distributed_loss_normalizer(batch)
+    loss, metrics = policy.forward(batch)
+    normalizer = policy.get_distributed_loss_normalizer(batch)
+    loss.backward()
+
+    assert captured["objective"] == PI05TrainingObjective.OBSERVATION_FLOW
+    assert captured["args"][0] is images
+    assert captured["args"][1] is image_masks
+    assert captured["args"][2] is batch[OBS_LANGUAGE_TOKENS]
+    assert captured["args"][3] is batch[OBS_LANGUAGE_ATTENTION_MASK]
+    assert "pi05_inpainting_mask" not in batch
+    assert torch.equal(batch["pi05_loss_valid_steps"], ~action_is_pad)
+    assert pre_forward_normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
+    assert normalizer.item() == (_HORIZON + 7) * _ACTION_DIM
+    assert metrics["stage1/bridge_active"] == 1.0
+    assert metrics["stage1/observation_flow_loss"] == pytest.approx(1.0)
+    torch.testing.assert_close(loss, torch.tensor(1.0))
+    assert raw_losses.grad is not None
+    assert torch.count_nonzero(raw_losses.grad[1, 7:]) == 0
+
+
+def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
+    policy = _make_policy("next_action", next_action_bridge_steps=250)
+    policy.set_training_progress(step=750, total_steps=1_000)
+    policy.train()
+    batch_size = 2
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+
+    def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
+        embeddings = policy.model.action_in_proj(x_t)
+        expert = policy.model.paligemma_with_expert.gemma_expert
+        embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
+        time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
+        time_features = policy.model.time_mlp_out(
+            torch.nn.functional.silu(policy.model.time_mlp_in(time_features))
+        )
+        return policy.model.action_out_proj(embeddings + time_features.unsqueeze(1))
+
+    monkeypatch.setattr(policy.model, "predict_velocity", action_path_velocity)
+    batch = {
+        ACTION: torch.randn(batch_size, _HORIZON, _ACTION_DIM),
+        "action_is_pad": torch.zeros(batch_size, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: torch.zeros(batch_size, 1, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(batch_size, 1, dtype=torch.bool),
+    }
+
+    loss, _ = policy.forward(batch)
+    loss.backward()
+
+    vlm = policy.model.paligemma_with_expert.paligemma
+    assert not vlm.training
+    assert all(not parameter.requires_grad and parameter.grad is None for parameter in vlm.parameters())
+    for parameter_name in (
+        "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
+        "model.action_in_proj.weight",
+        "model.action_out_proj.weight",
+        "model.time_mlp_in.weight",
+        "model.time_mlp_out.weight",
+    ):
+        gradient = dict(policy.named_parameters())[parameter_name].grad
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+
+
+def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeypatch):
+    policy = _make_policy("next_action", next_action_bridge_steps=1)
+    policy.train()
+    batch_size = 2
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
+
+    def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
+        embeddings = policy.model.action_in_proj(x_t)
+        expert = policy.model.paligemma_with_expert.gemma_expert
+        embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
+        time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
+        time_features = policy.model.time_mlp_out(
+            torch.nn.functional.silu(policy.model.time_mlp_in(time_features))
+        )
+        return policy.model.action_out_proj(embeddings + time_features.unsqueeze(1))
+
+    monkeypatch.setattr(policy.model, "predict_velocity", action_path_velocity)
+    optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    optimizer_identity = id(optimizer)
+    scheduler_identity = id(scheduler)
+    initial_scheduler_step = scheduler.last_epoch
+    optimizer_parameter_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    expected_parameter_ids = {id(parameter) for parameter in policy.parameters() if parameter.requires_grad}
+    bridge_metrics = []
+
+    for step in range(4):
+        policy.set_training_progress(step=step, total_steps=4)
+        batch = {
+            ACTION: torch.randn(batch_size, _HORIZON, _ACTION_DIM),
+            "action_is_pad": torch.zeros(batch_size, _HORIZON, dtype=torch.bool),
+            OBS_LANGUAGE_TOKENS: torch.zeros(batch_size, 1, dtype=torch.long),
+            OBS_LANGUAGE_ATTENTION_MASK: torch.ones(batch_size, 1, dtype=torch.bool),
+        }
+        loss, metrics = policy.forward(batch)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+        bridge_metrics.append(metrics["stage1/bridge_active"])
+
+    assert bridge_metrics == [0.0, 0.0, 0.0, 1.0]
+    assert id(optimizer) == optimizer_identity
+    assert id(scheduler) == scheduler_identity
+    assert scheduler.last_epoch == initial_scheduler_step + 4
+    assert optimizer_parameter_ids == expected_parameter_ids
+    assert {id(parameter) for parameter in policy.parameters() if parameter.requires_grad} == (
+        expected_parameter_ids
+    )
+    optimizer_step = optimizer.state[policy.model.action_in_proj.weight]["step"]
+    assert optimizer_step.item() == 4
 
 
 def test_flow_all_padded_actions_return_graph_connected_zero(monkeypatch):
@@ -700,7 +945,7 @@ def test_pi05_distributed_loss_normalizer_uses_actual_full_mask_from_forward():
 def test_flow_inpainting_checkpoint_rejects_action_inference_before_preprocessing(method_name):
     policy = _make_policy()
 
-    with pytest.raises(RuntimeError, match="action-only flow pretraining checkpoint"):
+    with pytest.raises(RuntimeError, match="frozen-VLM Stage-1 checkpoint"):
         getattr(policy, method_name)({})
 
 

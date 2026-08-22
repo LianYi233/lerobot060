@@ -341,7 +341,7 @@ def update_policy(
 
 
 def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
-    """Return whether this run needs integrated PI0.5 action-only flow pretraining."""
+    """Return whether this run needs integrated PI0.5 frozen-VLM Stage 1."""
     policy_cfg = cfg.policy
     return bool(
         not cfg.resume
@@ -353,27 +353,33 @@ def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
 
 
 def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> TrainPipelineConfig:
-    """Build an isolated action-only inpainting stage without mutating the formal flow config."""
+    """Build an isolated frozen-VLM Stage 1 without mutating the formal flow config."""
     from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 
     if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
-        raise ValueError("Integrated action-only flow pretraining requires a non-resumed PI0.5 flow run")
+        raise ValueError("Integrated PI0.5 Stage 1 requires a non-resumed flow run")
     if cfg.output_dir is None:
         raise ValueError("output_dir must be resolved before building the PI0.5 pretraining stage")
     if cfg.policy.use_peft or cfg.peft is not None:
         raise ValueError(
-            "Integrated PI0.5 action-only flow pretraining does not support PEFT. Use a standard PI0.5 "
+            "Integrated PI0.5 Stage 1 does not support PEFT. Use a standard PI0.5 "
             "base/flow checkpoint as --policy.path and run full-parameter flow training."
         )
 
     pretrain_cfg = copy.deepcopy(cfg)
     pretrain_steps = cfg.policy.next_action_pretrain_steps
+    bridge_steps = cfg.policy.next_action_bridge_steps
+    if bridge_steps > pretrain_steps:
+        raise ValueError(
+            "next_action_bridge_steps cannot exceed next_action_pretrain_steps for integrated "
+            f"Stage 1, got {bridge_steps} > {pretrain_steps}"
+        )
     pretrain_cfg.policy = dataclasses.replace(
         pretrain_cfg.policy,
         training_stage=PI05TrainingStage.NEXT_ACTION,
         next_action_pretrain_steps=0,
-        # Stage 1 always uses the fixed optimization recipe from the pretraining design, independently
-        # of any flow-stage optimizer overrides in the user's one-command invocation.
+        # Both Stage-1 objectives use this fixed recipe, independently of any formal-flow optimizer
+        # overrides in the user's one-command invocation.
         optimizer_lr=2.5e-5,
         optimizer_betas=(0.9, 0.95),
         optimizer_eps=1e-8,
@@ -418,6 +424,31 @@ def _pi05_next_action_pretrained_model_dir(pretrain_cfg: TrainPipelineConfig) ->
     return checkpoint_dir / PRETRAINED_MODEL_DIR
 
 
+def _pi05_stage1_bridge_start_step(cfg: TrainPipelineConfig) -> int | None:
+    """Return the zero-based Stage-1 update where observation-conditioned flow begins."""
+    policy_cfg = cfg.policy
+    if (
+        policy_cfg is None
+        or policy_cfg.type != "pi05"
+        or getattr(policy_cfg, "training_stage", None) != "next_action"
+    ):
+        return None
+    bridge_steps = int(getattr(policy_cfg, "next_action_bridge_steps", 0))
+    if bridge_steps > cfg.steps:
+        raise ValueError(
+            "next_action_bridge_steps cannot exceed the Stage-1 training steps, "
+            f"got {bridge_steps} > {cfg.steps}"
+        )
+    return cfg.steps - bridge_steps if bridge_steps > 0 else None
+
+
+def _set_policy_training_progress(policy, accelerator: "Accelerator", *, step: int, total_steps: int) -> None:
+    """Pass the checkpoint-aware global update index to policies with runtime curricula."""
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if has_method(unwrapped_policy, "set_training_progress"):
+        unwrapped_policy.set_training_progress(step=step, total_steps=total_steps)
+
+
 def _make_training_accelerator(
     cfg: TrainPipelineConfig,
     accelerator: "Accelerator | None" = None,
@@ -448,12 +479,15 @@ def _run_pi05_next_action_pretraining(
 ) -> None:
     """Run Stage 1, then point the untouched formal config at its transferable weights."""
     pretrain_cfg = _make_pi05_next_action_pretraining_config(cfg)
+    bridge_steps = pretrain_cfg.policy.next_action_bridge_steps
     logging.info(
-        "Starting integrated PI0.5 action-only flow-inpainting pretraining for %d steps; formal flow training "
-        "will start automatically afterwards.",
-        pretrain_cfg.steps,
+        "Starting integrated PI0.5 Stage 1 with %d action-only flow-inpainting updates followed by %d "
+        "observation-conditioned full-flow bridge updates with the VLM frozen; formal flow training will "
+        "start automatically afterwards.",
+        pretrain_cfg.steps - bridge_steps,
+        bridge_steps,
     )
-    _train_single_stage(pretrain_cfg, accelerator)
+    _train_single_stage(pretrain_cfg, accelerator, enable_pi05_stage1_bridge=True)
     accelerator.wait_for_everyone()
     pretrained_model_dir = _pi05_next_action_pretrained_model_dir(pretrain_cfg)
     checkpoint_visible = pretrained_model_dir.is_dir()
@@ -466,7 +500,7 @@ def _run_pi05_next_action_pretraining(
         checkpoint_visible = int(visible_count.item()) == num_processes
     if not checkpoint_visible:
         raise RuntimeError(
-            "Integrated PI0.5 action-only flow pretraining finished without producing its final "
+            "Integrated PI0.5 Stage 1 finished without producing its final "
             f"checkpoint at {pretrained_model_dir} on every rank. Distributed training requires "
             "output_dir and its sibling pretraining directory to be on a filesystem shared by all ranks."
         )
@@ -479,8 +513,8 @@ def _run_pi05_next_action_pretraining(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
-        "PI0.5 action-only flow pretraining complete; rebuilding the model, optimizer, scheduler, "
-        "and CABO state for formal flow training with checkpoints every %d steps.",
+        "PI0.5 Stage 1 complete; rebuilding the model, optimizer, scheduler, and CABO state for "
+        "formal flow training with checkpoints every %d steps.",
         cfg.save_freq,
     )
 
@@ -531,11 +565,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 def _train_single_stage(
     cfg: TrainPipelineConfig,
     accelerator: "Accelerator",
+    *,
+    enable_pi05_stage1_bridge: bool = False,
 ):
     """Train exactly one already-validated objective with freshly created training state."""
     from accelerate.utils import DistributedType
 
     active_cfg = cfg.trainable_config
+    pi05_stage1_bridge_start_step = _pi05_stage1_bridge_start_step(cfg) if enable_pi05_stage1_bridge else None
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
@@ -900,6 +937,15 @@ def _train_single_stage(
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
+        if enable_pi05_stage1_bridge:
+            _set_policy_training_progress(policy, accelerator, step=step, total_steps=cfg.steps)
+        if is_main_process and step == pi05_stage1_bridge_start_step:
+            logging.info(
+                "Switching PI0.5 Stage 1 to observation-conditioned full-flow for the final %d updates; "
+                "the VLM remains frozen and the existing optimizer and scheduler continue unchanged.",
+                cfg.steps - step,
+            )
+
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
@@ -945,6 +991,15 @@ def _train_single_stage(
 
         if is_eval_step:
             policy.eval()
+            # Evaluate the objective used by the next update at an exact curriculum boundary. At
+            # the final update, retain the final objective instead of passing an out-of-range step.
+            if enable_pi05_stage1_bridge:
+                _set_policy_training_progress(
+                    policy,
+                    accelerator,
+                    step=min(step, cfg.steps - 1),
+                    total_steps=cfg.steps,
+                )
             eval_loss_sum = 0.0
             n_eval_batches = 0
             with torch.no_grad(), accelerator.autocast():

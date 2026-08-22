@@ -35,6 +35,13 @@ class PI05TrainingStage(StrEnum):
     NEXT_ACTION = "next_action"
 
 
+class PI05TrainingObjective(StrEnum):
+    """Runtime objectives used within a PI0.5 training stage."""
+
+    ACTION_INPAINTING = "action_inpainting"
+    OBSERVATION_FLOW = "observation_flow"
+
+
 @PreTrainedConfig.register_subclass("pi05")
 @dataclass
 class PI05Config(PreTrainedConfig):
@@ -46,9 +53,10 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
-    # Training objective. ``next_action`` is kept as the public name for backwards compatibility,
-    # but now performs action-only flow inpainting over the complete chunk. ``flow`` keeps the
-    # standard observation-conditioned PI0.5 objective.
+    # Training stage. ``next_action`` is kept as the public name for backwards compatibility and
+    # freezes the VLM; its base objective is action-only flow inpainting over the complete chunk.
+    # The integrated trainer may route its final bridge updates through the standard
+    # observation-conditioned objective without changing this stage or its optimizer.
     # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
     training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
     # Number of valid temporal action tokens to hide and reconstruct per sample. The mask is sampled
@@ -61,9 +69,13 @@ class PI05Config(PreTrainedConfig):
     # Stage 1 defaults to fixed-count inpainting: 40 hidden action tokens and 10 visible tokens for
     # a standard 50-step chunk. Complete-chunk masking remains available as an explicit override.
     next_action_full_mask_probability: float = 0.0
-    # Number of action-only flow steps automatically run before a flow-training invocation. Set to 0
-    # to start flow training immediately. This is orchestration metadata and does not alter either loss.
-    next_action_pretrain_steps: int = 500
+    # Total Stage-1 updates automatically run before a flow-training invocation. Set to 0 to start
+    # formal flow training immediately. This is orchestration metadata and does not alter either loss.
+    next_action_pretrain_steps: int = 1_000
+    # Finish integrated Stage 1 with observation-conditioned full-flow updates while the VLM stays
+    # frozen. These updates reuse the same Stage-1 model, optimizer, and scheduler. Set to 0 to keep
+    # Stage 1 entirely action-only.
+    next_action_bridge_steps: int = 250
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -166,6 +178,10 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"next_action_pretrain_steps must be non-negative, got {self.next_action_pretrain_steps}"
             )
+        if self.next_action_bridge_steps < 0:
+            raise ValueError(
+                f"next_action_bridge_steps must be non-negative, got {self.next_action_bridge_steps}"
+            )
         if not 0.0 <= self.next_action_full_mask_probability <= 1.0:
             raise ValueError(
                 "next_action_full_mask_probability must be in [0, 1], "
@@ -230,7 +246,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def next_action_pretraining_active(self) -> bool:
-        """Whether a flow-training invocation should first run action-only flow pretraining."""
+        """Whether a flow-training invocation should first run frozen-VLM Stage 1."""
         return self.training_stage == "flow" and self.next_action_pretrain_steps > 0
 
     def validate_features(self) -> None:

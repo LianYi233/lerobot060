@@ -60,7 +60,12 @@ from lerobot.optim.cabo import (
     update_cabo_relative_update_scales,
     validate_adamw_param_group,
 )
-from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from lerobot.policies.pi05.configuration_pi05 import (
+    DEFAULT_IMAGE_SIZE,
+    PI05Config,
+    PI05TrainingObjective,
+    PI05TrainingStage,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
@@ -69,6 +74,8 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+
+_PI05_LOSS_VALID_STEPS_KEY = "pi05_loss_valid_steps"
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -1011,11 +1018,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time=None,
         action_is_pad=None,
         inpainting_mask=None,
+        objective: PI05TrainingObjective | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if actions is None:
             raise ValueError("actions are required")
-        if self.config.training_stage == "next_action":
+        if objective is None:
+            objective = (
+                PI05TrainingObjective.ACTION_INPAINTING
+                if self.config.training_stage == PI05TrainingStage.NEXT_ACTION
+                else PI05TrainingObjective.OBSERVATION_FLOW
+            )
+        if objective == PI05TrainingObjective.ACTION_INPAINTING:
             action_is_pad, inpainting_mask = self._validate_inpainting_inputs(
                 actions, action_is_pad, inpainting_mask
             )
@@ -1039,6 +1053,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             v_t = self.predict_inpainting_velocity(x_t, time, action_is_pad, inpainting_mask)
             losses = F.mse_loss(u_t, v_t, reduction="none")
             return torch.where(masked_elements, losses, torch.zeros_like(losses))
+
+        if objective != PI05TrainingObjective.OBSERVATION_FLOW:
+            raise ValueError(f"Unsupported PI0.5 training objective: {objective!r}")
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -1068,7 +1085,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Do a full inference forward and compute the action."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
+                "Action inference is unavailable for a frozen-VLM Stage-1 checkpoint; "
                 "load it with training_stage='flow' first"
             )
         if num_steps is None:
@@ -1215,6 +1232,10 @@ class PI05Policy(PreTrainedPolicy):
         # Initialize the core PI05 model
         self.init_rtc_processor()
         self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        # Runtime-only curriculum state. The trainer sets this from its checkpoint-aware global
+        # update counter before each forward. Keeping it out of the state dict preserves strict
+        # Stage-1 -> Stage-2 checkpoint compatibility.
+        self._stage1_bridge_active = False
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1223,6 +1244,23 @@ class PI05Policy(PreTrainedPolicy):
         self.model.to(config.device)
 
         self.reset()
+
+    def set_training_progress(self, *, step: int, total_steps: int) -> None:
+        """Select the Stage-1 objective for the next update without changing model state."""
+        self._stage1_bridge_active = False
+        if self.config.training_stage != PI05TrainingStage.NEXT_ACTION:
+            return
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be greater than 0, got {total_steps}")
+        if step < 0 or step >= total_steps:
+            raise ValueError(f"step must be in [0, {total_steps}), got {step}")
+        bridge_steps = self.config.next_action_bridge_steps
+        if bridge_steps > total_steps:
+            raise ValueError(
+                "next_action_bridge_steps cannot exceed the Stage-1 training steps, "
+                f"got {bridge_steps} > {total_steps}"
+            )
+        self._stage1_bridge_active = bridge_steps > 0 and step >= total_steps - bridge_steps
 
     @classmethod
     def from_pretrained(
@@ -1820,7 +1858,7 @@ class PI05Policy(PreTrainedPolicy):
         """Select a single action given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
+                "Action inference is unavailable for a frozen-VLM Stage-1 checkpoint; "
                 "load it with training_stage='flow' first"
             )
         assert not self._rtc_enabled(), (
@@ -1842,7 +1880,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
+                "Action inference is unavailable for a frozen-VLM Stage-1 checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1867,7 +1905,7 @@ class PI05Policy(PreTrainedPolicy):
         """Predict actions and return a pooled contextual PI0.5 prefix representation."""
         if self.config.training_stage == "next_action":
             raise RuntimeError(
-                "Action inference is unavailable for an action-only flow pretraining checkpoint; "
+                "Action inference is unavailable for a frozen-VLM Stage-1 checkpoint; "
                 "load it with training_stage='flow' first"
             )
         self.eval()
@@ -1899,7 +1937,8 @@ class PI05Policy(PreTrainedPolicy):
         if reduction not in ("mean", "none"):
             raise ValueError(f"Unsupported loss reduction: {reduction!r}")
 
-        if self.config.training_stage == "next_action":
+        is_stage1 = self.config.training_stage == PI05TrainingStage.NEXT_ACTION
+        if is_stage1 and not self._stage1_bridge_active:
             actions = self.prepare_action(batch)
             if "action_is_pad" not in batch:
                 raise ValueError("action_is_pad is required for action-only flow pretraining")
@@ -1909,10 +1948,12 @@ class PI05Policy(PreTrainedPolicy):
             # The trainer queries the DDP denominator immediately after forward. Exposing this
             # ephemeral mask on the current batch keeps normalization exact for the sampled mask.
             batch["pi05_inpainting_mask"] = inpainting_mask
+            batch[_PI05_LOSS_VALID_STEPS_KEY] = inpainting_mask
             losses = self.model.forward(
                 actions=actions,
                 action_is_pad=action_is_pad,
                 inpainting_mask=inpainting_mask,
+                objective=PI05TrainingObjective.ACTION_INPAINTING,
             )
 
             original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1928,12 +1969,23 @@ class PI05Policy(PreTrainedPolicy):
                 "flow_inpainting/masked_valid_fraction": float(
                     masked_valid_count.item() / max(valid_action_count.item(), 1)
                 ),
+                "stage1/bridge_active": 0.0,
                 "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
             }
             if reduction == "none":
                 return per_sample_loss, loss_dict
             return loss, loss_dict
 
+        return self._forward_observation_flow(batch, reduction=reduction, stage1_bridge=is_stage1)
+
+    def _forward_observation_flow(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        reduction: str,
+        stage1_bridge: bool,
+    ) -> tuple[Tensor, dict]:
+        """Compute the formal observation-conditioned flow loss for Stage 2 or its Stage-1 bridge."""
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -1941,12 +1993,23 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            objective=PI05TrainingObjective.OBSERVATION_FLOW,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
         valid_steps = _valid_action_steps(batch)
+        # Always overwrite the runtime denominator mask so a reused batch cannot retain an
+        # inpainting mask after the curriculum switches to full flow.
+        batch.pop("pi05_inpainting_mask", None)
+        batch[_PI05_LOSS_VALID_STEPS_KEY] = valid_steps
         loss, per_sample_loss, loss_per_dim = _reduce_action_losses(losses, valid_steps)
 
         loss_dict = {
@@ -1954,18 +2017,40 @@ class PI05Policy(PreTrainedPolicy):
             "valid_action_fraction": valid_steps.float().mean().item(),
             "all_padding_samples": float((~valid_steps.any(dim=1)).sum().item()),
         }
+        if stage1_bridge:
+            loss_dict.update(
+                {
+                    "stage1/bridge_active": 1.0,
+                    "stage1/observation_flow_loss": loss.detach().item(),
+                }
+            )
 
         if reduction == "none":
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
-        else:
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     def get_distributed_loss_normalizer(self, batch: dict[str, Tensor]) -> Tensor:
         """Return the local number of valid scalar loss terms for DDP reweighting."""
         valid_steps = _valid_action_steps(batch)
-        if self.config.training_stage == "next_action":
+        if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self._stage1_bridge_active:
+            # The bridge always optimizes every valid action step. Prefer the runtime phase over a
+            # temporary mask that may have been left on a deliberately reused inpainting batch.
+            valid_count = valid_steps.sum(dim=1)
+        elif _PI05_LOSS_VALID_STEPS_KEY in batch:
+            loss_valid_steps = batch[_PI05_LOSS_VALID_STEPS_KEY]
+            if not isinstance(loss_valid_steps, Tensor):
+                raise TypeError(
+                    f"{_PI05_LOSS_VALID_STEPS_KEY} must be a tensor, got {type(loss_valid_steps).__name__}"
+                )
+            if loss_valid_steps.shape != valid_steps.shape:
+                raise ValueError(
+                    f"{_PI05_LOSS_VALID_STEPS_KEY} must have shape {tuple(valid_steps.shape)}, "
+                    f"got {tuple(loss_valid_steps.shape)}"
+                )
+            valid_count = loss_valid_steps.to(dtype=torch.bool).sum(dim=1)
+        elif self.config.training_stage == PI05TrainingStage.NEXT_ACTION:
             if "pi05_inpainting_mask" in batch:
                 valid_count = batch["pi05_inpainting_mask"].to(dtype=torch.bool).sum(dim=1)
             elif self.config.next_action_full_mask_probability == 1.0:
@@ -1974,10 +2059,10 @@ class PI05Policy(PreTrainedPolicy):
                 # Before the first forward (or in standalone diagnostics), partial-mask objectives
                 # fall back to their fixed-size inpainting denominator.
                 valid_count = valid_steps.sum(dim=1).clamp(max=self.config.next_action_masked_steps)
-            action_dim = self.config.output_features[ACTION].shape[0]
-            return valid_count.sum(dtype=torch.float32) * action_dim
+        else:
+            valid_count = valid_steps.sum(dim=1)
         action_dim = self.config.output_features[ACTION].shape[0]
-        return valid_steps.sum(dtype=torch.float32) * action_dim
+        return valid_count.sum(dtype=torch.float32) * action_dim
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""

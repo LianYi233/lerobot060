@@ -46,6 +46,10 @@ class _FakeAccelerator:
     def end_training(self):
         self.end_training_calls += 1
 
+    def unwrap_model(self, policy, keep_fp32_wrapper=True):
+        assert keep_fp32_wrapper
+        return policy
+
 
 class _PartiallyVisibleAccelerator(_FakeAccelerator):
     num_processes = 2
@@ -97,10 +101,12 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.drop_n_last_frames == 0
     assert not pretrain_cfg.cabo_active
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
-    assert pretrain_cfg.steps == 500
+    assert pretrain_cfg.steps == 1_000
+    assert pretrain_cfg.policy.next_action_bridge_steps == 250
+    assert train_module._pi05_stage1_bridge_start_step(pretrain_cfg) == 750
     assert pretrain_cfg.output_dir == tmp_path / "flow_next_action_pretrain"
     assert pretrain_cfg.save_checkpoint
-    assert pretrain_cfg.save_freq == 500
+    assert pretrain_cfg.save_freq == 1_000
     assert not pretrain_cfg.save_checkpoint_to_hub
     assert not pretrain_cfg.policy.push_to_hub
     assert not pretrain_cfg.wandb.enable
@@ -122,8 +128,47 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.scheduler.num_decay_steps == 30_000
 
     assert train_module._pi05_next_action_pretrained_model_dir(pretrain_cfg) == (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "000500" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
+
+
+def test_stage1_bridge_boundary_and_training_progress_hook(tmp_path):
+    cfg = _make_flow_config(tmp_path)
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+    accelerator = _FakeAccelerator()
+
+    class ProgressAwarePolicy:
+        def __init__(self):
+            self.calls = []
+
+        def set_training_progress(self, *, step, total_steps):
+            self.calls.append((step, total_steps))
+
+    policy = ProgressAwarePolicy()
+    train_module._set_policy_training_progress(policy, accelerator, step=749, total_steps=1_000)
+    train_module._set_policy_training_progress(policy, accelerator, step=750, total_steps=1_000)
+
+    assert train_module._pi05_stage1_bridge_start_step(pretrain_cfg) == 750
+    assert policy.calls == [(749, 1_000), (750, 1_000)]
+
+
+def test_stage1_bridge_can_be_disabled_and_cannot_exceed_configured_stage(tmp_path):
+    cfg = _make_flow_config(tmp_path, next_action_bridge_steps=0)
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+    assert train_module._pi05_stage1_bridge_start_step(pretrain_cfg) is None
+
+    pretrain_cfg.policy.next_action_bridge_steps = 250
+    pretrain_cfg.steps = 249
+    with pytest.raises(ValueError, match="cannot exceed the Stage-1 training steps"):
+        train_module._pi05_stage1_bridge_start_step(pretrain_cfg)
+
+    invalid_integrated_cfg = _make_flow_config(
+        tmp_path,
+        next_action_pretrain_steps=249,
+        next_action_bridge_steps=250,
+    )
+    with pytest.raises(ValueError, match="cannot exceed next_action_pretrain_steps"):
+        train_module._make_pi05_next_action_pretraining_config(invalid_integrated_cfg)
 
 
 def test_flow_inpainting_sampler_keeps_episode_tail_anchors(tmp_path):
@@ -146,10 +191,11 @@ def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_
     cfg.validate()
     accelerator = _FakeAccelerator()
 
-    def fake_train_single_stage(stage_cfg, stage_accelerator):
+    def fake_train_single_stage(stage_cfg, stage_accelerator, *, enable_pi05_stage1_bridge=False):
         assert stage_accelerator is accelerator
         assert stage_cfg.policy.training_stage == "next_action"
         assert stage_cfg.save_freq == 1_200
+        assert enable_pi05_stage1_bridge
         train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(
             parents=True,
             exist_ok=True,
@@ -173,8 +219,8 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
         validate_calls.append(stage_cfg)
         return original_validate(stage_cfg)
 
-    def fake_train_single_stage(stage_cfg, stage_accelerator):
-        stages.append((stage_cfg, stage_accelerator))
+    def fake_train_single_stage(stage_cfg, stage_accelerator, *, enable_pi05_stage1_bridge=False):
+        stages.append((stage_cfg, stage_accelerator, enable_pi05_stage1_bridge))
         if stage_cfg.policy.training_stage == "next_action":
             train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(
                 parents=True,
@@ -187,8 +233,9 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     train_module.train(cfg, accelerator=accelerator)
 
     assert validate_calls == [cfg]
-    assert [stage_cfg.policy.training_stage for stage_cfg, _ in stages] == ["next_action", "flow"]
-    assert all(stage_accelerator is accelerator for _, stage_accelerator in stages)
+    assert [stage_cfg.policy.training_stage for stage_cfg, _, _ in stages] == ["next_action", "flow"]
+    assert all(stage_accelerator is accelerator for _, stage_accelerator, _ in stages)
+    assert [bridge_enabled for _, _, bridge_enabled in stages] == [True, False]
     assert stages[0][0] is not cfg
     assert not stages[0][0].cabo_active
     assert stages[0][0].optimizer is not cfg.optimizer
@@ -199,7 +246,7 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[1][0].save_checkpoint
     assert stages[1][0].save_freq == 3_000
     expected_model_dir = (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "000500" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
     assert cfg.policy.pretrained_path == expected_model_dir
     assert cfg.policy.pretrained_revision is None
@@ -233,8 +280,9 @@ def test_distributed_pretraining_requires_checkpoint_visible_to_every_rank(monke
     cfg.validate()
     accelerator = _PartiallyVisibleAccelerator()
 
-    def fake_train_single_stage(stage_cfg, stage_accelerator):
+    def fake_train_single_stage(stage_cfg, stage_accelerator, *, enable_pi05_stage1_bridge=False):
         assert stage_accelerator is accelerator
+        assert enable_pi05_stage1_bridge
         train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(
             parents=True,
             exist_ok=True,
