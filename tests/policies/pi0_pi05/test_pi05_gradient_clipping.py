@@ -33,7 +33,11 @@ def _make_module() -> nn.Module:
 
 
 def _make_policy_with_gradients(
-    *, action_gradient: float, vlm_gradient: float, action_head_grad_clip_ratio: float = 10.0
+    *,
+    action_gradient: float,
+    vlm_gradient: float,
+    action_head_grad_clip_ratio: float = 10.0,
+    clip_action_head_by_vlm: bool = True,
 ) -> tuple[SimpleNamespace, list[nn.Parameter], list[nn.Parameter]]:
     paligemma_with_expert = SimpleNamespace(
         paligemma=_make_module(),
@@ -58,9 +62,10 @@ def _make_policy_with_gradients(
     policy = SimpleNamespace(
         model=model,
         config=SimpleNamespace(
-            clip_action_head_by_vlm=True,
+            clip_action_head_by_vlm=clip_action_head_by_vlm,
             action_head_grad_clip_ratio=action_head_grad_clip_ratio,
             cabo_enabled=False,
+            training_stage="flow",
         ),
     )
 
@@ -79,7 +84,7 @@ def _gradient_rms(parameters: list[nn.Parameter]) -> float:
     return gradients.square().mean().sqrt().item()
 
 
-def test_pi05_optimizer_and_cabo_defaults():
+def test_pi05_optimizer_and_action_control_defaults():
     config = PI05Config()
     optimizer_config = config.get_optimizer_preset()
     scheduler = config.get_scheduler_preset()
@@ -102,10 +107,10 @@ def test_pi05_optimizer_and_cabo_defaults():
     assert scheduler.decay_lr == pytest.approx(1e-5)
     assert scheduler.num_warmup_steps == 1_000
     assert scheduler.num_decay_steps == 30_000
-    assert config.clip_action_head_by_vlm
+    assert not config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
-    assert config.cabo_enabled
-    assert config.cabo_active
+    assert not config.cabo_enabled
+    assert not config.cabo_active
     assert config.training_stage == "flow"
     assert config.next_action_masked_steps == 40
     assert config.next_action_full_mask_probability == pytest.approx(0.0)
@@ -122,6 +127,8 @@ def test_pi05_next_action_stage_disables_cabo_and_gradient_clipping():
     config = PI05Config(
         training_stage="next_action",
         optimizer_grad_clip_norm=42.0,
+        clip_action_head_by_vlm=True,
+        cabo_enabled=True,
     )
 
     assert config.cabo_enabled
@@ -204,6 +211,7 @@ def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
         args=[
             "--dataset.repo_id=user/repo",
             "--policy.type=pi05",
+            "--policy.cabo_enabled=true",
             "--policy.cabo_projection_update_ratio=3.5",
         ],
     )
@@ -318,6 +326,24 @@ def test_pi05_next_action_stage_disables_relative_gradient_clipping_hook():
 
     assert metrics["action_head_clip_applied"] == 0.0
     assert metrics["next_action/gradient_clip_disabled"] == 1.0
+    for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+
+def test_pi05_stage2_leaves_action_gradients_unrestricted_by_default():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+        clip_action_head_by_vlm=False,
+    )
+    action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics == {}
     for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
         assert torch.equal(parameter.grad, gradient_before)
     for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):

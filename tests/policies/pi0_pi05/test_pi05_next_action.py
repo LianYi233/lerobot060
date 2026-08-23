@@ -994,7 +994,13 @@ def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage
         rtol=0,
         atol=0,
     )
-    assert flow.config.cabo_active
+    assert not flow.config.cabo_active
+    assert not flow.config.clip_action_head_by_vlm
+    optimizer_parameters = flow.get_optim_params()
+    assert all(isinstance(parameter, nn.Parameter) for parameter in optimizer_parameters)
+    assert {id(parameter) for parameter in optimizer_parameters} == {
+        id(parameter) for parameter in flow.parameters() if parameter.requires_grad
+    }
     for name, parameter in flow.named_parameters():
         if name == "model.inpainting_visible_action_embedding.weight":
             assert not parameter.requires_grad

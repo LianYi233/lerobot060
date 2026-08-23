@@ -513,7 +513,7 @@ def _run_pi05_next_action_pretraining(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
-        "PI0.5 Stage 1 complete; rebuilding the model, optimizer, scheduler, and CABO state for "
+        "PI0.5 Stage 1 complete; rebuilding the model, optimizer, and scheduler for "
         "formal flow training with checkpoints every %d steps.",
         cfg.save_freq,
     )

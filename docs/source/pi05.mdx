@@ -82,7 +82,9 @@ embedding remains frozen, and no temporary prediction head is created or discard
 
 After Stage 1, Stage 2 rebuilds the policy and optimizer with the formal flow configuration and
 unfreezes the complete VLM, including the vision encoder, unless the user explicitly overrides the
-corresponding finetuning flags. Set `--policy.next_action_bridge_steps=0` to keep all Stage 1 updates
+corresponding finetuning flags. By default, the VLM and complete action path receive their ordinary
+AdamW updates independently: neither VLM-relative action-gradient clipping nor CABO learning-rate
+attenuation is active. Set `--policy.next_action_bridge_steps=0` to keep all Stage 1 updates
 action-only, or change it to adjust the bridge length; it must not exceed
 `next_action_pretrain_steps`. The bridge is enabled by the integrated two-stage run only, so a
 standalone `training_stage=next_action` invocation retains its original all-inpainting behavior.
@@ -118,13 +120,17 @@ boundary, but their state is not carried into Stage 2. During an integrated two-
 saves a checkpoint every 3,000 updates when checkpointing is enabled, and once more at the final
 update when the total step count is not divisible by 3,000.
 
-Without CABO, gradient clipping is policy-specific. The action-side gradient RMS is capped at 10
-times the VLM gradient RMS, and only action-side gradients are rescaled when that cap is exceeded.
-VLM gradients are left unchanged, and global gradient clipping is disabled. CABO is enabled by
-default and disables this action-gradient hook so that only the relative-update controller is active.
-Training checkpoints are saved every 10,000 steps by default and once more at the final step.
+Stage 2 does not constrain the action side using the VLM by default. Both
+`clip_action_head_by_vlm` and `cabo_enabled` default to `false`, while global gradient clipping is
+also disabled. Consequently the VLM, action expert, and action projections all use the full
+scheduled AdamW learning rate. The VLM-relative controllers below remain available as explicit,
+backwards-compatible opt-ins.
 
-PI0.5 also provides relative-update optimizer control (CABO). Before each AdamW step, CABO
+Setting `--policy.clip_action_head_by_vlm=true` caps the action-side gradient RMS at 10 times the
+VLM gradient RMS. Only action-side gradients are rescaled when that cap is exceeded; VLM gradients
+are left unchanged.
+
+PI0.5 also provides opt-in relative-update optimizer control (CABO). Before each AdamW step, CABO
 deterministically computes the candidate learning update for three parameter groups: VLM, action
 expert, and action projections. The VLM update remains at full scale. After an initial warmup, CABO
 only reduces the two action-side learning rates when their parameter-relative updates are too large
@@ -179,10 +185,10 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 | `optimizer_lr`                  | `2.5e-5` | Unified AdamW learning rate for VLM and action parameters   |
 | `scheduler_decay_lr`            | `1e-5`   | Learning-rate floor after cosine decay                      |
 | `save_freq`                     | `10000`  | Save every 10,000 steps and always save the final checkpoint |
-| `clip_action_head_by_vlm`       | `true`   | Enable the action-side RMS cap                              |
-| `action_head_grad_clip_ratio`   | `10.0`   | Enforce `action_rms <= 10 * vlm_rms`                        |
+| `clip_action_head_by_vlm`       | `false`  | Leave action gradients unrestricted by the VLM              |
+| `action_head_grad_clip_ratio`   | `10.0`   | RMS ratio used when the action-gradient cap is enabled      |
 | `optimizer_grad_clip_norm`      | `0.0`    | Disable global gradient clipping                            |
-| `cabo_enabled`                  | `true`   | Enable deterministic relative-update control                |
+| `cabo_enabled`                  | `false`  | Leave action learning rates unrestricted by the VLM         |
 | `cabo_expert_update_ratio`      | `2.0`    | Limit expert rate to this multiple of the VLM reference      |
 | `cabo_projection_update_ratio`  | `5.0`    | Limit projection rate to this multiple of the VLM reference  |
 | `cabo_vlm_update_ema_decay`     | `0.95`   | EMA decay used for the VLM relative-update reference         |
@@ -192,8 +198,8 @@ complete optimizer and scheduler step without advancing the CABO controller stat
 | `train_expert_only`             | `false`  | Do not freeze the VLM; train all parameters                 |
 
 **💡 Tip**: Setting `train_expert_only=true` freezes the VLM and trains only the action expert and
-projections, allowing finetuning with reduced memory usage. Because CABO needs trainable VLM
-parameters, also set `cabo_enabled=false` for expert-only training.
+projections, allowing finetuning with reduced memory usage. If CABO was explicitly enabled, disable
+it before using expert-only training because CABO requires trainable VLM parameters.
 
 If your dataset is not converted with `quantiles`, you can convert it with the following command:
 

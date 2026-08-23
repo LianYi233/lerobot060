@@ -126,22 +126,22 @@ class PI05Config(PreTrainedConfig):
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
-    # Global clipping is disabled for PI05. Its policy-specific hook clips only action-side gradients
-    # against the VLM gradient RMS and deliberately leaves VLM gradients unchanged.
+    # Global clipping is disabled for PI05. Stage 2 leaves the action side unrestricted by default;
+    # the two VLM-relative controllers below remain available as explicit opt-ins.
     optimizer_grad_clip_norm: float = 0.0
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:
     #     rms(g) = ||g||_2 / sqrt(number of gradient elements)
-    # The default ratio of 10.0 enforces action_rms <= 10 * vlm_rms.
-    clip_action_head_by_vlm: bool = True
+    # When explicitly enabled, the default ratio enforces action_rms <= 10 * vlm_rms.
+    clip_action_head_by_vlm: bool = False
     action_head_grad_clip_ratio: float = 10.0
 
     # Relative-update optimizer control (CABO). CABO deterministically computes the next AdamW
     # learning update for each parameter group, keeps the VLM update at full scale, and limits the
     # action expert/projection relative update rates against an EMA of the VLM relative update rate.
     # Weight decay is excluded from the measured learning rates so it is not mistaken for VLM signal.
-    cabo_enabled: bool = True
+    cabo_enabled: bool = False
     cabo_expert_update_ratio: float = 2.0
     cabo_projection_update_ratio: float = 5.0
     cabo_vlm_update_ema_decay: float = 0.95

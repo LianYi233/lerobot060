@@ -1700,7 +1700,7 @@ class PI05Policy(PreTrainedPolicy):
                 "action_head_clip_applied": 0.0,
                 "cabo/gradient_clip_disabled": 1.0,
             }
-        if not getattr(self.config, "clip_action_head_by_vlm", True):
+        if not getattr(self.config, "clip_action_head_by_vlm", False):
             return {}
 
         # Call the class helpers explicitly so the lightweight policy stand-ins used by optimizer

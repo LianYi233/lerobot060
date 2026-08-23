@@ -240,7 +240,8 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert not stages[0][0].cabo_active
     assert stages[0][0].optimizer is not cfg.optimizer
     assert stages[1][0] is cfg
-    assert stages[1][0].cabo_active
+    assert not stages[1][0].cabo_active
+    assert not stages[1][0].policy.clip_action_head_by_vlm
     assert not stages[1][0].policy.train_expert_only
     assert not stages[1][0].policy.freeze_vision_encoder
     assert stages[1][0].save_checkpoint
