@@ -97,10 +97,10 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.drop_n_last_frames == 0
     assert not pretrain_cfg.cabo_active
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
-    assert pretrain_cfg.steps == 500
+    assert pretrain_cfg.steps == 1_000
     assert pretrain_cfg.output_dir == tmp_path / "flow_next_action_pretrain"
     assert pretrain_cfg.save_checkpoint
-    assert pretrain_cfg.save_freq == 500
+    assert pretrain_cfg.save_freq == 1_000
     assert not pretrain_cfg.save_checkpoint_to_hub
     assert not pretrain_cfg.policy.push_to_hub
     assert not pretrain_cfg.wandb.enable
@@ -122,7 +122,7 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.scheduler.num_decay_steps == 30_000
 
     assert train_module._pi05_next_action_pretrained_model_dir(pretrain_cfg) == (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "000500" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
 
 
@@ -159,7 +159,10 @@ def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_
 
     train_module._run_pi05_next_action_pretraining(cfg, accelerator)
 
-    assert cfg.save_freq == 3_000
+    assert cfg.steps == 3_000
+    assert cfg.save_freq == 500
+    assert not cfg.policy.cabo_enabled
+    assert not cfg.policy.clip_action_head_by_vlm
 
 
 def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeypatch, tmp_path):
@@ -190,16 +193,20 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert [stage_cfg.policy.training_stage for stage_cfg, _ in stages] == ["next_action", "flow"]
     assert all(stage_accelerator is accelerator for _, stage_accelerator in stages)
     assert stages[0][0] is not cfg
+    assert stages[0][0].steps == 1_000
     assert not stages[0][0].cabo_active
     assert stages[0][0].optimizer is not cfg.optimizer
     assert stages[1][0] is cfg
-    assert stages[1][0].cabo_active
+    assert not stages[1][0].policy.cabo_enabled
+    assert not stages[1][0].cabo_active
+    assert not stages[1][0].policy.clip_action_head_by_vlm
     assert not stages[1][0].policy.train_expert_only
     assert not stages[1][0].policy.freeze_vision_encoder
     assert stages[1][0].save_checkpoint
-    assert stages[1][0].save_freq == 3_000
+    assert stages[1][0].steps == 3_000
+    assert stages[1][0].save_freq == 500
     expected_model_dir = (
-        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "000500" / "pretrained_model"
+        tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )
     assert cfg.policy.pretrained_path == expected_model_dir
     assert cfg.policy.pretrained_revision is None
@@ -223,6 +230,10 @@ def test_zero_pretraining_steps_runs_only_flow(monkeypatch, tmp_path):
     train_module.train(cfg, accelerator=accelerator)
 
     assert [stage_cfg.policy.training_stage for stage_cfg, _ in stages] == ["flow"]
+    assert stages[0][0].policy.cabo_enabled
+    assert stages[0][0].cabo_active
+    assert stages[0][0].policy.clip_action_head_by_vlm
+    assert stages[0][0].steps == 123
     assert stages[0][0].save_freq == 10_000
     assert accelerator.free_memory_calls == 0
     assert accelerator.end_training_calls == 1

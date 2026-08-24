@@ -63,7 +63,7 @@ class PI05Config(PreTrainedConfig):
     next_action_full_mask_probability: float = 0.0
     # Number of action-only flow steps automatically run before a flow-training invocation. Set to 0
     # to start flow training immediately. This is orchestration metadata and does not alter either loss.
-    next_action_pretrain_steps: int = 500
+    next_action_pretrain_steps: int = 1_000
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32

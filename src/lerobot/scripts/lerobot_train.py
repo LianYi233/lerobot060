@@ -76,7 +76,8 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 _PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
-_PI05_STAGE2_SAVE_FREQ = 3_000
+_PI05_STAGE2_STEPS = 3_000
+_PI05_STAGE2_SAVE_FREQ = 500
 
 
 @torch.no_grad()
@@ -473,14 +474,22 @@ def _run_pi05_next_action_pretraining(
     accelerator.free_memory()
     cfg.policy.pretrained_path = pretrained_model_dir
     cfg.policy.pretrained_revision = None
-    # Stage 1 keeps only its final transfer checkpoint. Once it succeeds, persist the formal
-    # observation-conditioned flow stage at a finer, fixed cadence (plus the existing final save).
+    # Stage 1 keeps only its final transfer checkpoint. For the current Stage 2 experiment, train the
+    # action side without either VLM-referenced limiter: disabling CABO alone would reactivate the
+    # fallback action-gradient RMS cap, so both controls must be disabled together.
+    cfg.policy.cabo_enabled = False
+    cfg.policy.clip_action_head_by_vlm = False
+    # Run the formal observation-conditioned flow stage for the fixed experimental duration and
+    # persist it at a finer cadence (plus the existing final save).
+    cfg.steps = _PI05_STAGE2_STEPS
     cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
         "PI0.5 action-only flow pretraining complete; rebuilding the model, optimizer, scheduler, "
-        "and CABO state for formal flow training with checkpoints every %d steps.",
+        "and training state for formal flow training without VLM-referenced action constraints and "
+        "running for %d steps with checkpoints every %d steps.",
+        cfg.steps,
         cfg.save_freq,
     )
 
@@ -514,14 +523,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
+        if _pi05_next_action_pretraining_active(cfg):
+            _run_pi05_next_action_pretraining(cfg, accelerator)
+
+        # Integrated PI0.5 Stage 2 disables CABO during the transition above, so check the effective
+        # formal-stage configuration rather than the pre-transition defaults.
         if cfg.cabo_active and accelerator.distributed_type == DistributedType.FSDP:
             raise NotImplementedError(
                 "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
                 "sharding is not yet supported."
             )
-
-        if _pi05_next_action_pretraining_active(cfg):
-            _run_pi05_next_action_pretraining(cfg, accelerator)
 
         return _train_single_stage(cfg, accelerator)
     finally:

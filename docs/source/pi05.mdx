@@ -69,8 +69,8 @@ lerobot-train \
     --batch_size=32
 ```
 
-By default, a fresh flow run first performs 500 action-only flow-inpainting updates, then performs
-the requested `--steps` observation-conditioned flow updates. For a complete 50-action chunk,
+By default, a fresh integrated flow run first performs 1,000 action-only flow-inpainting updates,
+then performs 3,000 observation-conditioned flow updates. For a complete 50-action chunk,
 Stage 1 randomly masks 40 valid positions without replacement, keeps 10 clean actions as
 bidirectional context, and predicts flow velocity only at the masked positions. If a padded chunk
 has fewer than 40 valid positions, all of its valid positions are masked. Stage 1 trains the complete
@@ -80,7 +80,8 @@ discarded. After Stage 1, Stage 2 rebuilds the policy with the observation-condi
 configuration and unfreezes the complete VLM, including the vision encoder, unless the user
 explicitly overrides the corresponding finetuning flags.
 
-Set `--policy.next_action_pretrain_steps=0` to skip Stage 1. The compatibility name
+Set `--policy.next_action_pretrain_steps=0` to skip Stage 1; standalone flow runs continue to honor
+the requested `--steps` value. The compatibility name
 `training_stage=next_action` now denotes action-only flow inpainting rather than the former 25-to-25
 MSE regression objective. The mask size and optional full-mask fraction can be changed with
 `--policy.next_action_masked_steps` and `--policy.next_action_full_mask_probability`.
@@ -104,8 +105,11 @@ parameters. After warmup, the learning rate follows a cosine decay from `2.5e-5`
 `1e-5`. Loading or resuming a checkpoint preserves the optimizer values saved in that checkpoint.
 The integrated Stage 1 uses a fixed `2.5e-5` peak learning rate and `1e-5` decay floor, matching the
 fresh Stage 2 defaults. Its optimizer state is not carried into Stage 2. During an integrated
-two-stage run, Stage 2 saves a checkpoint every 3,000 updates when checkpointing is enabled, and
-once more at the final update when the total step count is not divisible by 3,000.
+two-stage run, Stage 2 runs for 3,000 updates and saves a checkpoint every 500 updates when
+checkpointing is enabled. For the current Stage 2 experiment, both VLM-referenced action constraints
+are temporarily disabled: CABO does not attenuate action-side optimizer updates, and the fallback
+action-gradient RMS cap is also off. These overrides are limited to the automatic Stage 1-to-Stage 2
+transition; standalone flow runs retain their configured values.
 
 Without CABO, gradient clipping is policy-specific. The action-side gradient RMS is capped at 10
 times the VLM gradient RMS, and only action-side gradients are rescaled when that cap is exceeded.

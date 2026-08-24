@@ -324,6 +324,25 @@ def test_pi05_next_action_stage_disables_relative_gradient_clipping_hook():
         assert torch.equal(parameter.grad, gradient_before)
 
 
+def test_pi05_disabled_vlm_action_constraints_leave_all_gradients_unchanged():
+    policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
+        action_gradient=20.0,
+        vlm_gradient=1.0,
+    )
+    policy.config.cabo_enabled = False
+    policy.config.clip_action_head_by_vlm = False
+    action_gradients_before = [parameter.grad.clone() for parameter in action_parameters]
+    vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+
+    metrics = PI05Policy.clip_gradients(policy)
+
+    assert metrics == {}
+    for parameter, gradient_before in zip(action_parameters, action_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+    for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
+        assert torch.equal(parameter.grad, gradient_before)
+
+
 def test_pi05_leaves_action_gradient_below_ten_times_vlm_rms_unchanged():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
         action_gradient=6.0,
