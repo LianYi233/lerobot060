@@ -465,8 +465,6 @@ def create_libero_envs(
     if task_ids_filter is not None:
         print(f"Restricting to task_ids={task_ids_filter}")
 
-    is_async = env_cls is gym.vector.AsyncVectorEnv
-
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for suite_name in suite_names:
         suite = _get_suite(suite_name)
@@ -477,11 +475,13 @@ def create_libero_envs(
 
         # All tasks in a suite share identical observation/action spaces.
         # Probe once and reuse to avoid creating a temp env per task.
+        # Always lazy-wrap: LIBERO-plus has ~10k tasks and SyncVectorEnv would
+        # otherwise construct every MuJoCo/EGL env up front (OOM).
         cached_obs_space: spaces.Space | None = None
         cached_act_space: spaces.Space | None = None
         cached_metadata: dict[str, Any] | None = None
 
-        for tid in selected:
+        for i, tid in enumerate(selected):
             fns = _make_env_fns(
                 suite=suite,
                 episode_length=episode_length,
@@ -495,15 +495,22 @@ def create_libero_envs(
                 camera_name_mapping=camera_name_mapping,
                 is_libero_plus=is_libero_plus,
             )
-            if is_async:
-                lazy = _LazyAsyncVectorEnv(fns, cached_obs_space, cached_act_space, cached_metadata)
-                if cached_obs_space is None:
-                    cached_obs_space = lazy.observation_space
-                    cached_act_space = lazy.action_space
-                    cached_metadata = lazy.metadata
-                out[suite_name][tid] = lazy
-            else:
-                out[suite_name][tid] = env_cls(fns)
-            print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+            lazy = _LazyAsyncVectorEnv(
+                fns,
+                cached_obs_space,
+                cached_act_space,
+                cached_metadata,
+                vec_env_cls=env_cls,
+            )
+            if cached_obs_space is None:
+                cached_obs_space = lazy.observation_space
+                cached_act_space = lazy.action_space
+                cached_metadata = lazy.metadata
+            out[suite_name][tid] = lazy
+            if i == 0 or i + 1 == len(selected) or (i + 1) % 100 == 0:
+                print(
+                    f"Built lazy vec env | suite={suite_name} | task_id={tid} "
+                    f"| {i + 1}/{len(selected)} | n_envs={n_envs}"
+                )
 
     return {suite: dict(task_map) for suite, task_map in out.items()}

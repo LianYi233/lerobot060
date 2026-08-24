@@ -178,13 +178,17 @@ def _sub_env_has_attr(env: gym.vector.VectorEnv, attr: str) -> bool:
 
 
 class _LazyAsyncVectorEnv:
-    """Defers AsyncVectorEnv creation until first use.
+    """Defers vector-env creation until first use.
 
-    Creating all tasks' AsyncVectorEnvs upfront spawns N_tasks × n_envs worker
-    processes, all of which allocate EGL/GPU resources immediately. Since tasks
-    are evaluated sequentially, only one task's workers need to be alive at a
-    time. This wrapper stores the factory functions and creates the real
-    AsyncVectorEnv on first reset()/step()/call(), keeping peak process count = n_envs.
+    Creating all tasks' VectorEnvs upfront instantiates N_tasks × n_envs simulators
+    (and, for AsyncVectorEnv, worker processes), all of which allocate EGL/GPU
+    resources immediately. Since tasks are evaluated sequentially, only one task's
+    workers need to be alive at a time. This wrapper stores the factory functions
+    and creates the real VectorEnv on first reset()/step()/call().
+
+    ``vec_env_cls`` defaults to ``gym.vector.AsyncVectorEnv``. Pass
+    ``gym.vector.SyncVectorEnv`` when ``n_envs==1`` so LIBERO-plus (~10k tasks)
+    does not construct every MuJoCo env during ``make_env``.
     """
 
     def __init__(
@@ -193,9 +197,11 @@ class _LazyAsyncVectorEnv:
         observation_space=None,
         action_space=None,
         metadata=None,
+        vec_env_cls: Callable | None = None,
     ):
         self._env_fns = env_fns
-        self._env: gym.vector.AsyncVectorEnv | None = None
+        self._vec_env_cls = vec_env_cls or gym.vector.AsyncVectorEnv
+        self._env: gym.vector.VectorEnv | None = None
         self.num_envs = len(env_fns)
         if observation_space is not None and action_space is not None and metadata is not None:
             self.observation_space = observation_space
@@ -212,7 +218,10 @@ class _LazyAsyncVectorEnv:
 
     def _ensure(self) -> None:
         if self._env is None:
-            self._env = gym.vector.AsyncVectorEnv(self._env_fns, context="forkserver", shared_memory=True)
+            if self._vec_env_cls is gym.vector.AsyncVectorEnv:
+                self._env = gym.vector.AsyncVectorEnv(self._env_fns, context="forkserver", shared_memory=True)
+            else:
+                self._env = self._vec_env_cls(self._env_fns)
 
     @property
     def unwrapped(self):
@@ -233,6 +242,10 @@ class _LazyAsyncVectorEnv:
     def get_attr(self, name):
         self._ensure()
         return self._env.get_attr(name)
+
+    def render(self):
+        self._ensure()
+        return self._env.render()
 
     def close(self) -> None:
         if self._env is not None:
