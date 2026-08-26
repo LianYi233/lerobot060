@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 
-"""Memory-safe VLM/action task-effective-dimension diagnostic for PI0.5.
+"""Memory-safe multi-seed VLM/action task-effective-dimension diagnostic for PI0.5.
 
 The script estimates a task-conditioned empirical tangent/Fisher kernel for the
 VLM and action pathway under the same observation-conditioned VLA objective.
-To keep memory bounded on multi-billion-parameter PI0.5 models, samples are
-processed one at a time. For each sample, the VLM and action gradients are
-immediately CountSketched and then released before the next sample is loaded.
+Samples are processed one at a time so peak memory stays bounded on multi-billion-
+parameter PI0.5 models. For each sample, the VLM and action gradients are immediately
+CountSketched and released before the next sample is loaded.
 
-This is a practical scalar-loss tangent-kernel proxy, not the exact vector-output
-NTK. The main paper-facing statistics are spectral effective rank, participation
-ratio, d90, and Action/VLM ratios of those quantities.
+A single invocation evaluates multiple independent flow-noise/timestep seeds on the
+same fixed LIBERO sample set and reports per-seed spectra plus aggregate mean/std.
+This is a practical scalar-loss tangent-kernel proxy, not the exact vector-output NTK.
+The main paper-facing statistics are spectral effective rank, participation ratio,
+d90, and Action/VLM ratios of those quantities.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import argparse
 import gc
 import json
 import math
+import statistics
 from pathlib import Path
 
 import torch
@@ -156,6 +159,16 @@ def _gradient_sketch_for_group(
     return sketch
 
 
+def _sample_flow_seed(run_seed: int, sample_index: int) -> int:
+    """Create independent, reproducible per-sample RNG streams for each outer seed.
+
+    Using seed + sample_index makes adjacent outer runs share almost every RNG seed
+    (e.g. run 0 uses 0..31 and run 1 uses 1..32).  A large odd stride removes that
+    artificial overlap while retaining deterministic reproducibility.
+    """
+    return int(run_seed * 1_000_003 + sample_index)
+
+
 def analyze_streaming(
     policy: PI05Policy,
     dataloader,
@@ -184,7 +197,6 @@ def analyze_streaming(
     vlm_rows: list[torch.Tensor] = []
     action_rows: list[torch.Tensor] = []
     losses: list[float] = []
-    loss_metadata: dict[str, object] = {}
 
     try:
         policy.config.training_stage = PI05TrainingStage.FLOW
@@ -194,8 +206,7 @@ def analyze_streaming(
 
         iterator = iter(dataloader)
         for sample_index in range(num_samples):
-            # Keep flow noise/time reproducible per sample and identical for both module groups.
-            sample_seed = seed + sample_index
+            sample_seed = _sample_flow_seed(seed, sample_index)
             torch.manual_seed(sample_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(sample_seed)
@@ -208,7 +219,7 @@ def analyze_streaming(
                 ) from exc
 
             batch = _prepare_one_batch(batch, dataset, preprocessor)
-            per_sample_loss, current_metadata = policy.forward(batch, reduction="none")
+            per_sample_loss, _ = policy.forward(batch, reduction="none")
             if per_sample_loss.numel() != 1:
                 raise RuntimeError(
                     "Memory-safe NTK diagnostic expects DataLoader batch_size=1; "
@@ -216,9 +227,7 @@ def analyze_streaming(
                 )
             loss = per_sample_loss.reshape(())
             losses.append(float(loss.detach().item()))
-            loss_metadata = current_metadata
 
-            # VLM gradient first, retaining only this single-sample graph for the action pass.
             vlm_rows.append(
                 _gradient_sketch_for_group(
                     loss,
@@ -238,11 +247,14 @@ def analyze_streaming(
                 )
             )
 
-            del loss, per_sample_loss, batch, current_metadata
+            del loss, per_sample_loss, batch
             gc.collect()
             if str(device).startswith("cuda"):
                 torch.cuda.empty_cache()
-            print(f"[NTK gap] processed sample {sample_index + 1}/{num_samples}", flush=True)
+            print(
+                f"[NTK gap][seed {seed}] processed sample {sample_index + 1}/{num_samples}",
+                flush=True,
+            )
 
         vlm_sketches = torch.stack(vlm_rows, dim=0)
         action_sketches = torch.stack(action_rows, dim=0)
@@ -260,22 +272,16 @@ def analyze_streaming(
             "kernel_trace_ratio_action_over_vlm": float(action["trace"] / (vlm["trace"] + eps)),
         }
         return {
-            "method": "streaming task-conditioned empirical tangent kernel with deterministic CountSketch",
-            "note": (
-                "Scalar-loss tangent/Fisher-kernel proxy; not the exact vector-output NTK. "
-                "Use spectral-shape metrics as the primary complexity comparison."
-            ),
+            "seed": seed,
             "num_samples": num_samples,
             "sketch_dim": sketch_dim,
             "energy_threshold": energy_threshold,
-            "seed": seed,
             "mean_vla_loss": float(sum(losses) / len(losses)),
             "vlm_num_parameters": int(sum(p.numel() for p in vlm_parameters)),
             "action_num_parameters": int(sum(p.numel() for p in action_parameters)),
             "vlm": vlm,
             "action": action,
             "gap": gap,
-            "loss_metadata": loss_metadata,
         }
     finally:
         policy.config.training_stage = original_stage
@@ -287,21 +293,73 @@ def analyze_streaming(
             torch.cuda.empty_cache()
 
 
+def _mean_std(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"mean": float("nan"), "std": float("nan")}
+    return {
+        "mean": float(statistics.mean(values)),
+        "std": float(statistics.stdev(values)) if len(values) > 1 else 0.0,
+    }
+
+
+def _aggregate_results(results: list[dict[str, object]]) -> dict[str, object]:
+    vlm_erank = [float(r["vlm"]["effective_rank"]) for r in results]
+    action_erank = [float(r["action"]["effective_rank"]) for r in results]
+    gap_erank = [float(r["gap"]["effective_rank_ratio_action_over_vlm"]) for r in results]
+
+    vlm_pr = [float(r["vlm"]["participation_ratio"]) for r in results]
+    action_pr = [float(r["action"]["participation_ratio"]) for r in results]
+    gap_pr = [float(r["gap"]["participation_ratio_action_over_vlm"]) for r in results]
+
+    vlm_d90 = [float(r["vlm"]["d90"]) for r in results]
+    action_d90 = [float(r["action"]["d90"]) for r in results]
+    gap_d90 = [float(r["gap"]["d90_ratio_action_over_vlm"]) for r in results]
+
+    trace_ratio = [float(r["gap"]["kernel_trace_ratio_action_over_vlm"]) for r in results]
+    mean_loss = [float(r["mean_vla_loss"]) for r in results]
+
+    return {
+        "vlm": {
+            "effective_rank": _mean_std(vlm_erank),
+            "participation_ratio": _mean_std(vlm_pr),
+            "d90": _mean_std(vlm_d90),
+        },
+        "action": {
+            "effective_rank": _mean_std(action_erank),
+            "participation_ratio": _mean_std(action_pr),
+            "d90": _mean_std(action_d90),
+        },
+        "gap": {
+            "effective_rank_ratio_action_over_vlm": _mean_std(gap_erank),
+            "participation_ratio_action_over_vlm": _mean_std(gap_pr),
+            "d90_ratio_action_over_vlm": _mean_std(gap_d90),
+            "kernel_trace_ratio_action_over_vlm": _mean_std(trace_ratio),
+            "fraction_seeds_effective_rank_ratio_gt_1": float(
+                sum(value > 1.0 for value in gap_erank) / len(gap_erank)
+            ),
+            "fraction_seeds_d90_ratio_gt_1": float(
+                sum(value > 1.0 for value in gap_d90) / len(gap_d90)
+            ),
+        },
+        "mean_vla_loss": _mean_std(mean_loss),
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy-path", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--dataset-repo-id", default="libero")
     parser.add_argument("--video-backend", default="pyav")
-    # Kept for CLI compatibility; the diagnostic intentionally forces microbatch=1.
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--num-samples", type=int, default=32)
+    parser.add_argument("--num-seeds", type=int, default=10)
+    parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument("--sketch-dim", type=int, default=256)
     parser.add_argument("--sketch-chunk-size", type=int, default=250_000)
     parser.add_argument("--energy-threshold", type=float, default=0.90)
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output", type=Path, default=Path("ntk_gap.json"))
+    parser.add_argument("--output", type=Path, default=Path("ntk_gap_multiseed.json"))
     return parser.parse_args()
 
 
@@ -309,6 +367,8 @@ def main() -> None:
     args = _parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
+    if args.num_seeds < 1:
+        raise ValueError("num-seeds must be >= 1")
     if args.batch_size != 1:
         print(
             f"[NTK gap] ignoring --batch-size={args.batch_size}; using batch_size=1 to bound memory.",
@@ -323,8 +383,6 @@ def main() -> None:
     config.train_expert_only = False
     config.freeze_vision_encoder = False
     config.compile_model = False
-    # Keep checkpointing off here because the diagnostic uses autograd.grad over explicit
-    # parameter lists; streaming batch_size=1 is the primary memory-control mechanism.
     config.gradient_checkpointing = False
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
@@ -369,31 +427,84 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    result = analyze_streaming(
-        policy,
-        dataloader,
-        dataset,
-        preprocessor,
-        num_samples=args.num_samples,
-        sketch_dim=args.sketch_dim,
-        chunk_size=args.sketch_chunk_size,
-        energy_threshold=args.energy_threshold,
-        seed=args.seed,
-        device=args.device,
+    seeds = list(range(args.seed_start, args.seed_start + args.num_seeds))
+    per_seed_results: list[dict[str, object]] = []
+
+    print(
+        f"[NTK gap] running {len(seeds)} seeds x {args.num_samples} fixed samples "
+        f"(seeds={seeds[0]}..{seeds[-1]})",
+        flush=True,
     )
+
+    for run_index, seed in enumerate(seeds, start=1):
+        print(f"\n[NTK gap] === seed {seed} ({run_index}/{len(seeds)}) ===", flush=True)
+        result = analyze_streaming(
+            policy,
+            dataloader,
+            dataset,
+            preprocessor,
+            num_samples=args.num_samples,
+            sketch_dim=args.sketch_dim,
+            chunk_size=args.sketch_chunk_size,
+            energy_threshold=args.energy_threshold,
+            seed=seed,
+            device=args.device,
+        )
+        per_seed_results.append(result)
+        print(
+            f"[NTK gap][seed {seed}] VLM erank={result['vlm']['effective_rank']:.3f}, "
+            f"Action erank={result['action']['effective_rank']:.3f}, "
+            f"ratio={result['gap']['effective_rank_ratio_action_over_vlm']:.3f}; "
+            f"d90={result['vlm']['d90']}->{result['action']['d90']}",
+            flush=True,
+        )
+
+    aggregate = _aggregate_results(per_seed_results)
+    output = {
+        "method": "multi-seed streaming task-conditioned empirical tangent kernel with deterministic CountSketch",
+        "note": (
+            "Scalar-loss tangent/Fisher-kernel proxy; not the exact vector-output NTK. "
+            "All seeds use the same fixed LIBERO samples; only flow noise/timestep RNG streams differ. "
+            "Use aggregate spectral-shape statistics as the primary complexity comparison."
+        ),
+        "num_samples": args.num_samples,
+        "num_seeds": args.num_seeds,
+        "seeds": seeds,
+        "sketch_dim": args.sketch_dim,
+        "energy_threshold": args.energy_threshold,
+        "aggregate": aggregate,
+        "per_seed": per_seed_results,
+    }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    args.output.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
 
-    print("\n=== PI0.5 Cross-Module Task Complexity Gap ===")
-    print(f"VLM    effective_rank={result['vlm']['effective_rank']:.3f}  d90={result['vlm']['d90']}")
-    print(f"Action effective_rank={result['action']['effective_rank']:.3f}  d90={result['action']['d90']}")
+    vlm_er = aggregate["vlm"]["effective_rank"]
+    action_er = aggregate["action"]["effective_rank"]
+    gap_er = aggregate["gap"]["effective_rank_ratio_action_over_vlm"]
+    vlm_d90 = aggregate["vlm"]["d90"]
+    action_d90 = aggregate["action"]["d90"]
+    gap_d90 = aggregate["gap"]["d90_ratio_action_over_vlm"]
+
+    print("\n=== PI0.5 Cross-Module Task Complexity Gap: Multi-seed Summary ===")
     print(
-        "Gap    effective_rank(Action/VLM)="
-        f"{result['gap']['effective_rank_ratio_action_over_vlm']:.3f}, "
-        f"d90(Action/VLM)={result['gap']['d90_ratio_action_over_vlm']:.3f}"
+        f"VLM    effective_rank={vlm_er['mean']:.3f} +/- {vlm_er['std']:.3f}  "
+        f"d90={vlm_d90['mean']:.2f} +/- {vlm_d90['std']:.2f}"
     )
-    print(f"Saved full spectrum to: {args.output}")
+    print(
+        f"Action effective_rank={action_er['mean']:.3f} +/- {action_er['std']:.3f}  "
+        f"d90={action_d90['mean']:.2f} +/- {action_d90['std']:.2f}"
+    )
+    print(
+        f"Gap    effective_rank(Action/VLM)={gap_er['mean']:.3f} +/- {gap_er['std']:.3f}, "
+        f"d90(Action/VLM)={gap_d90['mean']:.3f} +/- {gap_d90['std']:.3f}"
+    )
+    print(
+        "Gap>1 fraction: effective_rank="
+        f"{aggregate['gap']['fraction_seeds_effective_rank_ratio_gt_1']:.2%}, "
+        f"d90={aggregate['gap']['fraction_seeds_d90_ratio_gt_1']:.2%}"
+    )
+    print(f"Saved per-seed spectra and aggregate statistics to: {args.output}")
 
 
 if __name__ == "__main__":
