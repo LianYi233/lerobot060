@@ -58,6 +58,7 @@ from pathlib import Path
 
 import torch
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
@@ -319,9 +320,15 @@ def main() -> None:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
 
-    # Load the checkpoint config, but probe both modules as trainable under the
-    # formal observation-conditioned objective.  This does not alter saved weights.
-    config = PI05Config.from_pretrained(args.policy_path, local_files_only=True)
+    # Load through the registered base config so draccus can consume the serialized
+    # discriminator field ("type": "pi05") and dispatch to PI05Config. Calling
+    # PI05Config.from_pretrained directly makes draccus treat "type" as an invalid
+    # PI05Config dataclass field for checkpoints written by LeRobot.
+    config = PreTrainedConfig.from_pretrained(args.policy_path, local_files_only=True)
+    if not isinstance(config, PI05Config):
+        raise TypeError(
+            f"Expected a PI05Config at {args.policy_path}, got {type(config).__name__}"
+        )
     config.device = args.device
     config.training_stage = PI05TrainingStage.FLOW
     config.train_expert_only = False
