@@ -1,57 +1,22 @@
 #!/usr/bin/env python
 
-"""Measure the VLM/action task-effective dimension gap in PI0.5.
+"""Memory-safe VLM/action task-effective-dimension diagnostic for PI0.5.
 
-This is a lightweight, paper-motivation diagnostic rather than a training script.
-It loads one PI0.5 checkpoint and one small LIBERO batch, computes a task-conditioned
-empirical tangent-kernel proxy for the VLM and action pathway separately, and reports
-spectral effective dimensions.
+The script estimates a task-conditioned empirical tangent/Fisher kernel for the
+VLM and action pathway under the same observation-conditioned VLA objective.
+To keep memory bounded on multi-billion-parameter PI0.5 models, samples are
+processed one at a time. For each sample, the VLM and action gradients are
+immediately CountSketched and then released before the next sample is loaded.
 
-Why a proxy instead of the exact NTK?
--------------------------------------
-The exact vector-output NTK of a multi-billion-parameter VLA is prohibitively large.
-For a scalar per-sample VLA loss l_i, we use the gradient feature
-
-    g_i^m = d l_i / d theta_m,
-
-for module m in {VLM, Action}.  The Gram matrix
-
-    K_m[i,j] = <g_i^m, g_j^m>
-
-is a task-conditioned empirical tangent/Fisher kernel.  We preserve its pairwise
-inner products approximately with a deterministic CountSketch before forming K_m.
-The resulting spectrum is suitable for comparing *relative downstream adaptation
-complexity* between the two modules on the same data and objective.
-
-Recommended paper use
----------------------
-Run this at the same initialization/checkpoint for both modules and report:
-  * spectral effective rank (entropy rank),
-  * participation ratio,
-  * d90: number of eigenmodes explaining 90% spectral mass,
-  * Action/VLM ratios for the above quantities.
-
-A gap > 1 means that, under the same downstream VLA objective, the action pathway
-uses a higher-dimensional task-conditioned tangent space than the VLM.
-
-Example
--------
-python -m lerobot.scripts.lerobot_ntk_gap \
-  --policy-path /data/models/lerobot/pi05_libero_base \
-  --dataset-root /data/datasets/libero \
-  --dataset-repo-id libero \
-  --batch-size 4 \
-  --sketch-dim 256 \
-  --video-backend pyav \
-  --output /data/wyn/ntk_gap/pi05_base.json
-
-For a clean motivation experiment, use a single GPU and disable torch.compile in
-any surrounding training process.  This script does not modify model weights.
+This is a practical scalar-loss tangent-kernel proxy, not the exact vector-output
+NTK. The main paper-facing statistics are spectral effective rank, participation
+ratio, d90, and Action/VLM ratios of those quantities.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 from pathlib import Path
@@ -59,14 +24,13 @@ from pathlib import Path
 import torch
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION
 
 
 def _unique_parameters(modules: list[torch.nn.Module]) -> list[torch.nn.Parameter]:
@@ -89,21 +53,13 @@ def _countsketch_gradients(
     sketch_dim: int,
     chunk_size: int,
 ) -> torch.Tensor:
-    """Deterministically CountSketch one flattened module gradient.
-
-    CountSketch gives an unbiased inner-product estimator while avoiding a dense
-    [num_parameters, sketch_dim] random projection.  The implementation hashes
-    each flattened gradient element into one bucket with one deterministic sign.
-    """
+    """CountSketch one flattened module gradient without a dense projection."""
     if sketch_dim <= 0:
         raise ValueError(f"sketch_dim must be > 0, got {sketch_dim}")
 
     device = next((g.device for g in gradients if g is not None), parameters[0].device)
     sketch = torch.zeros(sketch_dim, device=device, dtype=torch.float32)
     global_offset = 0
-
-    # Fixed integer hash constants.  We use element index + global parameter offset
-    # so the same virtual random projection is reused for every sample.
     hash_a = 1_103_515_245
     hash_b = 12_345
     sign_a = 2_654_435_761
@@ -112,29 +68,28 @@ def _countsketch_gradients(
     for parameter, gradient in zip(parameters, gradients, strict=True):
         numel = parameter.numel()
         if gradient is not None:
-            flat = gradient.detach().reshape(-1).to(dtype=torch.float32)
+            flat = gradient.detach().reshape(-1)
             for start in range(0, numel, chunk_size):
                 end = min(start + chunk_size, numel)
                 local = torch.arange(start, end, device=device, dtype=torch.int64)
                 absolute = local + global_offset
-                # Keep arithmetic in signed int64 range.
                 mixed = (absolute * hash_a + hash_b) & mask63
                 buckets = torch.remainder(mixed, sketch_dim)
                 sign_bits = ((absolute * sign_a + hash_b) & mask63) & 1
                 signs = sign_bits.to(torch.float32).mul_(2.0).sub_(1.0)
-                sketch.scatter_add_(0, buckets, flat[start:end] * signs)
+                values = flat[start:end].to(dtype=torch.float32)
+                sketch.scatter_add_(0, buckets, values * signs)
+                del local, absolute, mixed, buckets, sign_bits, signs, values
         global_offset += numel
 
-    return sketch
+    return sketch.detach().cpu()
 
 
 def _kernel_metrics(sketches: torch.Tensor, energy_threshold: float) -> dict[str, object]:
-    # [N, R] -> [N, N].  CPU float64 makes the tiny eigendecomposition stable.
-    kernel = (sketches @ sketches.T).detach().cpu().to(torch.float64)
+    kernel = (sketches @ sketches.T).to(torch.float64)
     kernel = 0.5 * (kernel + kernel.T)
     eigenvalues = torch.linalg.eigvalsh(kernel).clamp_min(0).flip(0)
     trace = eigenvalues.sum()
-
     if trace <= 0:
         return {
             "trace": 0.0,
@@ -146,13 +101,18 @@ def _kernel_metrics(sketches: torch.Tensor, energy_threshold: float) -> dict[str
         }
 
     p = eigenvalues / trace
-    nonzero = p[p > 0]
-    entropy = -(nonzero * nonzero.log()).sum()
-    effective_rank = entropy.exp()
-    participation_ratio = trace.square() / eigenvalues.square().sum().clamp_min(torch.finfo(torch.float64).eps)
+    nz = p[p > 0]
+    effective_rank = (-(nz * nz.log()).sum()).exp()
+    participation_ratio = trace.square() / eigenvalues.square().sum().clamp_min(
+        torch.finfo(torch.float64).eps
+    )
     cumulative = torch.cumsum(p, dim=0)
-    d90 = int(torch.searchsorted(cumulative, torch.tensor(energy_threshold, dtype=cumulative.dtype)).item()) + 1
-
+    d90 = int(
+        torch.searchsorted(
+            cumulative,
+            torch.tensor(energy_threshold, dtype=cumulative.dtype),
+        ).item()
+    ) + 1
     return {
         "trace": float(trace.item()),
         "eigenvalues": [float(x) for x in eigenvalues.tolist()],
@@ -163,137 +123,168 @@ def _kernel_metrics(sketches: torch.Tensor, energy_threshold: float) -> dict[str
     }
 
 
-def _module_sketches(
-    per_sample_loss: torch.Tensor,
+def _prepare_one_batch(batch, dataset, preprocessor):
+    for camera_key in dataset.meta.camera_keys:
+        if camera_key in batch and batch[camera_key].dtype == torch.uint8:
+            batch[camera_key] = batch[camera_key].to(dtype=torch.float32) / 255.0
+    return preprocessor(batch)
+
+
+def _gradient_sketch_for_group(
+    loss: torch.Tensor,
     parameters: list[torch.nn.Parameter],
     *,
     sketch_dim: int,
     chunk_size: int,
-    retain_after_last: bool,
+    retain_graph: bool,
 ) -> torch.Tensor:
-    rows: list[torch.Tensor] = []
-    n = per_sample_loss.numel()
-    for index in range(n):
-        retain_graph = retain_after_last or index < n - 1
-        gradients = torch.autograd.grad(
-            per_sample_loss[index],
-            parameters,
-            retain_graph=retain_graph,
-            create_graph=False,
-            allow_unused=True,
-            materialize_grads=False,
-        )
-        rows.append(
-            _countsketch_gradients(
-                gradients,
-                parameters,
-                sketch_dim=sketch_dim,
-                chunk_size=chunk_size,
-            )
-        )
-    return torch.stack(rows, dim=0)
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=retain_graph,
+        create_graph=False,
+        allow_unused=True,
+        materialize_grads=False,
+    )
+    sketch = _countsketch_gradients(
+        gradients,
+        parameters,
+        sketch_dim=sketch_dim,
+        chunk_size=chunk_size,
+    )
+    del gradients
+    return sketch
 
 
-def analyze_task_effective_dimension(
+def analyze_streaming(
     policy: PI05Policy,
-    batch: dict[str, torch.Tensor],
+    dataloader,
+    dataset,
+    preprocessor,
     *,
     num_samples: int,
     sketch_dim: int,
     chunk_size: int,
     energy_threshold: float,
     seed: int,
+    device: str,
 ) -> dict[str, object]:
-    """Compare VLM and action task-conditioned tangent-space dimensions."""
+    if num_samples < 2:
+        raise ValueError("num-samples must be >= 2 for a meaningful spectrum")
     if not 0 < energy_threshold <= 1:
-        raise ValueError("energy_threshold must be in (0, 1]")
+        raise ValueError("energy-threshold must be in (0, 1]")
 
-    # Keep a small, identical sample set for the two modules.
-    actual_batch = next(value.shape[0] for value in batch.values() if isinstance(value, torch.Tensor))
-    n = min(num_samples, actual_batch)
-    batch = {
-        key: (value[:n] if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == actual_batch else value)
-        for key, value in batch.items()
-    }
-
-    # Probe the formal observation-conditioned VLA objective regardless of how a
-    # staged-training checkpoint was produced.  We restore all flags afterwards.
     original_stage = policy.config.training_stage
     original_mode = policy.training
     vlm_parameters = _unique_parameters(policy._vlm_modules())
     action_parameters = _unique_parameters(policy._action_modules())
     all_parameters = vlm_parameters + action_parameters
-    original_requires_grad = [parameter.requires_grad for parameter in all_parameters]
+    original_requires_grad = [p.requires_grad for p in all_parameters]
+
+    vlm_rows: list[torch.Tensor] = []
+    action_rows: list[torch.Tensor] = []
+    losses: list[float] = []
+    loss_metadata: dict[str, object] = {}
 
     try:
         policy.config.training_stage = PI05TrainingStage.FLOW
         policy.eval()
-        for parameter in all_parameters:
-            parameter.requires_grad_(True)
+        for p in all_parameters:
+            p.requires_grad_(True)
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        iterator = iter(dataloader)
+        for sample_index in range(num_samples):
+            # Keep flow noise/time reproducible per sample and identical for both module groups.
+            sample_seed = seed + sample_index
+            torch.manual_seed(sample_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(sample_seed)
 
-        per_sample_loss, loss_dict = policy.forward(batch, reduction="none")
-        if per_sample_loss.ndim != 1:
-            raise RuntimeError(f"Expected per-sample PI0.5 loss, got shape {tuple(per_sample_loss.shape)}")
+            try:
+                batch = next(iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    f"Dataset exhausted after {sample_index} samples; requested {num_samples}."
+                ) from exc
 
-        # Two passes avoid materializing VLM and action gradients simultaneously.
-        # The VLM pass retains the graph; the action pass releases it on its final sample.
-        vlm_sketches = _module_sketches(
-            per_sample_loss,
-            vlm_parameters,
-            sketch_dim=sketch_dim,
-            chunk_size=chunk_size,
-            retain_after_last=True,
-        )
-        action_sketches = _module_sketches(
-            per_sample_loss,
-            action_parameters,
-            sketch_dim=sketch_dim,
-            chunk_size=chunk_size,
-            retain_after_last=False,
-        )
+            batch = _prepare_one_batch(batch, dataset, preprocessor)
+            per_sample_loss, current_metadata = policy.forward(batch, reduction="none")
+            if per_sample_loss.numel() != 1:
+                raise RuntimeError(
+                    "Memory-safe NTK diagnostic expects DataLoader batch_size=1; "
+                    f"got per-sample loss shape {tuple(per_sample_loss.shape)}"
+                )
+            loss = per_sample_loss.reshape(())
+            losses.append(float(loss.detach().item()))
+            loss_metadata = current_metadata
 
+            # VLM gradient first, retaining only this single-sample graph for the action pass.
+            vlm_rows.append(
+                _gradient_sketch_for_group(
+                    loss,
+                    vlm_parameters,
+                    sketch_dim=sketch_dim,
+                    chunk_size=chunk_size,
+                    retain_graph=True,
+                )
+            )
+            action_rows.append(
+                _gradient_sketch_for_group(
+                    loss,
+                    action_parameters,
+                    sketch_dim=sketch_dim,
+                    chunk_size=chunk_size,
+                    retain_graph=False,
+                )
+            )
+
+            del loss, per_sample_loss, batch, current_metadata
+            gc.collect()
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
+            print(f"[NTK gap] processed sample {sample_index + 1}/{num_samples}", flush=True)
+
+        vlm_sketches = torch.stack(vlm_rows, dim=0)
+        action_sketches = torch.stack(action_rows, dim=0)
         vlm = _kernel_metrics(vlm_sketches, energy_threshold)
         action = _kernel_metrics(action_sketches, energy_threshold)
-
         eps = 1e-12
         gap = {
-            "effective_rank_ratio_action_over_vlm": float(action["effective_rank"] / (vlm["effective_rank"] + eps)),
+            "effective_rank_ratio_action_over_vlm": float(
+                action["effective_rank"] / (vlm["effective_rank"] + eps)
+            ),
             "participation_ratio_action_over_vlm": float(
                 action["participation_ratio"] / (vlm["participation_ratio"] + eps)
             ),
             "d90_ratio_action_over_vlm": float(action["d90"] / max(vlm["d90"], 1)),
-            # Trace is scale-sensitive; report it as an optimization-strength diagnostic,
-            # not as the primary task-effective dimension metric.
             "kernel_trace_ratio_action_over_vlm": float(action["trace"] / (vlm["trace"] + eps)),
         }
-
         return {
-            "method": "task-conditioned empirical tangent kernel with deterministic CountSketch",
+            "method": "streaming task-conditioned empirical tangent kernel with deterministic CountSketch",
             "note": (
-                "This is a practical loss-gradient tangent/Fisher-kernel proxy, not the exact vector-output NTK. "
-                "Use spectral-shape metrics (effective rank, participation ratio, d90) as the primary complexity comparison."
+                "Scalar-loss tangent/Fisher-kernel proxy; not the exact vector-output NTK. "
+                "Use spectral-shape metrics as the primary complexity comparison."
             ),
-            "num_samples": n,
+            "num_samples": num_samples,
             "sketch_dim": sketch_dim,
             "energy_threshold": energy_threshold,
             "seed": seed,
-            "mean_vla_loss": float(per_sample_loss.detach().mean().item()),
+            "mean_vla_loss": float(sum(losses) / len(losses)),
             "vlm_num_parameters": int(sum(p.numel() for p in vlm_parameters)),
             "action_num_parameters": int(sum(p.numel() for p in action_parameters)),
             "vlm": vlm,
             "action": action,
             "gap": gap,
-            "loss_metadata": loss_dict,
+            "loss_metadata": loss_metadata,
         }
     finally:
         policy.config.training_stage = original_stage
         policy.train(original_mode)
-        for parameter, requires_grad in zip(all_parameters, original_requires_grad, strict=True):
-            parameter.requires_grad_(requires_grad)
+        for p, requires_grad in zip(all_parameters, original_requires_grad, strict=True):
+            p.requires_grad_(requires_grad)
+        gc.collect()
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -302,10 +293,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--dataset-repo-id", default="libero")
     parser.add_argument("--video-backend", default="pyav")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-samples", type=int, default=4)
+    # Kept for CLI compatibility; the diagnostic intentionally forces microbatch=1.
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--sketch-dim", type=int, default=256)
-    parser.add_argument("--sketch-chunk-size", type=int, default=1_000_000)
+    parser.add_argument("--sketch-chunk-size", type=int, default=250_000)
     parser.add_argument("--energy-threshold", type=float, default=0.90)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -315,25 +307,24 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.batch_size < args.num_samples:
-        raise ValueError("batch-size must be >= num-samples")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
+    if args.batch_size != 1:
+        print(
+            f"[NTK gap] ignoring --batch-size={args.batch_size}; using batch_size=1 to bound memory.",
+            flush=True,
+        )
 
-    # Load through the registered base config so draccus can consume the serialized
-    # discriminator field ("type": "pi05") and dispatch to PI05Config. Calling
-    # PI05Config.from_pretrained directly makes draccus treat "type" as an invalid
-    # PI05Config dataclass field for checkpoints written by LeRobot.
     config = PreTrainedConfig.from_pretrained(args.policy_path, local_files_only=True)
     if not isinstance(config, PI05Config):
-        raise TypeError(
-            f"Expected a PI05Config at {args.policy_path}, got {type(config).__name__}"
-        )
+        raise TypeError(f"Expected PI05Config at {args.policy_path}, got {type(config).__name__}")
     config.device = args.device
     config.training_stage = PI05TrainingStage.FLOW
     config.train_expert_only = False
     config.freeze_vision_encoder = False
     config.compile_model = False
+    # Keep checkpointing off here because the diagnostic uses autograd.grad over explicit
+    # parameter lists; streaming batch_size=1 is the primary memory-control mechanism.
     config.gradient_checkpointing = False
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
@@ -371,26 +362,24 @@ def main() -> None:
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=0,
-        drop_last=True,
+        drop_last=False,
         collate_fn=collate_fn,
     )
-    batch = next(iter(dataloader))
-    for camera_key in dataset.meta.camera_keys:
-        if camera_key in batch and batch[camera_key].dtype == torch.uint8:
-            batch[camera_key] = batch[camera_key].to(dtype=torch.float32) / 255.0
-    batch = preprocessor(batch)
 
-    result = analyze_task_effective_dimension(
+    result = analyze_streaming(
         policy,
-        batch,
+        dataloader,
+        dataset,
+        preprocessor,
         num_samples=args.num_samples,
         sketch_dim=args.sketch_dim,
         chunk_size=args.sketch_chunk_size,
         energy_threshold=args.energy_threshold,
         seed=args.seed,
+        device=args.device,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
