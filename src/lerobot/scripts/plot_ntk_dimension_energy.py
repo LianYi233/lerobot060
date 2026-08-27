@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 
-"""Plot task breadth and directional adaptation load for PI0.5.
+"""Plot relative task breadth and directional adaptation load for PI0.5.
 
 Reads the multi-seed JSON produced by lerobot_ntk_gap.py and creates a
-paper-facing two-panel figure:
+paper-facing two-panel figure using paired Action/VLM ratios:
 
-(a) Task-effective dimension (spectral effective rank), measuring adaptation breadth.
-(b) Directional Adaptation Load,
+(a) log10 task-effective breadth ratio
+        log10(d_eff^Action / d_eff^VLM)
 
-    L_m = Tr(K_m) / (|theta_m| * d_eff^m),
+(b) log10 directional adaptation-load ratio
+        log10(L_Action / L_VLM)
 
-measuring parameter-normalized tangent energy carried by each effective task mode.
+where
 
-This decomposition makes the intended motivation explicit:
-similar task breadth can coexist with strongly asymmetric adaptation load.
+        L_m = Tr(K_m) / (|theta_m| * d_eff^m).
+
+A value of zero is the no-mismatch baseline in both panels. Per-seed points are
+shown together with the median and interquartile range (IQR), which is more
+robust than mean +/- std for the long-tailed load-ratio distribution.
 """
 
 from __future__ import annotations
@@ -32,35 +36,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("ntk_breadth_vs_adaptation_load.pdf"),
+        default=Path("ntk_relative_breadth_vs_load.pdf"),
         help="Figure path (.pdf, .png, .svg, ...)",
     )
     parser.add_argument(
-        "--log-load",
+        "--show-seed-labels",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use logarithmic y-axis for adaptation load (recommended)",
-    )
-    parser.add_argument(
-        "--show-seeds",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Overlay per-seed points on top of the summary bars",
+        default=False,
+        help="Annotate each point with its seed id",
     )
     parser.add_argument("--dpi", type=int, default=300)
     return parser.parse_args()
 
 
-def _mean_std(x: np.ndarray) -> tuple[float, float]:
-    ddof = 1 if x.size > 1 else 0
-    return float(x.mean()), float(x.std(ddof=ddof))
-
-
-def _extract_module(data: dict, module: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _extract_module(data: dict, module: str) -> tuple[np.ndarray, np.ndarray]:
     ranks: list[float] = []
-    energies: list[float] = []
     loads: list[float] = []
-
     parameter_key = "vlm_num_parameters" if module == "vlm" else "action_num_parameters"
 
     for run in data["per_seed"]:
@@ -73,84 +64,66 @@ def _extract_module(data: dict, module: str) -> tuple[np.ndarray, np.ndarray, np
         if num_parameters <= 0:
             raise ValueError(f"Invalid parameter count for {module}: {num_parameters}")
 
-        energy = trace / num_parameters
-        load = energy / rank
-
+        load = trace / (num_parameters * rank)
         ranks.append(rank)
-        energies.append(energy)
         loads.append(load)
 
-    return (
-        np.asarray(ranks, dtype=np.float64),
-        np.asarray(energies, dtype=np.float64),
-        np.asarray(loads, dtype=np.float64),
-    )
+    return np.asarray(ranks, dtype=np.float64), np.asarray(loads, dtype=np.float64)
 
 
-def _plot_bar_with_points(
+def _summary(x: np.ndarray) -> tuple[float, float, float]:
+    median = float(np.median(x))
+    q1 = float(np.percentile(x, 25))
+    q3 = float(np.percentile(x, 75))
+    return median, q1, q3
+
+
+def _plot_relative_panel(
     ax,
-    values_a: np.ndarray,
-    values_b: np.ndarray,
+    values: np.ndarray,
     *,
+    title: str,
     ylabel: str,
-    log_scale: bool,
-    show_seeds: bool,
+    seed_ids: list[int],
+    show_seed_labels: bool,
 ) -> None:
-    labels = ["VLM", "Action Expert"]
-    x = np.arange(2)
+    x = np.arange(len(values), dtype=np.float64)
+    median, q1, q3 = _summary(values)
 
-    mean_a, std_a = _mean_std(values_a)
-    mean_b, std_b = _mean_std(values_b)
-    means = [mean_a, mean_b]
-    stds = [std_a, std_b]
+    ax.axhline(0.0, linestyle="--", linewidth=1.2, alpha=0.7)
+    ax.scatter(x, values, s=34, alpha=0.82, zorder=3)
 
-    ax.bar(
-        x,
-        means,
-        yerr=stds,
-        capsize=5,
-        width=0.58,
-        alpha=0.72,
-    )
+    # Robust summary: median with IQR band.
+    ax.axhspan(q1, q3, alpha=0.12, zorder=0)
+    ax.axhline(median, linewidth=2.0, alpha=0.9)
 
-    if show_seeds:
-        offsets = np.linspace(-0.09, 0.09, len(values_a)) if len(values_a) > 1 else np.array([0.0])
-        ax.scatter(
-            np.full_like(values_a, x[0], dtype=np.float64) + offsets,
-            values_a,
-            marker="o",
-            s=24,
-            alpha=0.75,
-            zorder=3,
-        )
-        ax.scatter(
-            np.full_like(values_b, x[1], dtype=np.float64) + offsets,
-            values_b,
-            marker="^",
-            s=28,
-            alpha=0.75,
-            zorder=3,
-        )
+    if show_seed_labels:
+        for xi, yi, seed in zip(x, values, seed_ids, strict=True):
+            ax.annotate(
+                str(seed),
+                (xi, yi),
+                xytext=(3, 4),
+                textcoords="offset points",
+                fontsize=7,
+                alpha=0.8,
+            )
 
-    if log_scale:
-        ax.set_yscale("log")
-
-    ax.set_xticks(x, labels)
+    ax.set_title(title)
     ax.set_ylabel(ylabel)
-    ax.grid(True, axis="y", which="both", alpha=0.22)
+    ax.set_xlabel("Seed")
+    ax.set_xticks(x, [str(s) for s in seed_ids])
+    ax.grid(True, axis="y", alpha=0.22)
 
-    for idx, (mean, std) in enumerate(zip(means, stds, strict=True)):
-        y_text = mean + std if mean + std > 0 else mean
-        label = f"{mean:.2e}" if log_scale else f"{mean:.2f}"
-        ax.annotate(
-            label,
-            (x[idx], y_text),
-            xytext=(0, 7),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    positive_fraction = float(np.mean(values > 0.0)) * 100.0
+    ax.text(
+        0.03,
+        0.97,
+        f"median={median:.3f}\nIQR=[{q1:.3f}, {q3:.3f}]\n>0: {positive_fraction:.0f}%",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+    )
 
 
 def main() -> None:
@@ -160,78 +133,67 @@ def main() -> None:
     if "per_seed" not in data or not data["per_seed"]:
         raise ValueError("Input JSON does not contain non-empty 'per_seed' results")
 
-    vlm_rank, vlm_energy, vlm_load = _extract_module(data, "vlm")
-    action_rank, action_energy, action_load = _extract_module(data, "action")
+    seed_ids = [int(run.get("seed", i)) for i, run in enumerate(data["per_seed"])]
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0))
+    vlm_rank, vlm_load = _extract_module(data, "vlm")
+    action_rank, action_load = _extract_module(data, "action")
 
-    _plot_bar_with_points(
+    breadth_ratio = action_rank / np.maximum(vlm_rank, 1e-30)
+    load_ratio = action_load / np.maximum(vlm_load, 1e-30)
+
+    log_breadth_ratio = np.log10(breadth_ratio)
+    log_load_ratio = np.log10(load_ratio)
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.4, 4.0))
+
+    _plot_relative_panel(
         axes[0],
-        vlm_rank,
-        action_rank,
-        ylabel="Task-effective dimension",
-        log_scale=False,
-        show_seeds=args.show_seeds,
+        log_breadth_ratio,
+        title="(a) Relative adaptation breadth",
+        ylabel=r"$\log_{10}(d_{\mathrm{eff}}^{A}/d_{\mathrm{eff}}^{V})$",
+        seed_ids=seed_ids,
+        show_seed_labels=args.show_seed_labels,
     )
-    axes[0].set_title("(a) Adaptation breadth")
 
-    _plot_bar_with_points(
+    _plot_relative_panel(
         axes[1],
-        vlm_load,
-        action_load,
-        ylabel=r"Directional adaptation load  $\mathrm{Tr}(K)/(|\theta| d_{\mathrm{eff}})$",
-        log_scale=args.log_load,
-        show_seeds=args.show_seeds,
+        log_load_ratio,
+        title="(b) Relative adaptation load",
+        ylabel=r"$\log_{10}(L_A/L_V)$",
+        seed_ids=seed_ids,
+        show_seed_labels=args.show_seed_labels,
     )
-    axes[1].set_title("(b) Adaptation load")
 
     fig.tight_layout()
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig)
 
-    vlm_rank_mean, vlm_rank_std = _mean_std(vlm_rank)
-    action_rank_mean, action_rank_std = _mean_std(action_rank)
-    vlm_energy_mean, vlm_energy_std = _mean_std(vlm_energy)
-    action_energy_mean, action_energy_std = _mean_std(action_energy)
-    vlm_load_mean, vlm_load_std = _mean_std(vlm_load)
-    action_load_mean, action_load_std = _mean_std(action_load)
+    breadth_median, breadth_q1, breadth_q3 = _summary(breadth_ratio)
+    load_median, load_q1, load_q3 = _summary(load_ratio)
 
-    raw_trace_ratios = np.asarray(
-        [
-            float(run["action"]["trace"]) / max(float(run["vlm"]["trace"]), 1e-30)
-            for run in data["per_seed"]
-        ],
-        dtype=np.float64,
-    )
-    normalized_energy_ratios = action_energy / np.maximum(vlm_energy, 1e-30)
-    load_ratios = action_load / np.maximum(vlm_load, 1e-30)
+    breadth_log_median, breadth_log_q1, breadth_log_q3 = _summary(log_breadth_ratio)
+    load_log_median, load_log_q1, load_log_q3 = _summary(log_load_ratio)
 
-    print("=== Task Breadth vs Directional Adaptation Load ===")
+    print("=== Relative Task Breadth vs Directional Adaptation Load ===")
     print(
-        f"VLM    effective_rank={vlm_rank_mean:.3f} +/- {vlm_rank_std:.3f}, "
-        f"energy={vlm_energy_mean:.6e} +/- {vlm_energy_std:.6e}, "
-        f"load={vlm_load_mean:.6e} +/- {vlm_load_std:.6e}"
+        "Breadth ratio Action/VLM: "
+        f"median={breadth_median:.3f}, IQR=[{breadth_q1:.3f}, {breadth_q3:.3f}], "
+        f">1 fraction={float(np.mean(breadth_ratio > 1.0)) * 100:.2f}%"
     )
     print(
-        f"Action effective_rank={action_rank_mean:.3f} +/- {action_rank_std:.3f}, "
-        f"energy={action_energy_mean:.6e} +/- {action_energy_std:.6e}, "
-        f"load={action_load_mean:.6e} +/- {action_load_std:.6e}"
+        "Load ratio Action/VLM: "
+        f"median={load_median:.3f}, IQR=[{load_q1:.3f}, {load_q3:.3f}], "
+        f">1 fraction={float(np.mean(load_ratio > 1.0)) * 100:.2f}%"
     )
     print(
-        "Raw trace ratio Action/VLM: "
-        f"{raw_trace_ratios.mean():.3f} +/- {raw_trace_ratios.std(ddof=1):.3f}"
+        "log10 breadth ratio: "
+        f"median={breadth_log_median:.3f}, IQR=[{breadth_log_q1:.3f}, {breadth_log_q3:.3f}]"
     )
     print(
-        "Parameter-normalized energy ratio Action/VLM: "
-        f"{normalized_energy_ratios.mean():.3f} +/- {normalized_energy_ratios.std(ddof=1):.3f}"
+        "log10 load ratio: "
+        f"median={load_log_median:.3f}, IQR=[{load_log_q1:.3f}, {load_log_q3:.3f}]"
     )
-    print(
-        "Directional adaptation load ratio Action/VLM: "
-        f"{load_ratios.mean():.3f} +/- {load_ratios.std(ddof=1):.3f}"
-    )
-    print(f"Load>1 fraction: {float(np.mean(load_ratios > 1.0)) * 100:.2f}%")
     print(f"Saved figure to: {args.output}")
 
 
