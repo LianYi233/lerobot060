@@ -340,7 +340,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         tokenizer: A pre-initialized processor/tokenizer object. If provided, `tokenizer_name` is ignored.
         trust_remote_code: Whether to trust remote code when loading the tokenizer (required for some tokenizers).
         action_tokenizer: The internal tokenizer/processor instance, loaded during initialization.
-        paligemma_tokenizer_name: The name of a pretrained PaliGemma tokenizer from the Hugging Face Hub (e.g., "google/paligemma-3b-pt-224").
+        paligemma_tokenizer_name: The name of a pretrained PaliGemma tokenizer from the Hugging Face Hub (e.g., "/data/models/paligemma-3b-pt-224").
     """
 
     action_tokenizer_name: str | None = None
@@ -348,7 +348,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
     trust_remote_code: bool = True
     max_action_tokens: int = 256
     fast_skip_tokens: int = 128
-    paligemma_tokenizer_name: str = "google/paligemma-3b-pt-224"
+    paligemma_tokenizer_name: str = "/data/models/paligemma-3b-pt-224"
     # Internal tokenizer instance (not part of the config)
     action_tokenizer: Any = field(default=None, init=False, repr=False)
     _paligemma_tokenizer: Any = field(default=None, init=False, repr=False)

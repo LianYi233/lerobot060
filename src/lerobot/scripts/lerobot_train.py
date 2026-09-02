@@ -76,7 +76,7 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 _PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
-_PI05_STAGE2_SAVE_FREQ = 3_000
+# _PI05_STAGE2_SAVE_FREQ = 3_000
 
 
 @torch.no_grad()
@@ -509,7 +509,9 @@ def _run_pi05_next_action_pretraining(
     cfg.policy.pretrained_revision = None
     # Stage 1 keeps only its final transfer checkpoint. Once it succeeds, persist the formal
     # observation-conditioned flow stage at a finer, fixed cadence (plus the existing final save).
-    cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
+    # cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
+    if cfg.save_stage2_freq > 0:
+        cfg.save_freq = cfg.save_stage2_freq
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
