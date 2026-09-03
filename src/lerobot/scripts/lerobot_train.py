@@ -76,7 +76,7 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 _PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
-_PI05_STAGE2_SAVE_FREQ = 3_000
+_PI05_STAGE2_SAVE_FREQ = 500
 
 
 @torch.no_grad()
