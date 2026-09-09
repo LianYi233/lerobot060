@@ -49,12 +49,17 @@ class PI05Config(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
+    # Learned expert-side tokens between the frozen VLM prefix and action tokens.
+    # Set to 0 for an ablation without prompts; the VLM remains frozen.
+    num_prompt_tokens: int = 16
+    prompt_init_std: float = 0.02
+
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
-    # Training stage. ``next_action`` is kept as the public name for backwards compatibility and
-    # freezes the VLM; its base objective is action-only flow inpainting over the complete chunk.
+    # Training stage. Both stages freeze the VLM. ``next_action`` is kept as the public name for
+    # backwards compatibility; its base objective is action-only flow inpainting over the chunk.
     # The integrated trainer may route its final bridge updates through the standard
     # observation-conditioned objective without changing this stage or its optimizer.
     # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
@@ -117,17 +122,18 @@ class PI05Config(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
-    # Finetuning settings
-    freeze_vision_encoder: bool = False  # Freeze only the vision encoder
-    train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Legacy finetuning flags retained for checkpoint/CLI compatibility. PI05 always freezes the
+    # complete VLM and trains the prompts, action expert, and projections in both training stages.
+    freeze_vision_encoder: bool = True
+    train_expert_only: bool = True
 
-    # Optimizer settings. Action and VLM parameters share this single AdamW learning rate.
+    # Optimizer settings. Prompt and action parameters share this single AdamW learning rate.
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
-    # Global clipping is disabled for PI05. Stage 2 leaves the action side unrestricted by default;
-    # the two VLM-relative controllers below remain available as explicit opt-ins.
+    # Global clipping is disabled for PI05. The optional CABO controller below acts on AdamW
+    # parameter updates, after gradient computation.
     optimizer_grad_clip_norm: float = 0.0
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
@@ -137,17 +143,19 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = False
     action_head_grad_clip_ratio: float = 10.0
 
-    # Relative-update optimizer control (CABO). CABO deterministically computes the next AdamW
-    # learning update for each parameter group, keeps the VLM update at full scale, and limits the
-    # action expert/projection relative update rates against an EMA of the VLM relative update rate.
-    # Weight decay is excluded from the measured learning rates so it is not mistaken for VLM signal.
+    # Prompt-relative CABO: in every training stage, preserve the prompt's scheduled learning rate
+    # and cap each action group's relative learning update at prompt_rate / this ratio. Weight
+    # decay is excluded from the measurement. A ratio of 1 means prompts update at least as much
+    # as each action group, relative to that group's parameter norm.
     cabo_enabled: bool = False
+    cabo_prompt_update_ratio: float = 1.0
+
+    # Deprecated VLM-reference settings retained only for loading older configurations. The
+    # prompt controller uses the current step immediately; EMA, warmup and floors are not applied.
     cabo_expert_update_ratio: float = 2.0
     cabo_projection_update_ratio: float = 5.0
     cabo_vlm_update_ema_decay: float = 0.95
-    # Keep both action groups unrestricted while collecting a stable VLM reference.
     cabo_update_warmup_steps: int = 100
-    # After warmup, retain this fraction of the warmup-average VLM rate as a reference floor.
     cabo_vlm_update_floor_ratio: float = 0.1
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
@@ -161,6 +169,21 @@ class PI05Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Older configs explicitly stored False. Loading them must never unfreeze the VLM.
+        self.freeze_vision_encoder = True
+        self.train_expert_only = True
+
+        if (
+            isinstance(self.num_prompt_tokens, bool)
+            or not isinstance(self.num_prompt_tokens, int)
+            or self.num_prompt_tokens < 0
+        ):
+            raise ValueError(
+                f"num_prompt_tokens must be a non-negative integer, got {self.num_prompt_tokens}"
+            )
+        if not math.isfinite(self.prompt_init_std) or self.prompt_init_std <= 0:
+            raise ValueError(f"prompt_init_std must be finite and greater than 0, got {self.prompt_init_std}")
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:
@@ -234,15 +257,22 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"cabo_vlm_update_floor_ratio must be in [0, 1], got {self.cabo_vlm_update_floor_ratio}"
             )
-        if self.cabo_active and self.train_expert_only:
+        if not math.isfinite(self.cabo_prompt_update_ratio) or self.cabo_prompt_update_ratio < 1.0:
             raise ValueError(
-                "CABO requires trainable VLM parameters and is incompatible with train_expert_only=True"
+                f"cabo_prompt_update_ratio must be finite and at least 1, got {self.cabo_prompt_update_ratio}"
+            )
+        if self.cabo_active and self.num_prompt_tokens == 0:
+            raise ValueError("Prompt-relative CABO requires num_prompt_tokens > 0")
+        if self.training_stage == "flow" and self.clip_action_head_by_vlm:
+            raise ValueError(
+                "clip_action_head_by_vlm requires trainable VLM parameters, but PI05 always freezes "
+                "the VLM. Set clip_action_head_by_vlm=False."
             )
 
     @property
     def cabo_active(self) -> bool:
-        """Whether CABO participates in the current training objective."""
-        return self.cabo_enabled and self.training_stage == "flow"
+        """Whether prompt-relative CABO participates in any training stage."""
+        return self.cabo_enabled
 
     @property
     def next_action_pretraining_active(self) -> bool:

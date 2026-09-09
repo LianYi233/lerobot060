@@ -26,7 +26,7 @@ from lerobot.optim.cabo import (  # noqa: E402
     CABO_ACTION_EXPERT_GROUP,
     CABO_ACTION_PROJECTION_GROUP,
     CABO_GROUP_NAME,
-    CABO_VLM_GROUP,
+    CABO_PROMPT_GROUP,
     temporary_optimizer_group_lr_scales,
 )
 from lerobot.policies.pi05 import PI05Policy  # noqa: E402
@@ -43,11 +43,11 @@ class _ReducingFakeAccelerator:
     num_processes = 2
 
     def __init__(self):
-        self.reduce_calls = 0
+        self.reduce_shapes = []
 
     def reduce(self, value, reduction="mean"):
         assert reduction == "sum"
-        self.reduce_calls += 1
+        self.reduce_shapes.append(value.shape)
         return value * self.num_processes
 
 
@@ -55,30 +55,32 @@ class _TinyCABOPolicy(nn.Module):
     compute_optimizer_step_control = PI05Policy.compute_optimizer_step_control
     validate_optimizer_step_control = PI05Policy.validate_optimizer_step_control
 
-    def __init__(self, *, warmup_steps: int = 0):
+    def __init__(self, *, prompt_update_ratio: float = 1.0, dtype=torch.float64):
         super().__init__()
-        self.vlm_weight = nn.Parameter(torch.tensor([10.0], dtype=torch.float64))
-        self.expert_weight = nn.Parameter(torch.tensor([1.0], dtype=torch.float64))
-        self.projection_weight = nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+        self.prompt_weight = nn.Parameter(torch.tensor([10.0], dtype=dtype))
+        self.expert_weight = nn.Parameter(torch.tensor([1.0], dtype=dtype))
+        self.projection_weight = nn.Parameter(torch.tensor([2.0], dtype=dtype))
         self.config = SimpleNamespace(
             cabo_enabled=True,
+            cabo_prompt_update_ratio=prompt_update_ratio,
+            # Legacy VLM settings must not relax the current prompt update bound.
             cabo_expert_update_ratio=2.0,
             cabo_projection_update_ratio=5.0,
-            cabo_vlm_update_ema_decay=0.0,
-            cabo_update_warmup_steps=warmup_steps,
-            cabo_vlm_update_floor_ratio=0.0,
+            cabo_vlm_update_ema_decay=0.99,
+            cabo_update_warmup_steps=100,
+            cabo_vlm_update_floor_ratio=0.1,
         )
 
     def _cabo_parameter_groups(self):
-        return [self.vlm_weight], [self.expert_weight], [self.projection_weight]
+        return [self.prompt_weight], [self.expert_weight], [self.projection_weight]
 
 
-def _make_optimizer(policy: _TinyCABOPolicy, *, weight_decay: float = 0.0):
+def _make_optimizer(policy: _TinyCABOPolicy, *, weight_decay: float = 0.0, betas=(0.0, 0.0)):
     return torch.optim.AdamW(
         [
             {
-                "params": [policy.vlm_weight],
-                CABO_GROUP_NAME: CABO_VLM_GROUP,
+                "params": [policy.prompt_weight],
+                CABO_GROUP_NAME: CABO_PROMPT_GROUP,
             },
             {
                 "params": [policy.expert_weight],
@@ -90,7 +92,7 @@ def _make_optimizer(policy: _TinyCABOPolicy, *, weight_decay: float = 0.0):
             },
         ],
         lr=0.1,
-        betas=(0.0, 0.0),
+        betas=betas,
         eps=1e-8,
         weight_decay=weight_decay,
         foreach=False,
@@ -111,14 +113,14 @@ def test_pi05_cabo_scales_action_groups_from_relative_adamw_updates_without_touc
     control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
 
     # The first AdamW learning delta is 0.1 for every scalar. Relative rates are
-    # therefore VLM=0.01, expert=0.1, projection=0.05.
+    # therefore prompt=0.01, expert=0.1, projection=0.05.
     assert control.group_scales == pytest.approx(
         {
-            CABO_ACTION_EXPERT_GROUP: 0.2,
-            CABO_ACTION_PROJECTION_GROUP: 1.0,
+            CABO_ACTION_EXPERT_GROUP: 0.1,
+            CABO_ACTION_PROJECTION_GROUP: 0.2,
         }
     )
-    assert control.metrics["cabo/vlm_relative_update_rate"] == pytest.approx(0.01)
+    assert control.metrics["cabo/prompt_relative_update_rate"] == pytest.approx(0.01)
     assert control.metrics["cabo/expert_relative_update_rate"] == pytest.approx(0.1)
     assert control.metrics["cabo/projection_relative_update_rate"] == pytest.approx(0.05)
     assert not control.skip_optimizer_step
@@ -126,9 +128,17 @@ def test_pi05_cabo_scales_action_groups_from_relative_adamw_updates_without_touc
         assert torch.equal(parameter.grad, gradient_before)
 
 
-def test_pi05_cabo_action_scales_limit_the_real_optimizer_step_and_leave_vlm_full():
-    policy = _TinyCABOPolicy()
+@pytest.mark.parametrize("ratio", [1.0, 2.0])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
+def test_pi05_cabo_action_scales_limit_the_real_optimizer_step_and_leave_prompt_full(ratio, dtype):
+    policy = _TinyCABOPolicy(prompt_update_ratio=ratio, dtype=dtype)
     optimizer = _make_optimizer(policy)
+    reference_prompt = nn.Parameter(policy.prompt_weight.detach().clone())
+    reference_optimizer = torch.optim.AdamW(
+        [reference_prompt], lr=0.1, betas=(0.0, 0.0), eps=1e-8, weight_decay=0.0, foreach=False
+    )
+    reference_prompt.grad = torch.ones_like(reference_prompt)
+    reference_optimizer.step()
     _set_unit_gradients(policy)
     before = [parameter.detach().clone() for parameter in policy.parameters()]
 
@@ -137,35 +147,93 @@ def test_pi05_cabo_action_scales_limit_the_real_optimizer_step_and_leave_vlm_ful
         optimizer.step()
 
     deltas = [parameter.detach() - old for parameter, old in zip(policy.parameters(), before, strict=True)]
-    assert deltas[0].item() == pytest.approx(-0.1)
-    assert deltas[1].item() == pytest.approx(-0.02)
-    assert deltas[2].item() == pytest.approx(-0.1)
+    torch.testing.assert_close(policy.prompt_weight, reference_prompt, rtol=0, atol=0)
+    rates = [
+        delta.double().norm().item() / old.double().norm().item()
+        for delta, old in zip(deltas, before, strict=True)
+    ]
+    assert rates[0] >= ratio * rates[1] - 1e-8
+    assert rates[0] >= ratio * rates[2] - 1e-8
+    whole_action_rate = torch.cat(deltas[1:]).double().norm() / torch.cat(before[1:]).double().norm()
+    assert rates[0] >= ratio * whole_action_rate.item() - 1e-8
+    assert all(group["lr"] == 0.1 for group in optimizer.param_groups)
 
 
-def test_pi05_cabo_warmup_collects_reference_without_limiting_action_groups():
-    policy = _TinyCABOPolicy(warmup_steps=2)
+def test_pi05_cabo_rechecks_bfloat16_updates_when_lr_scaling_rounds_above_the_prompt_budget():
+    policy = _TinyCABOPolicy()
+    policy.expert_weight = nn.Parameter(torch.tensor([0.01], dtype=torch.bfloat16))
+    policy.projection_weight = nn.Parameter(torch.tensor([0.01], dtype=torch.bfloat16))
     optimizer = _make_optimizer(policy)
-
-    for expected_step in (1, 2):
-        _set_unit_gradients(policy)
-        control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
-        assert control.group_scales == pytest.approx(
-            {
-                CABO_ACTION_EXPERT_GROUP: 1.0,
-                CABO_ACTION_PROJECTION_GROUP: 1.0,
-            }
-        )
-        assert control.metrics["cabo/warmup_active"] == 1.0
-        assert get_vlm_group(optimizer)["cabo_step"] == expected_step
-
+    # A full bfloat16 step moves the action weight by 0.0001220703125. Scaling
+    # its LR by 0.33 moves it by 0.00006103515625: half the full delta, not 0.33.
+    action_rate = 0.0001220703125 / policy.expert_weight.item()
+    optimizer.param_groups[0]["lr"] = action_rate * 0.33 * policy.prompt_weight.item()
+    for group in optimizer.param_groups[1:]:
+        group["lr"] = 0.0001
     _set_unit_gradients(policy)
+    before = [parameter.detach().clone() for parameter in policy.parameters()]
+
     control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
-    assert control.metrics["cabo/warmup_active"] == 0.0
-    assert control.group_scales[CABO_ACTION_EXPERT_GROUP] == pytest.approx(0.2)
+    with temporary_optimizer_group_lr_scales(optimizer, control.group_scales):
+        optimizer.step()
+
+    assert control.metrics["cabo/candidate_verification_passes"] >= 2.0
+    assert all(scale < 0.33 for scale in control.group_scales.values())
+    rates = [
+        (parameter.detach().double() - old.double()).norm().item() / old.double().norm().item()
+        for parameter, old in zip(policy.parameters(), before, strict=True)
+    ]
+    assert rates[0] > 0.0
+    assert rates[0] >= max(rates[1:])
 
 
-def get_vlm_group(optimizer):
-    return next(group for group in optimizer.param_groups if group.get(CABO_GROUP_NAME) == CABO_VLM_GROUP)
+@pytest.mark.parametrize("missing_gradient", [False, True])
+def test_pi05_cabo_zero_prompt_update_stops_both_action_groups(missing_gradient):
+    policy = _TinyCABOPolicy()
+    optimizer = _make_optimizer(policy)
+    _set_unit_gradients(policy)
+    policy.prompt_weight.grad = None if missing_gradient else torch.zeros_like(policy.prompt_weight)
+    before = [parameter.detach().clone() for parameter in policy.parameters()]
+
+    control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
+    with temporary_optimizer_group_lr_scales(optimizer, control.group_scales):
+        optimizer.step()
+
+    assert control.metrics["cabo/prompt_relative_update_rate"] == 0.0
+    assert control.group_scales == {CABO_ACTION_EXPERT_GROUP: 0.0, CABO_ACTION_PROJECTION_GROUP: 0.0}
+    assert not control.skip_optimizer_step
+    for parameter, previous in zip(policy.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, previous, rtol=0, atol=0)
+
+
+def test_pi05_cabo_prompt_momentum_still_provides_an_update_budget_with_zero_gradient():
+    policy = _TinyCABOPolicy()
+    optimizer = _make_optimizer(policy, betas=(0.9, 0.99))
+    _set_unit_gradients(policy)
+    optimizer.step()
+    policy.prompt_weight.grad.zero_()
+
+    control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
+
+    assert control.metrics["cabo/prompt_relative_update_rate"] > 0.0
+    assert 0.0 < control.group_scales[CABO_ACTION_EXPERT_GROUP] < 1.0
+    assert 0.0 < control.group_scales[CABO_ACTION_PROJECTION_GROUP] < 1.0
+
+
+def test_pi05_cabo_does_not_reuse_legacy_vlm_ema_or_warmup_budget():
+    policy = _TinyCABOPolicy()
+    optimizer = _make_optimizer(policy)
+    optimizer.param_groups[0].update(cabo_step=100, cabo_vlm_update_ema=100.0)
+    _set_unit_gradients(policy)
+    first = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
+    policy.prompt_weight.grad.zero_()
+
+    second = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
+
+    assert first.group_scales[CABO_ACTION_EXPERT_GROUP] < 1.0
+    assert second.group_scales == {CABO_ACTION_EXPERT_GROUP: 0.0, CABO_ACTION_PROJECTION_GROUP: 0.0}
+    assert optimizer.param_groups[0]["cabo_step"] == 100
+    assert optimizer.param_groups[0]["cabo_vlm_update_ema"] == 100.0
 
 
 def test_pi05_cabo_excludes_weight_decay_from_measured_learning_rate():
@@ -176,14 +244,14 @@ def test_pi05_cabo_excludes_weight_decay_from_measured_learning_rate():
 
     control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
 
-    assert control.metrics["cabo/vlm_relative_update_rate"] == 0.0
+    assert control.metrics["cabo/prompt_relative_update_rate"] == 0.0
     assert control.metrics["cabo/expert_relative_update_rate"] == 0.0
     assert control.metrics["cabo/projection_relative_update_rate"] == 0.0
     assert control.group_scales[CABO_ACTION_EXPERT_GROUP] == 1.0
     assert control.group_scales[CABO_ACTION_PROJECTION_GROUP] == 1.0
 
 
-def test_pi05_cabo_reduces_only_six_update_moments_for_multi_process_training():
+def test_pi05_cabo_reduces_candidate_and_verified_update_moments_for_multi_process_training():
     policy = _TinyCABOPolicy()
     optimizer = _make_optimizer(policy)
     accelerator = _ReducingFakeAccelerator()
@@ -191,28 +259,49 @@ def test_pi05_cabo_reduces_only_six_update_moments_for_multi_process_training():
 
     control = policy.compute_optimizer_step_control({}, optimizer, accelerator)
 
-    assert accelerator.reduce_calls == 1
-    assert control.group_scales[CABO_ACTION_EXPERT_GROUP] == pytest.approx(0.2)
-    assert control.group_scales[CABO_ACTION_PROJECTION_GROUP] == pytest.approx(1.0)
+    assert accelerator.reduce_shapes[0] == (6,)
+    assert accelerator.reduce_shapes[1:]
+    assert all(shape == (4,) for shape in accelerator.reduce_shapes[1:])
+    single_process_control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
+    assert control.group_scales == single_process_control.group_scales
 
 
-def test_pi05_cabo_nonfinite_update_skips_without_mutating_controller_state():
+@pytest.mark.parametrize("group", ["prompt_weight", "expert_weight", "projection_weight"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_pi05_cabo_nonfinite_update_in_any_group_skips_without_mutating_optimizer_state(group, value):
     policy = _TinyCABOPolicy()
-    policy.vlm_weight.data.zero_()
     optimizer = _make_optimizer(policy)
     _set_unit_gradients(policy)
-    vlm_group = get_vlm_group(optimizer)
-    state_before = dict(vlm_group)
+    getattr(policy, group).grad.fill_(value)
+    groups_before = [dict(group) for group in optimizer.param_groups]
 
     control = policy.compute_optimizer_step_control({}, optimizer, _FakeAccelerator())
 
     assert control.skip_optimizer_step
     assert control.metrics["cabo/update_nonfinite"] == 1.0
     assert control.metrics["optimizer_step/nonfinite_cabo_update"] == 1.0
-    assert "cabo_step" not in vlm_group
-    for key, value in state_before.items():
-        if key != "params":
-            assert vlm_group[key] == value
+    assert not optimizer.state
+    for group, previous in zip(optimizer.param_groups, groups_before, strict=True):
+        for key, value in previous.items():
+            if key != "params":
+                assert group[key] == value
+
+
+def test_pi05_cabo_nonfinite_update_from_another_rank_skips_the_step():
+    class RemoteNonfiniteAccelerator(_ReducingFakeAccelerator):
+        def reduce(self, value, reduction="mean"):
+            result = super().reduce(value, reduction=reduction)
+            result[0] = float("nan")
+            return result
+
+    policy = _TinyCABOPolicy()
+    optimizer = _make_optimizer(policy)
+    _set_unit_gradients(policy)
+
+    control = policy.compute_optimizer_step_control({}, optimizer, RemoteNonfiniteAccelerator())
+
+    assert control.skip_optimizer_step
+    assert control.metrics["optimizer_step/nonfinite_cabo_update"] == 1.0
 
 
 def test_pi05_cabo_optimizer_contract_is_validated_before_training():
@@ -236,8 +325,8 @@ def test_pi05_cabo_optimizer_contract_rejects_wrong_optimizer_or_groups():
 
     swapped_optimizer = torch.optim.AdamW(
         [
-            {"params": [policy.expert_weight], CABO_GROUP_NAME: CABO_VLM_GROUP},
-            {"params": [policy.vlm_weight], CABO_GROUP_NAME: CABO_ACTION_EXPERT_GROUP},
+            {"params": [policy.expert_weight], CABO_GROUP_NAME: CABO_PROMPT_GROUP},
+            {"params": [policy.prompt_weight], CABO_GROUP_NAME: CABO_ACTION_EXPERT_GROUP},
             {
                 "params": [policy.projection_weight],
                 CABO_GROUP_NAME: CABO_ACTION_PROJECTION_GROUP,

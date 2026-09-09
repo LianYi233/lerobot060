@@ -19,12 +19,42 @@ It is designed as a **Vision-Language-Action model with open-world generalizatio
 
 ## Training Defaults
 
-Fresh π₀.₅ configurations use a unified AdamW learning rate of `2.5e-5` for the VLM and action-side
-parameters, followed by cosine decay to a `1e-5` floor. Checkpoint loads and resumed runs preserve
-their saved optimizer values. Stage 2 does not constrain action-side gradients or learning rates
-using the VLM by default: `clip_action_head_by_vlm=false` and `cabo_enabled=false`. Global gradient
-clipping is also disabled (`optimizer_grad_clip_norm=0.0`). Both VLM-relative controllers remain
-available as explicit opt-ins.
+This repository's variant uses `[VLM tokens] [prompt tokens] [action tokens]`, with 16 trainable
+prompt embeddings by default (`num_prompt_tokens=16`, `prompt_init_std=0.02`). Prompts use the action
+expert's embedding width. VLM tokens see the VLM prefix; prompts see the prefix and all prompts;
+actions see all three blocks. Set `num_prompt_tokens=0` for an ablation without prompts.
+
+The entire VLM, including the vision encoder, stays frozen in every training stage.
+`freeze_vision_encoder=true` and `train_expert_only=true` are enforced even when loading older
+configurations. Prompts and the complete action path train during action-only Stage 1, the
+observation-conditioned bridge, and Stage 2. At inference, the VLM prefix is cached and prompts are
+processed with actions at each denoising step; the action chunk length is unchanged.
+
+Fresh configurations use a unified AdamW learning rate of `2.5e-5` for prompts and action-side
+parameters, followed by cosine decay to a `1e-5` floor. Global gradient clipping is disabled
+(`optimizer_grad_clip_norm=0.0`). VLM-relative gradient clipping (`clip_action_head_by_vlm`) must
+remain `false` for flow training.
+
+CABO is optional and uses the prompt as its update reference. Enable it with
+`--policy.cabo_enabled=true --policy.cabo_prompt_update_ratio=1.0`. It keeps the prompt's full
+scheduled learning rate and attenuates the current step's learning rate for the action expert and
+the projections/timestep MLP so that each group's relative learning update is no larger than the
+prompt's. The relative update is `||delta_theta|| / ||theta||`, including AdamW preconditioning and
+the learning rate, but excluding weight decay. A ratio above `1.0` increases the required prompt
+advantage. CABO applies from the first update in every stage, requires nonzero prompt tokens, and
+keeps the complete VLM frozen. Legacy VLM-based CABO ratios, EMA, warmup, and floor settings are
+loadable but inactive; the ordinary learning-rate scheduler is unchanged. CABO is disabled by default.
+
+Loading a base or older full-model checkpoint without prompt weights initializes new prompts. Loading a
+checkpoint saved by this variant preserves its learned prompts. To migrate an older training run,
+initialize a new run from its model weights: the old optimizer state may not support direct resume
+after adding prompts and freezing the VLM. Enabling prompt-based CABO requires named `prompt`,
+`action_expert`, and `action_projection` optimizer groups, so changing from a non-CABO or older
+VLM-based CABO run also requires a fresh optimizer initialized from saved model weights. See the
+[training guide](./pi05.mdx) for the two-stage curriculum and checkpoint details.
+
+Legacy PEFT adapters without saved `prompt_tokens` require `num_prompt_tokens=0`; for prompt
+training, use a prompt-enabled adapter or initialize from a full-model checkpoint.
 
 ---
 
@@ -55,9 +85,11 @@ Joints listed in `relative_exclude_joints` (e.g., gripper) are kept absolute.
 ### Training example
 
 ```bash
-python -m lerobot.scripts.lerobot_train \
+uv run lerobot-train \
   --policy.type=pi05 \
   --dataset.repo_id=your_org/your_dataset \
+  --policy.num_prompt_tokens=16 \
+  --policy.train_expert_only=true \
   --policy.use_relative_actions=true \
   --policy.relative_exclude_joints='["gripper"]'
 ```

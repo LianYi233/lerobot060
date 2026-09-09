@@ -83,8 +83,9 @@ def _make_flow_config(tmp_path: Path, **policy_kwargs) -> TrainPipelineConfig:
     )
 
 
-def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_path):
-    cfg = _make_flow_config(tmp_path)
+@pytest.mark.parametrize("cabo_enabled", [False, True])
+def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_path, cabo_enabled):
+    cfg = _make_flow_config(tmp_path, cabo_enabled=cabo_enabled, cabo_prompt_update_ratio=1.5)
     cfg.validate()
 
     pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
@@ -99,8 +100,13 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.next_action_pretrain_steps == 0
     assert not pretrain_cfg.policy.next_action_pretraining_active
     assert pretrain_cfg.policy.drop_n_last_frames == 0
-    assert not pretrain_cfg.cabo_active
+    assert pretrain_cfg.cabo_active is cabo_enabled
+    assert pretrain_cfg.policy.cabo_prompt_update_ratio == cfg.policy.cabo_prompt_update_ratio == 1.5
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
+    assert pretrain_cfg.policy.num_prompt_tokens == cfg.policy.num_prompt_tokens == 16
+    assert pretrain_cfg.policy.prompt_init_std == cfg.policy.prompt_init_std
+    assert pretrain_cfg.policy.train_expert_only
+    assert pretrain_cfg.policy.freeze_vision_encoder
     assert pretrain_cfg.steps == 1_000
     assert pretrain_cfg.policy.next_action_bridge_steps == 250
     assert train_module._pi05_stage1_bridge_start_step(pretrain_cfg) == 750
@@ -208,8 +214,9 @@ def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_
     assert cfg.save_freq == 3_000
 
 
-def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeypatch, tmp_path):
-    cfg = _make_flow_config(tmp_path)
+@pytest.mark.parametrize("cabo_enabled", [False, True])
+def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeypatch, tmp_path, cabo_enabled):
+    cfg = _make_flow_config(tmp_path, cabo_enabled=cabo_enabled, cabo_prompt_update_ratio=1.5)
     accelerator = _FakeAccelerator()
     stages = []
     validate_calls = []
@@ -237,13 +244,15 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert all(stage_accelerator is accelerator for _, stage_accelerator, _ in stages)
     assert [bridge_enabled for _, _, bridge_enabled in stages] == [True, False]
     assert stages[0][0] is not cfg
-    assert not stages[0][0].cabo_active
+    assert stages[0][0].cabo_active is cabo_enabled
     assert stages[0][0].optimizer is not cfg.optimizer
     assert stages[1][0] is cfg
-    assert not stages[1][0].cabo_active
+    assert stages[1][0].cabo_active is cabo_enabled
+    assert stages[1][0].policy.cabo_prompt_update_ratio == stages[0][0].policy.cabo_prompt_update_ratio == 1.5
     assert not stages[1][0].policy.clip_action_head_by_vlm
-    assert not stages[1][0].policy.train_expert_only
-    assert not stages[1][0].policy.freeze_vision_encoder
+    assert stages[1][0].policy.train_expert_only
+    assert stages[1][0].policy.freeze_vision_encoder
+    assert stages[1][0].policy.num_prompt_tokens == stages[0][0].policy.num_prompt_tokens
     assert stages[1][0].save_checkpoint
     assert stages[1][0].save_freq == 3_000
     expected_model_dir = (

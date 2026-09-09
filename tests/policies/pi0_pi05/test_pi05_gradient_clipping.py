@@ -58,6 +58,7 @@ def _make_policy_with_gradients(
         time_mlp_in=action_modules[3],
         time_mlp_out=action_modules[4],
         inpainting_visible_action_embedding=action_modules[5],
+        prompt_tokens=nn.Embedding(16, 2),
     )
     policy = SimpleNamespace(
         model=model,
@@ -73,6 +74,7 @@ def _make_policy_with_gradients(
     vlm_parameters = list(paligemma_with_expert.paligemma.parameters())
     for parameter in action_parameters:
         parameter.grad = torch.full_like(parameter, action_gradient)
+    model.prompt_tokens.weight.grad = torch.full_like(model.prompt_tokens.weight, action_gradient)
     for parameter in vlm_parameters:
         parameter.grad = torch.full_like(parameter, vlm_gradient)
 
@@ -111,7 +113,12 @@ def test_pi05_optimizer_and_action_control_defaults():
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
     assert not config.cabo_enabled
     assert not config.cabo_active
+    assert config.cabo_prompt_update_ratio == pytest.approx(1.0)
     assert config.training_stage == "flow"
+    assert config.train_expert_only
+    assert config.freeze_vision_encoder
+    assert config.num_prompt_tokens == 16
+    assert config.prompt_init_std == pytest.approx(0.02)
     assert config.next_action_masked_steps == 40
     assert config.next_action_full_mask_probability == pytest.approx(0.0)
     assert config.next_action_context_steps == 25
@@ -123,7 +130,7 @@ def test_pi05_optimizer_and_action_control_defaults():
     assert config.cabo_vlm_update_floor_ratio == pytest.approx(0.1)
 
 
-def test_pi05_next_action_stage_disables_cabo_and_gradient_clipping():
+def test_pi05_next_action_stage_enables_prompt_cabo_without_gradient_clipping():
     config = PI05Config(
         training_stage="next_action",
         optimizer_grad_clip_norm=42.0,
@@ -132,7 +139,7 @@ def test_pi05_next_action_stage_disables_cabo_and_gradient_clipping():
     )
 
     assert config.cabo_enabled
-    assert not config.cabo_active
+    assert config.cabo_active
     assert config.get_optimizer_preset().grad_clip_norm == 0.0
 
 
@@ -205,19 +212,35 @@ def test_pi05_rejects_invalid_cabo_update_ratio(field: str, value: float):
         PI05Config(**{field: value})
 
 
-def test_pi05_cabo_update_ratio_decodes_from_nested_cli_argument():
+@pytest.mark.parametrize("value", [0.0, 0.99, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_pi05_rejects_prompt_cabo_ratios_below_one_or_nonfinite(value: float):
+    with pytest.raises(ValueError, match="cabo_prompt_update_ratio"):
+        PI05Config(cabo_prompt_update_ratio=value)
+
+
+@pytest.mark.parametrize("training_stage", ["next_action", "flow"])
+def test_pi05_prompt_cabo_requires_prompt_tokens(training_stage):
+    with pytest.raises(ValueError, match="num_prompt_tokens"):
+        PI05Config(training_stage=training_stage, cabo_enabled=True, num_prompt_tokens=0)
+
+
+def test_pi05_stage1_legacy_cabo_update_ratio_decodes_from_nested_cli_argument():
     config = draccus.parse(
         TrainPipelineConfig,
         args=[
             "--dataset.repo_id=user/repo",
             "--policy.type=pi05",
+            "--policy.training_stage=next_action",
             "--policy.cabo_enabled=true",
+            "--policy.cabo_prompt_update_ratio=1.5",
             "--policy.cabo_projection_update_ratio=3.5",
         ],
     )
 
     assert isinstance(config.policy, PI05Config)
     assert config.policy.cabo_enabled
+    assert config.policy.cabo_active
+    assert config.policy.cabo_prompt_update_ratio == pytest.approx(1.5)
     assert config.policy.cabo_projection_update_ratio == pytest.approx(3.5)
     assert config.save_freq == 10_000
 
@@ -254,29 +277,34 @@ def test_pi05_rejects_invalid_cabo_vlm_floor_ratio(cabo_vlm_update_floor_ratio: 
         PI05Config(cabo_vlm_update_floor_ratio=cabo_vlm_update_floor_ratio)
 
 
-def test_pi05_rejects_cabo_with_expert_only_training():
-    with pytest.raises(ValueError, match="train_expert_only"):
-        PI05Config(cabo_enabled=True, train_expert_only=True)
-
-
-def test_pi05_cabo_requires_policy_training_preset(tmp_path):
-    policy_config = PI05Config(cabo_enabled=True, push_to_hub=False)
-    config = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="user/repo"),
-        policy=policy_config,
-        output_dir=tmp_path / "new-output",
-        use_policy_training_preset=False,
-        optimizer=policy_config.get_optimizer_preset(),
-        scheduler=policy_config.get_scheduler_preset(),
+@pytest.mark.parametrize("training_stage", ["next_action", "flow"])
+@pytest.mark.parametrize("legacy_freeze_flags", [False, True])
+def test_pi05_prompt_cabo_accepts_and_enforces_frozen_vlm(training_stage, legacy_freeze_flags):
+    config = PI05Config(
+        training_stage=training_stage,
+        cabo_enabled=True,
+        train_expert_only=legacy_freeze_flags,
+        freeze_vision_encoder=legacy_freeze_flags,
     )
 
-    with pytest.raises(ValueError, match="use_policy_training_preset"):
-        config.validate()
+    assert config.cabo_active
+    assert config.train_expert_only
+    assert config.freeze_vision_encoder
 
 
-def test_pi05_next_action_stage_does_not_require_cabo_parameter_groups(tmp_path):
+def test_pi05_flow_rejects_vlm_relative_gradient_clipping_with_legacy_unfreeze_flags():
+    with pytest.raises(ValueError, match="always freezes the VLM"):
+        PI05Config(
+            clip_action_head_by_vlm=True,
+            train_expert_only=False,
+            freeze_vision_encoder=False,
+        )
+
+
+@pytest.mark.parametrize("training_stage", ["next_action", "flow"])
+def test_pi05_prompt_cabo_requires_policy_parameter_groups_in_every_stage(tmp_path, training_stage):
     policy_config = PI05Config(
-        training_stage="next_action",
+        training_stage=training_stage,
         cabo_enabled=True,
         push_to_hub=False,
     )
@@ -289,9 +317,12 @@ def test_pi05_next_action_stage_does_not_require_cabo_parameter_groups(tmp_path)
         scheduler=policy_config.get_scheduler_preset(),
     )
 
-    config.validate()
+    with pytest.raises(ValueError, match="named prompt, action expert, and action projection"):
+        config.validate()
 
-    assert not config.cabo_active
+    config.use_policy_training_preset = True
+    config.validate()
+    assert config.cabo_active
 
 
 def test_pi05_cabo_disables_relative_gradient_clipping_hook():
@@ -372,12 +403,13 @@ def test_pi05_leaves_action_gradient_below_ten_times_vlm_rms_unchanged():
         assert torch.equal(parameter.grad, gradient_before)
 
 
-def test_pi05_clips_action_gradient_to_ten_times_vlm_rms_without_modifying_vlm():
+def test_pi05_clips_action_gradient_to_ten_times_vlm_rms_without_modifying_vlm_or_prompt():
     policy, action_parameters, vlm_parameters = _make_policy_with_gradients(
         action_gradient=20.0,
         vlm_gradient=1.0,
     )
     vlm_gradients_before = [parameter.grad.clone() for parameter in vlm_parameters]
+    prompt_gradient_before = policy.model.prompt_tokens.weight.grad.clone()
 
     metrics = PI05Policy.clip_gradients(policy)
 
@@ -390,3 +422,4 @@ def test_pi05_clips_action_gradient_to_ten_times_vlm_rms_without_modifying_vlm()
     assert metrics["action_head_clip_scale"] == pytest.approx(0.5, abs=1e-6)
     for parameter, gradient_before in zip(vlm_parameters, vlm_gradients_before, strict=True):
         assert torch.equal(parameter.grad, gradient_before)
+    assert torch.equal(policy.model.prompt_tokens.weight.grad, prompt_gradient_before)

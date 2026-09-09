@@ -32,6 +32,7 @@ from torch import Tensor, nn
 from torch.optim import AdamW, Optimizer
 
 CABO_VLM_GROUP = "vlm"
+CABO_PROMPT_GROUP = "prompt"
 CABO_ACTION_EXPERT_GROUP = "action_expert"
 CABO_ACTION_PROJECTION_GROUP = "action_projection"
 CABO_GROUP_NAME = "name"
@@ -87,6 +88,8 @@ def get_named_param_group(optimizer: Optimizer, name: str) -> dict[str, Any]:
 
 def validate_adamw_param_group(param_group: Mapping[str, Any]) -> None:
     """Reject AdamW modes the native-dtype candidate computation cannot reproduce."""
+    if isinstance(param_group.get("lr"), Tensor):
+        raise RuntimeError("CABO requires a numeric learning rate; tensor learning rates are not supported")
     unsupported_modes = [
         name
         for name in ("differentiable", "fused", "capturable", "foreach")
@@ -142,8 +145,8 @@ def adamw_candidate_parameter_delta(
     """Compute the next AdamW parameter delta without mutating optimizer state.
 
     ``include_weight_decay=False`` isolates the optimizer's learning component.
-    CABO uses that mode so decoupled weight decay is not mistaken for VLM
-    learning signal when it establishes the action-side update budget.
+    CABO uses that mode so decoupled weight decay is not mistaken for the
+    reference group's learning signal when it establishes the action-side budget.
     """
     if parameter.grad is None:
         return None
@@ -207,9 +210,9 @@ def adamw_group_relative_update_moments(
         update_norm_dtype = torch.float64 if delta.dtype == torch.float64 else torch.float32
         parameter_norm_dtype = torch.float64 if parameter.dtype == torch.float64 else torch.float32
         update_norm = torch.linalg.vector_norm(delta, ord=2, dtype=update_norm_dtype).to(torch.float32)
-        parameter_norm = torch.linalg.vector_norm(
-            parameter.detach(), ord=2, dtype=parameter_norm_dtype
-        ).to(torch.float32)
+        parameter_norm = torch.linalg.vector_norm(parameter.detach(), ord=2, dtype=parameter_norm_dtype).to(
+            torch.float32
+        )
         update_norm_sq.add_(update_norm.square())
         parameter_norm_sq.add_(parameter_norm.square())
         active_numel += parameter.numel()
@@ -226,6 +229,63 @@ def relative_update_rate(update_norm_sq: float, parameter_norm_sq: float) -> flo
     if parameter_norm_sq == 0.0:
         return float("inf")
     return math.sqrt(update_norm_sq / parameter_norm_sq)
+
+
+def update_cabo_prompt_relative_update_scales(
+    *,
+    prompt_rate: float,
+    expert_rate: float,
+    projection_rate: float,
+    prompt_update_ratio: float,
+) -> tuple[float, float, dict[str, float]]:
+    """Limit each action-side update to the current prompt update divided by a ratio.
+
+    The prompt learning rate stays unchanged. There is no moving average,
+    warmup, or reference floor: those could permit an action-side update larger
+    than the current prompt update. A zero prompt update therefore gives a zero
+    budget to any moving action group. A stationary action group needs no cap.
+
+    These scales assume linear learning-rate scaling. Native parameter rounding
+    can violate that assumption, so the caller must verify candidate updates at
+    the scaled learning rates before using them as a strict update bound. A
+    nonfinite or negative input rate sets ``cabo/update_nonfinite``; the caller
+    must skip that optimizer step.
+    """
+    if not math.isfinite(prompt_update_ratio) or prompt_update_ratio < 1.0:
+        raise ValueError("CABO prompt_update_ratio must be finite and at least 1.0")
+
+    finite = all(math.isfinite(rate) and rate >= 0.0 for rate in (prompt_rate, expert_rate, projection_rate))
+    limit = prompt_rate / prompt_update_ratio if finite else float("nan")
+
+    def action_scale(rate: float) -> float:
+        if not finite or rate == 0.0 or rate <= limit:
+            return 1.0
+        scale = limit / rate
+        # Avoid a one-ULP overshoot even in the linear prediction.
+        if scale * rate > limit:
+            scale = math.nextafter(scale, 0.0)
+        return scale
+
+    expert_scale = action_scale(expert_rate)
+    projection_scale = action_scale(projection_rate)
+    return (
+        expert_scale,
+        projection_scale,
+        {
+            "cabo/prompt_relative_update_rate": prompt_rate,
+            "cabo/expert_relative_update_rate": expert_rate,
+            "cabo/projection_relative_update_rate": projection_rate,
+            "cabo/prompt_update_ratio": prompt_update_ratio,
+            "cabo/expert_relative_update_limit": limit,
+            "cabo/projection_relative_update_limit": limit,
+            "cabo/scaled_expert_relative_update_rate": expert_scale * expert_rate,
+            "cabo/scaled_projection_relative_update_rate": projection_scale * projection_rate,
+            "cabo/prompt_scale": 1.0,
+            "cabo/expert_scale": expert_scale,
+            "cabo/projection_scale": projection_scale,
+            "cabo/update_nonfinite": float(not finite),
+        },
+    )
 
 
 def update_cabo_relative_update_scales(
@@ -246,14 +306,18 @@ def update_cabo_relative_update_scales(
     previous_expert_scale = float(controller_group.get("cabo_expert_scale", 1.0))
     previous_projection_scale = float(controller_group.get("cabo_projection_scale", 1.0))
     if not finite:
-        return previous_expert_scale, previous_projection_scale, {
-            "cabo/vlm_relative_update_rate": vlm_rate,
-            "cabo/expert_relative_update_rate": expert_rate,
-            "cabo/projection_relative_update_rate": projection_rate,
-            "cabo/expert_scale": previous_expert_scale,
-            "cabo/projection_scale": previous_projection_scale,
-            "cabo/update_nonfinite": 1.0,
-        }
+        return (
+            previous_expert_scale,
+            previous_projection_scale,
+            {
+                "cabo/vlm_relative_update_rate": vlm_rate,
+                "cabo/expert_relative_update_rate": expert_rate,
+                "cabo/projection_relative_update_rate": projection_rate,
+                "cabo/expert_scale": previous_expert_scale,
+                "cabo/projection_scale": previous_projection_scale,
+                "cabo/update_nonfinite": 1.0,
+            },
+        )
 
     step = int(controller_group.get("cabo_step", 0))
     initialized = bool(controller_group.get("cabo_update_ema_initialized", False))
@@ -279,9 +343,7 @@ def update_cabo_relative_update_scales(
     else:
         expert_scale = 1.0 if expert_rate == 0.0 else min(1.0, expert_ratio * vlm_reference / expert_rate)
         projection_scale = (
-            1.0
-            if projection_rate == 0.0
-            else min(1.0, projection_ratio * vlm_reference / projection_rate)
+            1.0 if projection_rate == 0.0 else min(1.0, projection_ratio * vlm_reference / projection_rate)
         )
 
     controller_group.update(
@@ -295,22 +357,26 @@ def update_cabo_relative_update_scales(
             "cabo_projection_scale": projection_scale,
         }
     )
-    return expert_scale, projection_scale, {
-        "cabo/vlm_relative_update_rate": vlm_rate,
-        "cabo/expert_relative_update_rate": expert_rate,
-        "cabo/projection_relative_update_rate": projection_rate,
-        "cabo/vlm_relative_update_rate_ema": vlm_rate_ema,
-        "cabo/vlm_relative_update_floor": vlm_floor,
-        "cabo/vlm_relative_update_reference": vlm_reference,
-        "cabo/expert_relative_update_limit": expert_ratio * vlm_reference,
-        "cabo/projection_relative_update_limit": projection_ratio * vlm_reference,
-        "cabo/scaled_expert_relative_update_rate": expert_scale * expert_rate,
-        "cabo/scaled_projection_relative_update_rate": projection_scale * projection_rate,
-        "cabo/expert_scale": expert_scale,
-        "cabo/projection_scale": projection_scale,
-        "cabo/warmup_active": float(in_warmup),
-        "cabo/update_nonfinite": 0.0,
-    }
+    return (
+        expert_scale,
+        projection_scale,
+        {
+            "cabo/vlm_relative_update_rate": vlm_rate,
+            "cabo/expert_relative_update_rate": expert_rate,
+            "cabo/projection_relative_update_rate": projection_rate,
+            "cabo/vlm_relative_update_rate_ema": vlm_rate_ema,
+            "cabo/vlm_relative_update_floor": vlm_floor,
+            "cabo/vlm_relative_update_reference": vlm_reference,
+            "cabo/expert_relative_update_limit": expert_ratio * vlm_reference,
+            "cabo/projection_relative_update_limit": projection_ratio * vlm_reference,
+            "cabo/scaled_expert_relative_update_rate": expert_scale * expert_rate,
+            "cabo/scaled_projection_relative_update_rate": projection_scale * projection_rate,
+            "cabo/expert_scale": expert_scale,
+            "cabo/projection_scale": projection_scale,
+            "cabo/warmup_active": float(in_warmup),
+            "cabo/update_nonfinite": 0.0,
+        },
+    )
 
 
 @contextmanager

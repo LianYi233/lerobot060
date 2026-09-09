@@ -623,6 +623,18 @@ def make_policy(
 
         peft_pretrained_path = str(cfg.pretrained_path)
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+        if cfg.type == "pi05" and cfg.num_prompt_tokens > 0:
+            prompt_module = "model.prompt_tokens"
+            saved_modules = getattr(peft_config, "modules_to_save", None) or []
+            if not any(
+                prompt_module == module_name or prompt_module.endswith(f".{module_name}")
+                for module_name in saved_modules
+            ):
+                raise ValueError(
+                    "This PI05 PEFT adapter lacks saved learned prompt tokens. Start from a base "
+                    "checkpoint for new prompt training, or load a matching prompt-enabled adapter. "
+                    "Set num_prompt_tokens=0 only for an explicit legacy adapter ablation."
+                )
 
         kwargs["pretrained_name_or_path"] = peft_config.base_model_name_or_path
         if not kwargs["pretrained_name_or_path"]:
@@ -637,6 +649,9 @@ def make_policy(
         policy = PeftModel.from_pretrained(
             policy, peft_pretrained_path, config=peft_config, is_trainable=True
         )
+        if cfg.type == "pi05":
+            # Adapter loading bypasses PI05Policy.wrap_with_peft and may enable VLM adapters.
+            policy.get_base_model().model._freeze_vlm()
 
     else:
         # Make a fresh policy.

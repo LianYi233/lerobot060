@@ -22,14 +22,35 @@ from lerobot.optim.cabo import (
     CABO_ACTION_EXPERT_GROUP,
     CABO_ACTION_PROJECTION_GROUP,
     CABO_GROUP_NAME,
+    CABO_PROMPT_GROUP,
     CABO_VLM_GROUP,
     adamw_candidate_parameter_delta,
     adamw_group_relative_update_moments,
     get_named_param_group,
     relative_update_rate,
     temporary_optimizer_group_lr_scales,
+    update_cabo_prompt_relative_update_scales,
     update_cabo_relative_update_scales,
+    validate_adamw_param_group,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_adamw_validation_rejects_tensor_learning_rates(dtype: torch.dtype):
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=torch.tensor(0.001, dtype=dtype), foreach=False)
+
+    with pytest.raises(RuntimeError, match="tensor learning rates are not supported"):
+        validate_adamw_param_group(optimizer.param_groups[0])
+
+
+def test_adamw_candidate_rejects_tensor_learning_rate():
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.AdamW([parameter], lr=torch.tensor(0.001), foreach=False)
+
+    with pytest.raises(RuntimeError, match="tensor learning rates are not supported"):
+        adamw_candidate_parameter_delta(parameter, optimizer.param_groups[0], {})
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
@@ -134,9 +155,7 @@ def test_relative_update_controller_limits_expert_and_projection_after_warmup():
         assert projection_scale == pytest.approx(1.0)
         assert metrics["cabo/warmup_active"] == 1.0
 
-    expert_scale, projection_scale, metrics = update_cabo_relative_update_scales(
-        controller_group, **common
-    )
+    expert_scale, projection_scale, metrics = update_cabo_relative_update_scales(controller_group, **common)
 
     assert expert_scale == pytest.approx(0.4)
     assert projection_scale == pytest.approx(0.5)
@@ -200,6 +219,146 @@ def test_relative_update_controller_preserves_state_on_nonfinite_rate():
     assert expert_scale == pytest.approx(0.25)
     assert projection_scale == pytest.approx(0.5)
     assert metrics["cabo/update_nonfinite"] == 1.0
+
+
+@pytest.mark.parametrize("ratio", [1.0, 2.0, 10.0])
+@pytest.mark.parametrize(
+    "expert_rate, projection_rate", [(0.05, 0.10), (0.001, 0.10), (0.001, 0.001), (0.0, 0.0)]
+)
+def test_prompt_controller_caps_both_action_groups_against_current_prompt(
+    ratio: float, expert_rate: float, projection_rate: float
+):
+    prompt_rate = 0.01
+    expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
+        prompt_rate=prompt_rate,
+        expert_rate=expert_rate,
+        projection_rate=projection_rate,
+        prompt_update_ratio=ratio,
+    )
+
+    limit = prompt_rate / ratio
+    for rate, scale in ((expert_rate, expert_scale), (projection_rate, projection_scale)):
+        assert 0.0 <= scale <= 1.0
+        assert rate * scale <= limit
+        if rate <= limit:
+            assert scale == 1.0
+        else:
+            assert scale == pytest.approx(limit / rate)
+    assert metrics["cabo/prompt_relative_update_rate"] == prompt_rate
+    assert metrics["cabo/prompt_update_ratio"] == ratio
+    assert metrics["cabo/prompt_scale"] == 1.0
+    assert metrics["cabo/expert_relative_update_limit"] == limit
+    assert metrics["cabo/projection_relative_update_limit"] == limit
+    assert metrics["cabo/scaled_expert_relative_update_rate"] == expert_scale * expert_rate
+    assert metrics["cabo/scaled_projection_relative_update_rate"] == projection_scale * projection_rate
+    assert metrics["cabo/update_nonfinite"] == 0.0
+
+
+@pytest.mark.parametrize("expert_rate, projection_rate", [(0.1, 0.2), (0.0, 0.2), (0.1, 0.0), (0.0, 0.0)])
+def test_prompt_controller_zero_reference_stops_only_moving_action_groups(
+    expert_rate: float, projection_rate: float
+):
+    expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
+        prompt_rate=0.0,
+        expert_rate=expert_rate,
+        projection_rate=projection_rate,
+        prompt_update_ratio=1.0,
+    )
+
+    assert expert_scale == (0.0 if expert_rate else 1.0)
+    assert projection_scale == (0.0 if projection_rate else 1.0)
+    assert metrics["cabo/scaled_expert_relative_update_rate"] == 0.0
+    assert metrics["cabo/scaled_projection_relative_update_rate"] == 0.0
+    assert metrics["cabo/update_nonfinite"] == 0.0
+
+
+def test_prompt_controller_missing_prompt_gradient_has_zero_update_budget():
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW(
+        [{"params": [parameter], CABO_GROUP_NAME: CABO_PROMPT_GROUP}], lr=0.1, foreach=False
+    )
+    group = get_named_param_group(optimizer, CABO_PROMPT_GROUP)
+    update_sq, parameter_sq, active_numel = adamw_group_relative_update_moments(group, optimizer.state)
+
+    expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
+        prompt_rate=relative_update_rate(update_sq.item(), parameter_sq.item()),
+        expert_rate=0.1,
+        projection_rate=0.2,
+        prompt_update_ratio=1.0,
+    )
+
+    assert active_numel == 0
+    assert expert_scale == projection_scale == 0.0
+    assert metrics["cabo/prompt_relative_update_rate"] == 0.0
+
+
+@pytest.mark.parametrize("invalid_rate", [float("nan"), float("inf"), -float("inf"), -0.1])
+@pytest.mark.parametrize("group", ["prompt_rate", "expert_rate", "projection_rate"])
+def test_prompt_controller_flags_invalid_rates_for_caller_to_skip(group: str, invalid_rate: float):
+    rates = {"prompt_rate": 0.01, "expert_rate": 0.1, "projection_rate": 0.2}
+    rates[group] = invalid_rate
+
+    expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
+        **rates, prompt_update_ratio=1.0
+    )
+
+    assert expert_scale == projection_scale == 1.0
+    assert metrics["cabo/update_nonfinite"] == 1.0
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, -1.0, float("nan"), float("inf"), -float("inf")])
+def test_prompt_controller_rejects_invalid_ratio(ratio: float):
+    with pytest.raises(ValueError, match="finite and at least 1.0"):
+        update_cabo_prompt_relative_update_scales(
+            prompt_rate=0.01, expert_rate=0.1, projection_rate=0.2, prompt_update_ratio=ratio
+        )
+
+
+def test_prompt_controller_uses_current_reference_without_history():
+    common = {"expert_rate": 0.1, "projection_rate": 0.2, "prompt_update_ratio": 1.0}
+    update_cabo_prompt_relative_update_scales(prompt_rate=0.5, **common)
+
+    expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
+        prompt_rate=0.001, **common
+    )
+
+    assert expert_scale == pytest.approx(0.01)
+    assert projection_scale == pytest.approx(0.005)
+    assert metrics["cabo/expert_relative_update_limit"] == 0.001
+
+
+def test_prompt_controller_linear_scale_requires_native_dtype_candidate_verification():
+    parameter = nn.Parameter(torch.tensor([0.01], dtype=torch.bfloat16))
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.AdamW(
+        [{"params": [parameter], CABO_GROUP_NAME: CABO_ACTION_EXPERT_GROUP}],
+        lr=0.0001,
+        betas=(0.0, 0.0),
+        eps=1e-8,
+        weight_decay=0.0,
+        foreach=False,
+    )
+    group = get_named_param_group(optimizer, CABO_ACTION_EXPERT_GROUP)
+    original_delta = adamw_candidate_parameter_delta(parameter, group, {}, include_weight_decay=False)
+    expert_rate = abs(original_delta.item() / parameter.item())
+    prompt_rate = 0.33 * expert_rate
+    expert_scale, _, metrics = update_cabo_prompt_relative_update_scales(
+        prompt_rate=prompt_rate,
+        expert_rate=expert_rate,
+        projection_rate=0.0,
+        prompt_update_ratio=1.0,
+    )
+
+    with temporary_optimizer_group_lr_scales(optimizer, {CABO_ACTION_EXPERT_GROUP: expert_scale}):
+        scaled_delta = adamw_candidate_parameter_delta(parameter, group, {}, include_weight_decay=False)
+        scaled_rate = abs(scaled_delta.item() / parameter.item())
+        before = parameter.detach().float().clone()
+        optimizer.step()
+
+    # BF16 rounding makes the true motion larger than the linear prediction.
+    assert metrics["cabo/scaled_expert_relative_update_rate"] <= prompt_rate
+    assert scaled_rate > prompt_rate
+    torch.testing.assert_close(parameter.detach().float() - before, scaled_delta, rtol=0.0, atol=0.0)
 
 
 def test_temporary_group_lr_scales_apply_and_restore_both_action_groups():

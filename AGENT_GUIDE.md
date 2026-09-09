@@ -246,6 +246,10 @@ All policies typically train for **5–10 epochs** (see §7).
 
 **Critical caveats:**
 
+- **π₀.₅ variant:** this repository now trains prompt embeddings between VLM and action tokens while
+  always freezing the complete VLM. The π₀.₅ profiling numbers above predate this change and have
+  not been re-measured. Use `--policy.num_prompt_tokens=16 --policy.train_expert_only=true`; see the
+  [π₀.₅ training guide](./docs/source/pi05.mdx) for the training stages and checkpoint migration.
 - **Optimizer:** measured with **SGD**. LeRobot's default is **AdamW**, which keeps extra optimizer state → **peak memory will be noticeably higher** with the default, especially for `pi0`, `pi05`, `wall_x`, `xvla`.
 - **Batch size:** the large policies were profiled at batch 1. In practice use a **larger batch** for stable training (see §7.4). Memory scales roughly linearly with batch.
 

@@ -746,7 +746,7 @@ def _train_single_stage(
             if cfg.cabo_active and incompatible_groups:
                 raise ValueError(
                     "A non-CABO optimizer checkpoint cannot be resumed with CABO enabled because CABO "
-                    "uses named VLM, action expert, and action projection parameter groups. Start a "
+                    "uses named prompt, action expert, and action projection parameter groups. Start a "
                     "new run from the checkpoint's model weights, or resume a checkpoint that was "
                     "already trained with this CABO parameter-group layout."
                 ) from exc

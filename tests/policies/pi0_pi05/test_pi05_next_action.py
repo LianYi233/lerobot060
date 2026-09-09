@@ -351,16 +351,24 @@ def test_flow_inpainting_action_block_is_bidirectional_and_padding_is_removed():
 
     call = core.paligemma_with_expert.last_call
     allowed = call["attention_mask"][:, 0].eq(0)
+    num_prompts = core.config.num_prompt_tokens
     assert velocity.shape == x_t.shape
-    assert allowed[0].all()
-    assert allowed[1, :-3, :-3].all()
+    assert allowed[:, :num_prompts, :num_prompts].all()
+    assert not allowed[:, :num_prompts, num_prompts:].any()
+    assert allowed[0, num_prompts:, :].all()
+    assert allowed[1, num_prompts:-3, :-3].all()
     assert not allowed[1, -3:, :].any()
     assert not allowed[1, :, -3:].any()
-    torch.testing.assert_close(call["position_ids"], torch.arange(_HORIZON).unsqueeze(0).expand(2, -1))
+    torch.testing.assert_close(
+        call["position_ids"], torch.arange(num_prompts + _HORIZON).unsqueeze(0).expand(2, -1)
+    )
     expected_embs = core.action_in_proj(x_t)
     visible = ~action_is_pad & ~inpainting_mask
     expected_embs = expected_embs + visible.unsqueeze(-1) * core.inpainting_visible_action_embedding.weight[0]
-    torch.testing.assert_close(call["suffix_embs"], expected_embs)
+    torch.testing.assert_close(call["suffix_embs"][:, num_prompts:], expected_embs)
+    torch.testing.assert_close(
+        call["suffix_embs"][:, :num_prompts], core.prompt_tokens.weight.unsqueeze(0).expand(2, -1, -1)
+    )
 
 
 def test_action_only_full_mask_never_applies_visible_action_role():
@@ -376,7 +384,7 @@ def test_action_only_full_mask_never_applies_visible_action_role():
     core.predict_inpainting_velocity(x_t, torch.tensor([0.5]), action_is_pad, inpainting_mask)
 
     torch.testing.assert_close(
-        core.paligemma_with_expert.last_call["suffix_embs"],
+        core.paligemma_with_expert.last_call["suffix_embs"][:, core.config.num_prompt_tokens :],
         core.action_in_proj(x_t),
     )
 
@@ -496,6 +504,7 @@ def test_action_only_flow_trains_complete_action_path_and_freezes_vlm():
 
     trainable = {name for name, parameter in policy.named_parameters() if parameter.requires_grad}
     expected_prefixes = (
+        "model.prompt_tokens.",
         "model.paligemma_with_expert.gemma_expert.",
         "model.action_in_proj.",
         "model.action_out_proj.",
@@ -506,6 +515,7 @@ def test_action_only_flow_trains_complete_action_path_and_freezes_vlm():
     assert all(name.startswith(expected_prefixes) for name in trainable)
     assert all(any(name.startswith(prefix) for name in trainable) for prefix in expected_prefixes)
     for parameter_name in (
+        "model.prompt_tokens.weight",
         "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
         "model.action_in_proj.weight",
         "model.action_out_proj.weight",
@@ -560,6 +570,7 @@ def test_flow_inpainting_forward_supports_gradient_checkpointing():
     assert policy.model.action_out_proj.weight.grad is not None
     assert policy.model.time_mlp_in.weight.grad is not None
     assert policy.model.time_mlp_out.weight.grad is not None
+    assert policy.model.prompt_tokens.weight.grad is not None
     assert policy.model.inpainting_visible_action_embedding.weight.grad is None
 
 
@@ -730,6 +741,7 @@ def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
 
     def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
         embeddings = policy.model.action_in_proj(x_t)
+        embeddings = embeddings + policy.model.prompt_tokens.weight.mean(dim=0)
         expert = policy.model.paligemma_with_expert.gemma_expert
         embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
         time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
@@ -753,6 +765,7 @@ def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
     assert not vlm.training
     assert all(not parameter.requires_grad and parameter.grad is None for parameter in vlm.parameters())
     for parameter_name in (
+        "model.prompt_tokens.weight",
         "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
         "model.action_in_proj.weight",
         "model.action_out_proj.weight",
@@ -773,6 +786,7 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
 
     def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
         embeddings = policy.model.action_in_proj(x_t)
+        embeddings = embeddings + policy.model.prompt_tokens.weight.mean(dim=0)
         expert = policy.model.paligemma_with_expert.gemma_expert
         embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
         time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
@@ -818,6 +832,7 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
     )
     optimizer_step = optimizer.state[policy.model.action_in_proj.weight]["step"]
     assert optimizer_step.item() == 4
+    assert optimizer.state[policy.model.prompt_tokens.weight]["step"].item() == 4
 
 
 def test_flow_all_padded_actions_return_graph_connected_zero(monkeypatch):
@@ -949,9 +964,11 @@ def test_flow_inpainting_checkpoint_rejects_action_inference_before_preprocessin
         getattr(policy, method_name)({})
 
 
-def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage2(tmp_path):
-    source = _make_policy("next_action")
+@pytest.mark.parametrize("cabo_enabled", [False, True])
+def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage2(tmp_path, cabo_enabled):
+    source = _make_policy("next_action", cabo_enabled=cabo_enabled)
     with torch.no_grad():
+        source.model.prompt_tokens.weight.fill_(0.125)
         source.model.action_in_proj.weight.fill_(0.25)
         source.model.action_in_proj.bias.fill_(-0.5)
         source.model.action_out_proj.weight.fill_(1.25)
@@ -961,7 +978,7 @@ def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage
         source.model.inpainting_visible_action_embedding.weight.fill_(3.75)
         source.model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.fill_(4.25)
 
-    flow_template = _make_policy("flow")
+    flow_template = _make_policy("flow", cabo_enabled=cabo_enabled)
     assert set(source.state_dict()) == set(flow_template.state_dict())
     assert not hasattr(source.model, "next_action_query")
     assert not hasattr(source.model, "next_action_out_proj")
@@ -970,12 +987,12 @@ def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage
 
     resumed = PI05Policy.from_pretrained(
         checkpoint,
-        config=_make_config("next_action"),
+        config=_make_config("next_action", cabo_enabled=cabo_enabled),
         local_files_only=True,
     )
     flow = PI05Policy.from_pretrained(
         checkpoint,
-        config=_make_config("flow"),
+        config=_make_config("flow", cabo_enabled=cabo_enabled),
         local_files_only=True,
     )
 
@@ -994,15 +1011,24 @@ def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage
         rtol=0,
         atol=0,
     )
-    assert not flow.config.cabo_active
+    assert flow.config.cabo_active is cabo_enabled
     assert not flow.config.clip_action_head_by_vlm
     optimizer_parameters = flow.get_optim_params()
+    if cabo_enabled:
+        assert [group["name"] for group in optimizer_parameters] == [
+            "prompt",
+            "action_expert",
+            "action_projection",
+        ]
+        optimizer_parameters = [parameter for group in optimizer_parameters for parameter in group["params"]]
     assert all(isinstance(parameter, nn.Parameter) for parameter in optimizer_parameters)
     assert {id(parameter) for parameter in optimizer_parameters} == {
         id(parameter) for parameter in flow.parameters() if parameter.requires_grad
     }
     for name, parameter in flow.named_parameters():
-        if name == "model.inpainting_visible_action_embedding.weight":
+        if name == "model.inpainting_visible_action_embedding.weight" or name.startswith(
+            "model.paligemma_with_expert.paligemma."
+        ):
             assert not parameter.requires_grad
         else:
             assert parameter.requires_grad
