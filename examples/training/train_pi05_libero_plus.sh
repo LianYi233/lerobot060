@@ -95,7 +95,7 @@ accelerate launch \
   --policy.type=pi05 \
   --policy.repo_id="${POLICY_REPO_ID}" \
   --policy.pretrained_path="${PRETRAINED}" \
-  --policy.compile_model=true \
+  --policy.compile_model=false \
   --policy.gradient_checkpointing=true \
   --policy.dtype=bfloat16 \
   --policy.freeze_vision_encoder=false \
