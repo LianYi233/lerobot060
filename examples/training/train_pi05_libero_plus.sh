@@ -40,6 +40,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 CABO_ENABLED="${CABO_ENABLED:-true}"
+AUTO_AUGMENT_QUANTILES="${AUTO_AUGMENT_QUANTILES:-true}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export LEROBOT_GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS}"
@@ -48,6 +49,16 @@ if [[ -n "${DATASET_ROOT}" && ! -d "${DATASET_ROOT}" ]]; then
   echo "ERROR: DATASET_ROOT does not exist: ${DATASET_ROOT}" >&2
   echo "Download lerobot/libero_plus there first, or override DATASET_ROOT." >&2
   exit 2
+fi
+
+# PI0.5 uses QUANTILES normalization for observation.state and action. The
+# public LIBERO-Plus LeRobot metadata may not contain q01/q99. Add those
+# statistics locally before launching DDP; this reads only parquet state/action
+# columns and never decodes videos or contacts the Hub.
+if [[ "${AUTO_AUGMENT_QUANTILES}" == "true" && -n "${DATASET_ROOT}" ]]; then
+  echo "Checking PI0.5 quantile statistics in ${DATASET_ROOT}/meta/stats.json ..."
+  python -m lerobot.scripts.augment_libero_plus_quantiles \
+    --root "${DATASET_ROOT}"
 fi
 
 EFFECTIVE_BATCH=$((BATCH_SIZE * NUM_PROCESSES * GRAD_ACCUM_STEPS))
