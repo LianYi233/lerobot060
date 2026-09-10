@@ -701,9 +701,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # FP32 also requires full-precision matmuls and vision convolutions. The trainer may
+        # have enabled TF32 before constructing the model; override it before compiling.
+        if config.dtype == "float32":
+            torch.set_float32_matmul_precision("highest")
+            torch.backends.cudnn.allow_tf32 = False
+        elif config.compile_model:
+            torch.set_float32_matmul_precision("high")
+
         # Compile model if requested
         if config.compile_model:
-            torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)

@@ -139,6 +139,9 @@ for loading older checkpoints and no longer affect training.
 - **`--policy.compile_model=true`**: Enables model compilation for faster training
 - **`--policy.gradient_checkpointing=true`**: Reduces memory usage significantly during training
 - **`--policy.dtype=bfloat16`**: Use mixed precision training for efficiency
+- For full FP32 training, use `accelerate launch --mixed_precision=no` with
+  `--policy.dtype=float32 --policy.use_amp=false`. PI05 also disables TF32 matrix multiplications
+  and cuDNN convolutions in this mode, including when `compile_model=true`.
 - **`--policy.num_vlm_prompt_tokens=16`**: Number of trainable VLM embeddings after observation/language tokens
 - **`--policy.num_prompt_tokens=16`**: Number of trainable expert embeddings before the action tokens
 - **`--policy.cabo_enabled=true`**: Enable CABO between the VLM and expert prompt banks

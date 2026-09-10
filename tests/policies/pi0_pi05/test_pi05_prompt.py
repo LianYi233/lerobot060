@@ -41,6 +41,15 @@ _PROMPT_KEYS = {_VLM_PROMPT_KEY, _PROMPT_KEY}
 
 
 @pytest.fixture(autouse=True)
+def _restore_matmul_precision():
+    precision = torch.get_float32_matmul_precision()
+    cudnn_allow_tf32 = torch.backends.cudnn.allow_tf32
+    yield
+    torch.set_float32_matmul_precision(precision)
+    torch.backends.cudnn.allow_tf32 = cudnn_allow_tf32
+
+
+@pytest.fixture(autouse=True)
 def _tiny_real_pi05(monkeypatch):
     """Reduce allocation sizes, retaining all production model implementations."""
     original_paligemma = modeling_pi05.PaliGemmaForConditionalGenerationWithPiGemma
@@ -118,6 +127,53 @@ def _save_checkpoint(path, policy, state_dict=None):
     save_file(
         {key: value.detach().cpu().clone() for key, value in state_dict.items()}, path / "model.safetensors"
     )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("compile_model", [False, True])
+def test_model_precision_applies_before_compile(monkeypatch, dtype, compile_model):
+    torch.set_float32_matmul_precision("medium")
+    torch.backends.cudnn.allow_tf32 = True
+    compile_calls = []
+
+    def capture_compile(function, *, mode):
+        compile_calls.append(
+            (
+                function.__name__,
+                mode,
+                torch.get_float32_matmul_precision(),
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        return function
+
+    monkeypatch.setattr(torch, "compile", capture_compile)
+    cfg = _config(dtype=dtype, compile_model=compile_model)
+    policy = PI05Policy(cfg)
+
+    expected_precision = "highest" if dtype == "float32" else "high" if compile_model else "medium"
+    expected_tf32 = dtype != "float32"
+    assert torch.get_float32_matmul_precision() == expected_precision
+    assert torch.backends.cuda.matmul.allow_tf32 is expected_tf32
+    assert torch.backends.cudnn.allow_tf32 is expected_tf32
+    if compile_model:
+        assert compile_calls == [
+            ("sample_actions", cfg.compile_mode, expected_precision, expected_tf32),
+            ("forward", cfg.compile_mode, expected_precision, expected_tf32),
+        ]
+    else:
+        assert not compile_calls
+
+    if dtype == "float32":
+        assert all(parameter.dtype == torch.float32 for parameter in policy.parameters())
+    else:
+        backbone = policy.model.paligemma_with_expert
+        assert (
+            backbone.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+        )
+        assert backbone.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+    assert policy.model.vlm_prompt_tokens.weight.dtype == torch.float32
+    assert policy.model.prompt_tokens.weight.dtype == torch.float32
 
 
 @pytest.mark.parametrize("field", ["num_prompt_tokens", "num_vlm_prompt_tokens"])

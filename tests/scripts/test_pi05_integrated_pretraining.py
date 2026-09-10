@@ -287,6 +287,38 @@ def test_zero_pretraining_steps_runs_only_flow(monkeypatch, tmp_path):
     assert accelerator.end_training_calls == 1
 
 
+@pytest.mark.parametrize("dtype, mixed_precision", [("float32", "no"), ("bfloat16", "bf16")])
+def test_integrated_pretraining_preserves_policy_precision(monkeypatch, tmp_path, dtype, mixed_precision):
+    import accelerate
+
+    cfg = _make_flow_config(tmp_path, dtype=dtype)
+    accelerator = _FakeAccelerator()
+    accelerator_calls = []
+    stages = []
+    # The policy dtype must win over stale launcher defaults, including when disabling AMP.
+    monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", "bf16" if dtype == "float32" else "no")
+
+    def create_accelerator(**kwargs):
+        accelerator_calls.append(kwargs)
+        return accelerator
+
+    def fake_train_single_stage(stage_cfg, stage_accelerator, *, enable_pi05_stage1_bridge=False):
+        stages.append((stage_cfg.policy.training_stage, stage_cfg.policy.dtype, stage_accelerator))
+        if stage_cfg.policy.training_stage == "next_action":
+            assert enable_pi05_stage1_bridge
+            train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(parents=True)
+
+    monkeypatch.setattr(accelerate, "Accelerator", create_accelerator)
+    monkeypatch.setattr(train_module, "_train_single_stage", fake_train_single_stage)
+
+    train_module.train(cfg)
+
+    assert len(accelerator_calls) == 1
+    assert accelerator_calls[0]["mixed_precision"] == mixed_precision
+    assert stages == [("next_action", dtype, accelerator), ("flow", dtype, accelerator)]
+    assert accelerator.end_training_calls == 1
+
+
 def test_distributed_pretraining_requires_checkpoint_visible_to_every_rank(monkeypatch, tmp_path):
     cfg = _make_flow_config(tmp_path)
     cfg.validate()
