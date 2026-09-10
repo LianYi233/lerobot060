@@ -19,42 +19,57 @@ It is designed as a **Vision-Language-Action model with open-world generalizatio
 
 ## Training Defaults
 
-This repository's variant uses `[VLM tokens] [prompt tokens] [action tokens]`, with 16 trainable
-prompt embeddings by default (`num_prompt_tokens=16`, `prompt_init_std=0.02`). Prompts use the action
-expert's embedding width. VLM tokens see the VLM prefix; prompts see the prefix and all prompts;
-actions see all three blocks. Set `num_prompt_tokens=0` for an ablation without prompts.
+This repository's variant uses
+`[VLM observation/language tokens] [VLM prompt tokens] [expert prompt tokens] [action tokens]`.
+There are 16 trainable embeddings on each side by default (`num_vlm_prompt_tokens=16`,
+`num_prompt_tokens=16`, `prompt_init_std=0.02`), using their respective backbone widths.
+With the default VLM/expert variants, the two banks have **32,768 + 16,384 = 49,152 trainable
+parameters**. VLM prompts see observation/language tokens and all VLM prompts; expert prompts see
+the full VLM prefix and all expert prompts; actions see all four blocks. Observation/language
+tokens do not attend to the prompts.
 
-The entire VLM, including the vision encoder, stays frozen in every training stage.
-`freeze_vision_encoder=true` and `train_expert_only=true` are enforced even when loading older
-configurations. Prompts and the complete action path train during action-only Stage 1, the
-observation-conditioned bridge, and Stage 2. At inference, the VLM prefix is cached and prompts are
-processed with actions at each denoising step; the action chunk length is unchanged.
+The entire VLM, action expert, action projections, and timestep MLP stay frozen in every phase.
+`freeze_vision_encoder=true` and `train_expert_only=true` remain enforced legacy flags. The training
+curriculum is unchanged: action-only inpainting updates expert prompts; the observation-conditioned
+bridge and formal flow training update both prompt banks. At inference, VLM prompts are cached with
+the VLM prefix and expert prompts are processed with actions at each denoising step; the action
+chunk length is unchanged. With `cabo_enabled=false`, either prompt count may be `0` for an ablation.
+Inpainting requires expert prompts, and training requires a nonempty bank. Both counts may be `0`
+for inference with CABO disabled.
 
-Fresh configurations use a unified AdamW learning rate of `2.5e-5` for prompts and action-side
-parameters, followed by cosine decay to a `1e-5` floor. Global gradient clipping is disabled
+Fresh configurations use a unified AdamW learning rate of `2.5e-5` for both prompt banks,
+followed by cosine decay to a `1e-5` floor. Global gradient clipping is disabled
 (`optimizer_grad_clip_norm=0.0`). VLM-relative gradient clipping (`clip_action_head_by_vlm`) must
 remain `false` for flow training.
 
-CABO is optional and uses the prompt as its update reference. Enable it with
-`--policy.cabo_enabled=true --policy.cabo_prompt_update_ratio=1.0`. It keeps the prompt's full
-scheduled learning rate and attenuates the current step's learning rate for the action expert and
-the projections/timestep MLP so that each group's relative learning update is no larger than the
-prompt's. The relative update is `||delta_theta|| / ||theta||`, including AdamW preconditioning and
-the learning rate, but excluding weight decay. A ratio above `1.0` increases the required prompt
-advantage. CABO applies from the first update in every stage, requires nonzero prompt tokens, and
-keeps the complete VLM frozen. Legacy VLM-based CABO ratios, EMA, warmup, and floor settings are
-loadable but inactive; the ordinary learning-rate scheduler is unchanged. CABO is disabled by default.
+CABO is enabled by default (`cabo_enabled=true`, `cabo_prompt_update_ratio=2.0`) and requires both
+prompt banks. It uses named AdamW groups `vlm_prompt` and `action_prompt`. In the bridge and formal
+flow phases, it limits the expert prompt's relative learning update to at most half of the VLM
+prompt's: `r_action <= r_vlm / 2`, where `r = ||AdamW learning delta||₂ / ||prompt parameters||₂`
+excludes decoupled weight decay. Only expert prompt updates above the cap are attenuated; VLM
+updates are unchanged. Action-only inpainting bypasses CABO and updates expert prompts normally,
+because its forward path omits the VLM. The three phases and learning-rate scheduler are unchanged.
+Use a larger `cabo_prompt_update_ratio` for a lower expert prompt cap, or `cabo_enabled=false` to
+disable CABO. The ratio accepts values of at least `1.0`. CABO requires
+`use_policy_training_preset=true` so its named groups are constructed correctly.
 
-Loading a base or older full-model checkpoint without prompt weights initializes new prompts. Loading a
-checkpoint saved by this variant preserves its learned prompts. To migrate an older training run,
-initialize a new run from its model weights: the old optimizer state may not support direct resume
-after adding prompts and freezing the VLM. Enabling prompt-based CABO requires named `prompt`,
-`action_expert`, and `action_projection` optimizer groups, so changing from a non-CABO or older
-VLM-based CABO run also requires a fresh optimizer initialized from saved model weights. See the
-[training guide](./pi05.mdx) for the two-stage curriculum and checkpoint details.
+The old expert/projection update ratios and CABO EMA, warmup, and floor settings remain loadable
+for compatibility but do not affect prompt CABO, which uses the current VLM prompt update.
 
-Legacy PEFT adapters without saved `prompt_tokens` require `num_prompt_tokens=0`; for prompt
-training, use a prompt-enabled adapter or initialize from a full-model checkpoint.
+Loading a base or older full-model checkpoint initializes missing prompt banks while preserving
+existing prompt weights. Loading a checkpoint saved by this variant preserves both learned banks.
+To migrate an older training run, initialize a new run from its model weights: the old optimizer
+layout differs after adding VLM prompts and freezing the action path. The former single-group
+prompt optimizer also differs from CABO's two named prompt groups. See the
+[training guide](./pi05.mdx) for the curriculum and checkpoint details.
+Saved CABO settings are preserved. When loading a checkpoint that stored CABO disabled or ratio
+`1.0`, pass `--policy.cabo_enabled=true --policy.cabo_prompt_update_ratio=2.0` explicitly.
+
+PEFT defaults to saving only the two prompt banks through `modules_to_save`, with no backbone LoRA
+adapters. Any custom backbone adapters remain frozen. Legacy adapters must save every enabled bank:
+set `num_vlm_prompt_tokens=0` for an expert-prompt-only adapter, or both counts to `0` for inference
+with an adapter containing neither bank; set `cabo_enabled=false` in either case. Initialize from a
+full-model checkpoint to add missing banks.
 
 ---
 
@@ -88,7 +103,10 @@ Joints listed in `relative_exclude_joints` (e.g., gripper) are kept absolute.
 uv run lerobot-train \
   --policy.type=pi05 \
   --dataset.repo_id=your_org/your_dataset \
+  --policy.num_vlm_prompt_tokens=16 \
   --policy.num_prompt_tokens=16 \
+  --policy.cabo_enabled=true \
+  --policy.cabo_prompt_update_ratio=2.0 \
   --policy.train_expert_only=true \
   --policy.use_relative_actions=true \
   --policy.relative_exclude_joints='["gripper"]'

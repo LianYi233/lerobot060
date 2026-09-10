@@ -363,7 +363,7 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     if cfg.policy.use_peft or cfg.peft is not None:
         raise ValueError(
             "Integrated PI0.5 Stage 1 does not support PEFT. Use a standard PI0.5 "
-            "base/flow checkpoint as --policy.path and run full-parameter flow training."
+            "base/flow checkpoint as --policy.path and run prompt training without a PEFT wrapper."
         )
 
     pretrain_cfg = copy.deepcopy(cfg)
@@ -745,8 +745,8 @@ def _train_single_stage(
             incompatible_groups = "parameter group" in str(exc).lower() or "param_groups" in str(exc).lower()
             if cfg.cabo_active and incompatible_groups:
                 raise ValueError(
-                    "A non-CABO optimizer checkpoint cannot be resumed with CABO enabled because CABO "
-                    "uses named prompt, action expert, and action projection parameter groups. Start a "
+                    "An incompatible optimizer checkpoint cannot be resumed with CABO enabled because "
+                    "CABO uses named VLM prompt and action prompt parameter groups. Start a "
                     "new run from the checkpoint's model weights, or resume a checkpoint that was "
                     "already trained with this CABO parameter-group layout."
                 ) from exc

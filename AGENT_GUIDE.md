@@ -246,9 +246,13 @@ All policies typically train for **5–10 epochs** (see §7).
 
 **Critical caveats:**
 
-- **π₀.₅ variant:** this repository now trains prompt embeddings between VLM and action tokens while
-  always freezing the complete VLM. The π₀.₅ profiling numbers above predate this change and have
-  not been re-measured. Use `--policy.num_prompt_tokens=16 --policy.train_expert_only=true`; see the
+- **π₀.₅ variant:** this repository trains only VLM-side and expert-side prompt embeddings while
+  freezing the complete VLM, action expert, and projections. The default 16 prompts per side total
+  49,152 trainable parameters. The π₀.₅ profiling numbers above predate this change and have not been
+  re-measured. CABO is enabled by default (`--policy.cabo_prompt_update_ratio=2.0`): in the bridge
+  and formal flow phases, it caps the expert prompt's relative AdamW learning update at half the
+  VLM prompt's, excluding weight decay. Action-only inpainting bypasses CABO and updates expert
+  prompts normally. Use `--policy.num_vlm_prompt_tokens=16 --policy.num_prompt_tokens=16`; see the
   [π₀.₅ training guide](./docs/source/pi05.mdx) for the training stages and checkpoint migration.
 - **Optimizer:** measured with **SGD**. LeRobot's default is **AdamW**, which keeps extra optimizer state → **peak memory will be noticeably higher** with the default, especially for `pi0`, `pi05`, `wall_x`, `xvla`.
 - **Batch size:** the large policies were profiled at batch 1. In practice use a **larger batch** for stable training (see §7.4). Memory scales roughly linearly with batch.

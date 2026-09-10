@@ -24,6 +24,7 @@ from torch import nn
 pytest.importorskip("transformers")
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
+from lerobot.optim.cabo import temporary_optimizer_group_lr_scales  # noqa: E402
 from lerobot.policies.pi05 import (  # noqa: E402
     PI05Config,
     PI05Policy,
@@ -448,10 +449,11 @@ def test_flow_inpainting_all_padded_actions_return_graph_connected_zero():
     assert loss.requires_grad
     assert metrics["flow_inpainting/masked_valid_count"] == 0
     assert metrics["flow_inpainting/masked_valid_fraction"] == 0.0
-    assert policy.model.action_out_proj.weight.grad is not None
-    assert torch.count_nonzero(policy.model.action_out_proj.weight.grad) == 0
-    assert policy.model.action_in_proj.weight.grad is not None
-    assert torch.count_nonzero(policy.model.action_in_proj.weight.grad) == 0
+    assert policy.model.prompt_tokens.weight.grad is not None
+    assert torch.count_nonzero(policy.model.prompt_tokens.weight.grad) == 0
+    assert policy.model.vlm_prompt_tokens.weight.grad is None
+    assert policy.model.action_out_proj.weight.grad is None
+    assert policy.model.action_in_proj.weight.grad is None
     assert all(
         parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in policy.parameters()
     )
@@ -484,9 +486,9 @@ def test_flow_inpainting_validates_padding_and_explicit_masks():
         )
 
 
-def test_action_only_flow_trains_complete_action_path_and_freezes_vlm():
+def test_action_only_flow_updates_only_expert_prompt_with_all_backbones_frozen():
     torch.manual_seed(5)
-    policy = _make_policy()
+    policy = _make_policy(cabo_enabled=False)
     core = policy.model
     actions = torch.randn(2, _HORIZON, _MAX_ACTION_DIM)
     action_is_pad = torch.zeros(2, _HORIZON, dtype=torch.bool)
@@ -503,29 +505,17 @@ def test_action_only_flow_trains_complete_action_path_and_freezes_vlm():
     losses[inpainting_mask].mean().backward()
 
     trainable = {name for name, parameter in policy.named_parameters() if parameter.requires_grad}
-    expected_prefixes = (
-        "model.prompt_tokens.",
-        "model.paligemma_with_expert.gemma_expert.",
-        "model.action_in_proj.",
-        "model.action_out_proj.",
-        "model.time_mlp_in.",
-        "model.time_mlp_out.",
+    assert trainable == {"model.vlm_prompt_tokens.weight", "model.prompt_tokens.weight"}
+    gradient = core.prompt_tokens.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+    assert core.vlm_prompt_tokens.weight.grad is None
+    assert all(
+        not parameter.requires_grad and parameter.grad is None
+        for name, parameter in policy.named_parameters()
+        if name not in trainable
     )
-    assert trainable
-    assert all(name.startswith(expected_prefixes) for name in trainable)
-    assert all(any(name.startswith(prefix) for name in trainable) for prefix in expected_prefixes)
-    for parameter_name in (
-        "model.prompt_tokens.weight",
-        "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
-        "model.action_in_proj.weight",
-        "model.action_out_proj.weight",
-        "model.time_mlp_in.weight",
-        "model.time_mlp_out.weight",
-    ):
-        gradient = dict(policy.named_parameters())[parameter_name].grad
-        assert gradient is not None
-        assert torch.isfinite(gradient).all()
-        assert torch.count_nonzero(gradient) > 0
 
     role_parameter = dict(policy.named_parameters())["model.inpainting_visible_action_embedding.weight"]
     assert not role_parameter.requires_grad
@@ -562,16 +552,12 @@ def test_flow_inpainting_forward_supports_gradient_checkpointing():
     )
     loss.backward()
 
-    assert policy.model.action_in_proj.weight.grad is not None
-    assert (
-        policy.model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.grad
-        is not None
-    )
-    assert policy.model.action_out_proj.weight.grad is not None
-    assert policy.model.time_mlp_in.weight.grad is not None
-    assert policy.model.time_mlp_out.weight.grad is not None
-    assert policy.model.prompt_tokens.weight.grad is not None
-    assert policy.model.inpainting_visible_action_embedding.weight.grad is None
+    gradient = policy.model.prompt_tokens.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+    assert policy.model.vlm_prompt_tokens.weight.grad is None
+    assert all(parameter.grad is None for parameter in policy.parameters() if not parameter.requires_grad)
 
 
 @pytest.mark.skipif(
@@ -732,7 +718,7 @@ def test_stage1_bridge_uses_full_flow_loss_and_overwrites_inpainting_denominator
     assert torch.count_nonzero(raw_losses.grad[1, 7:]) == 0
 
 
-def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
+def test_stage1_bridge_backpropagates_to_both_prompt_banks(monkeypatch):
     policy = _make_policy("next_action", next_action_bridge_steps=250)
     policy.set_training_progress(step=750, total_steps=1_000)
     policy.train()
@@ -742,6 +728,8 @@ def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
     def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
         embeddings = policy.model.action_in_proj(x_t)
         embeddings = embeddings + policy.model.prompt_tokens.weight.mean(dim=0)
+        vlm_features = policy.model.paligemma_with_expert.paligemma(policy.model.vlm_prompt_tokens.weight)
+        embeddings = embeddings + vlm_features.mean(dim=0)
         expert = policy.model.paligemma_with_expert.gemma_expert
         embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
         time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
@@ -766,20 +754,18 @@ def test_stage1_bridge_backpropagates_only_through_the_action_path(monkeypatch):
     assert all(not parameter.requires_grad and parameter.grad is None for parameter in vlm.parameters())
     for parameter_name in (
         "model.prompt_tokens.weight",
-        "model.paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
-        "model.action_in_proj.weight",
-        "model.action_out_proj.weight",
-        "model.time_mlp_in.weight",
-        "model.time_mlp_out.weight",
+        "model.vlm_prompt_tokens.weight",
     ):
         gradient = dict(policy.named_parameters())[parameter_name].grad
         assert gradient is not None
         assert torch.isfinite(gradient).all()
         assert torch.count_nonzero(gradient) > 0
+    assert all(parameter.grad is None for parameter in policy.parameters() if not parameter.requires_grad)
 
 
-def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeypatch):
-    policy = _make_policy("next_action", next_action_bridge_steps=1)
+@pytest.mark.parametrize("cabo_enabled", [False, True])
+def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeypatch, cabo_enabled):
+    policy = _make_policy("next_action", next_action_bridge_steps=1, cabo_enabled=cabo_enabled)
     policy.train()
     batch_size = 2
     monkeypatch.setattr(policy, "_preprocess_images", lambda _batch: ([], []))
@@ -787,6 +773,8 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
     def action_path_velocity(_images, _img_masks, _tokens, _masks, x_t, time):
         embeddings = policy.model.action_in_proj(x_t)
         embeddings = embeddings + policy.model.prompt_tokens.weight.mean(dim=0)
+        vlm_features = policy.model.paligemma_with_expert.paligemma(policy.model.vlm_prompt_tokens.weight)
+        embeddings = embeddings + vlm_features.mean(dim=0)
         expert = policy.model.paligemma_with_expert.gemma_expert
         embeddings = expert.model.layers[0].self_attn.q_proj(embeddings)
         time_features = torch.ones(batch_size, _WIDTH) * time.unsqueeze(1)
@@ -797,6 +785,7 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
 
     monkeypatch.setattr(policy.model, "predict_velocity", action_path_velocity)
     optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=1e-3)
+    policy.validate_optimizer_step_control(optimizer)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     optimizer_identity = id(optimizer)
     scheduler_identity = id(scheduler)
@@ -806,6 +795,7 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
     }
     expected_parameter_ids = {id(parameter) for parameter in policy.parameters() if parameter.requires_grad}
     bridge_metrics = []
+    initial_weights = {name: parameter.detach().clone() for name, parameter in policy.named_parameters()}
 
     for step in range(4):
         policy.set_training_progress(step=step, total_steps=4)
@@ -817,10 +807,29 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
         }
         loss, metrics = policy.forward(batch)
         loss.backward()
-        optimizer.step()
+        control = policy.compute_optimizer_step_control(batch, optimizer, SimpleNamespace(num_processes=1))
+        assert not control.skip_optimizer_step
+        if cabo_enabled and step == 3:
+            assert control.metrics["cabo/active"] == 1.0
+            assert control.metrics["cabo/scaled_action_prompt_relative_update_rate"] <= (
+                control.metrics["cabo/vlm_prompt_relative_update_rate"]
+                / policy.config.cabo_prompt_update_ratio
+            )
+        else:
+            assert not control.group_scales
+        with temporary_optimizer_group_lr_scales(optimizer, control.group_scales):
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
         bridge_metrics.append(metrics["stage1/bridge_active"])
+        if step < 3:
+            torch.testing.assert_close(
+                policy.model.vlm_prompt_tokens.weight,
+                initial_weights["model.vlm_prompt_tokens.weight"],
+                rtol=0,
+                atol=0,
+            )
+            assert policy.model.vlm_prompt_tokens.weight not in optimizer.state
 
     assert bridge_metrics == [0.0, 0.0, 0.0, 1.0]
     assert id(optimizer) == optimizer_identity
@@ -830,9 +839,15 @@ def test_stage1_objective_switch_preserves_optimizer_and_scheduler_state(monkeyp
     assert {id(parameter) for parameter in policy.parameters() if parameter.requires_grad} == (
         expected_parameter_ids
     )
-    optimizer_step = optimizer.state[policy.model.action_in_proj.weight]["step"]
-    assert optimizer_step.item() == 4
     assert optimizer.state[policy.model.prompt_tokens.weight]["step"].item() == 4
+    assert optimizer.state[policy.model.vlm_prompt_tokens.weight]["step"].item() == 1
+    assert not torch.equal(policy.model.prompt_tokens.weight, initial_weights["model.prompt_tokens.weight"])
+    assert not torch.equal(
+        policy.model.vlm_prompt_tokens.weight, initial_weights["model.vlm_prompt_tokens.weight"]
+    )
+    for name, parameter in policy.named_parameters():
+        if not parameter.requires_grad:
+            torch.testing.assert_close(parameter, initial_weights[name], rtol=0, atol=0)
 
 
 def test_flow_all_padded_actions_return_graph_connected_zero(monkeypatch):
@@ -968,6 +983,7 @@ def test_flow_inpainting_checkpoint_rejects_action_inference_before_preprocessin
 def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage2(tmp_path, cabo_enabled):
     source = _make_policy("next_action", cabo_enabled=cabo_enabled)
     with torch.no_grad():
+        source.model.vlm_prompt_tokens.weight.fill_(0.375)
         source.model.prompt_tokens.weight.fill_(0.125)
         source.model.action_in_proj.weight.fill_(0.25)
         source.model.action_in_proj.bias.fill_(-0.5)
@@ -1015,23 +1031,16 @@ def test_stage1_checkpoint_strictly_preserves_every_weight_when_loaded_for_stage
     assert not flow.config.clip_action_head_by_vlm
     optimizer_parameters = flow.get_optim_params()
     if cabo_enabled:
-        assert [group["name"] for group in optimizer_parameters] == [
-            "prompt",
-            "action_expert",
-            "action_projection",
-        ]
+        assert [group["name"] for group in optimizer_parameters] == ["vlm_prompt", "action_prompt"]
         optimizer_parameters = [parameter for group in optimizer_parameters for parameter in group["params"]]
     assert all(isinstance(parameter, nn.Parameter) for parameter in optimizer_parameters)
     assert {id(parameter) for parameter in optimizer_parameters} == {
         id(parameter) for parameter in flow.parameters() if parameter.requires_grad
     }
     for name, parameter in flow.named_parameters():
-        if name == "model.inpainting_visible_action_embedding.weight" or name.startswith(
-            "model.paligemma_with_expert.paligemma."
-        ):
-            assert not parameter.requires_grad
-        else:
-            assert parameter.requires_grad
+        assert parameter.requires_grad == (
+            name in {"model.vlm_prompt_tokens.weight", "model.prompt_tokens.weight"}
+        )
 
 
 def test_legacy_flow_checkpoint_zero_initializes_missing_inpainting_role(tmp_path):

@@ -104,6 +104,7 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.policy.cabo_prompt_update_ratio == cfg.policy.cabo_prompt_update_ratio == 1.5
     assert pretrain_cfg.policy.time_sampling_offset == pytest.approx(0.25)
     assert pretrain_cfg.policy.num_prompt_tokens == cfg.policy.num_prompt_tokens == 16
+    assert pretrain_cfg.policy.num_vlm_prompt_tokens == cfg.policy.num_vlm_prompt_tokens == 16
     assert pretrain_cfg.policy.prompt_init_std == cfg.policy.prompt_init_std
     assert pretrain_cfg.policy.train_expert_only
     assert pretrain_cfg.policy.freeze_vision_encoder
@@ -253,6 +254,7 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[1][0].policy.train_expert_only
     assert stages[1][0].policy.freeze_vision_encoder
     assert stages[1][0].policy.num_prompt_tokens == stages[0][0].policy.num_prompt_tokens
+    assert stages[1][0].policy.num_vlm_prompt_tokens == stages[0][0].policy.num_vlm_prompt_tokens
     assert stages[1][0].save_checkpoint
     assert stages[1][0].save_freq == 3_000
     expected_model_dir = (

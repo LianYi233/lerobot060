@@ -111,12 +111,13 @@ def test_pi05_optimizer_and_action_control_defaults():
     assert scheduler.num_decay_steps == 30_000
     assert not config.clip_action_head_by_vlm
     assert config.action_head_grad_clip_ratio == pytest.approx(10.0)
-    assert not config.cabo_enabled
-    assert not config.cabo_active
-    assert config.cabo_prompt_update_ratio == pytest.approx(1.0)
+    assert config.cabo_enabled
+    assert config.cabo_active
+    assert config.cabo_prompt_update_ratio == pytest.approx(2.0)
     assert config.training_stage == "flow"
     assert config.train_expert_only
     assert config.freeze_vision_encoder
+    assert config.num_vlm_prompt_tokens == 16
     assert config.num_prompt_tokens == 16
     assert config.prompt_init_std == pytest.approx(0.02)
     assert config.next_action_masked_steps == 40
@@ -130,7 +131,7 @@ def test_pi05_optimizer_and_action_control_defaults():
     assert config.cabo_vlm_update_floor_ratio == pytest.approx(0.1)
 
 
-def test_pi05_next_action_stage_enables_prompt_cabo_without_gradient_clipping():
+def test_pi05_next_action_stage_keeps_cabo_enabled_for_bridge_without_gradient_clipping():
     config = PI05Config(
         training_stage="next_action",
         optimizer_grad_clip_norm=42.0,
@@ -219,12 +220,40 @@ def test_pi05_rejects_prompt_cabo_ratios_below_one_or_nonfinite(value: float):
 
 
 @pytest.mark.parametrize("training_stage", ["next_action", "flow"])
-def test_pi05_prompt_cabo_requires_prompt_tokens(training_stage):
-    with pytest.raises(ValueError, match="num_prompt_tokens"):
-        PI05Config(training_stage=training_stage, cabo_enabled=True, num_prompt_tokens=0)
+@pytest.mark.parametrize("prompt_counts", [(0, 0), (0, 16), (16, 0)])
+def test_pi05_cabo_requires_both_prompt_banks(training_stage, prompt_counts):
+    with pytest.raises(ValueError, match="CABO requires num_vlm_prompt_tokens > 0 and num_prompt_tokens > 0"):
+        PI05Config(
+            training_stage=training_stage,
+            cabo_enabled=True,
+            num_vlm_prompt_tokens=prompt_counts[0],
+            num_prompt_tokens=prompt_counts[1],
+        )
 
 
-def test_pi05_stage1_legacy_cabo_update_ratio_decodes_from_nested_cli_argument():
+@pytest.mark.parametrize("training_stage", ["next_action", "flow"])
+@pytest.mark.parametrize("prompt_counts", [(0, 0), (0, 16), (16, 0)])
+def test_pi05_disabling_cabo_allows_single_bank_and_prompt_free_configuration(training_stage, prompt_counts):
+    config = PI05Config(
+        training_stage=training_stage,
+        cabo_enabled=False,
+        num_vlm_prompt_tokens=prompt_counts[0],
+        num_prompt_tokens=prompt_counts[1],
+    )
+
+    assert not config.cabo_enabled
+    assert not config.cabo_active
+
+
+@pytest.mark.parametrize("ratio", [1.0, 1.5, 2.0, 10.0])
+def test_pi05_accepts_cabo_prompt_update_ratio_at_least_one(ratio):
+    config = PI05Config(cabo_prompt_update_ratio=ratio)
+
+    assert config.cabo_active
+    assert config.cabo_prompt_update_ratio == ratio
+
+
+def test_pi05_stage1_prompt_cabo_update_ratio_decodes_from_nested_cli_argument():
     config = draccus.parse(
         TrainPipelineConfig,
         args=[
@@ -257,7 +286,23 @@ def test_pi05_next_action_stage_decodes_from_nested_cli_argument():
 
     assert isinstance(config.policy, PI05Config)
     assert config.policy.training_stage == "next_action"
-    assert not config.policy.cabo_active
+    assert config.policy.cabo_active
+
+
+def test_pi05_both_prompt_counts_decode_from_nested_cli_arguments():
+    config = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id=user/repo",
+            "--policy.type=pi05",
+            "--policy.num_vlm_prompt_tokens=24",
+            "--policy.num_prompt_tokens=8",
+        ],
+    )
+
+    assert isinstance(config.policy, PI05Config)
+    assert config.policy.num_vlm_prompt_tokens == 24
+    assert config.policy.num_prompt_tokens == 8
 
 
 @pytest.mark.parametrize("cabo_vlm_update_ema_decay", [-0.1, 1.0, float("nan")])
@@ -279,7 +324,7 @@ def test_pi05_rejects_invalid_cabo_vlm_floor_ratio(cabo_vlm_update_floor_ratio: 
 
 @pytest.mark.parametrize("training_stage", ["next_action", "flow"])
 @pytest.mark.parametrize("legacy_freeze_flags", [False, True])
-def test_pi05_prompt_cabo_accepts_and_enforces_frozen_vlm(training_stage, legacy_freeze_flags):
+def test_pi05_prompt_cabo_stays_active_and_enforces_freeze_flags(training_stage, legacy_freeze_flags):
     config = PI05Config(
         training_stage=training_stage,
         cabo_enabled=True,
@@ -287,6 +332,7 @@ def test_pi05_prompt_cabo_accepts_and_enforces_frozen_vlm(training_stage, legacy
         freeze_vision_encoder=legacy_freeze_flags,
     )
 
+    assert config.cabo_enabled
     assert config.cabo_active
     assert config.train_expert_only
     assert config.freeze_vision_encoder
@@ -302,7 +348,7 @@ def test_pi05_flow_rejects_vlm_relative_gradient_clipping_with_legacy_unfreeze_f
 
 
 @pytest.mark.parametrize("training_stage", ["next_action", "flow"])
-def test_pi05_prompt_cabo_requires_policy_parameter_groups_in_every_stage(tmp_path, training_stage):
+def test_pi05_cabo_requires_policy_preset_for_named_prompt_groups(tmp_path, training_stage):
     policy_config = PI05Config(
         training_stage=training_stage,
         cabo_enabled=True,
@@ -317,8 +363,9 @@ def test_pi05_prompt_cabo_requires_policy_parameter_groups_in_every_stage(tmp_pa
         scheduler=policy_config.get_scheduler_preset(),
     )
 
-    with pytest.raises(ValueError, match="named prompt, action expert, and action projection"):
+    with pytest.raises(ValueError, match="CABO requires use_policy_training_preset=True"):
         config.validate()
+    assert config.cabo_active
 
     config.use_policy_training_preset = True
     config.validate()

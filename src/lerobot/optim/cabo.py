@@ -35,6 +35,8 @@ CABO_VLM_GROUP = "vlm"
 CABO_PROMPT_GROUP = "prompt"
 CABO_ACTION_EXPERT_GROUP = "action_expert"
 CABO_ACTION_PROJECTION_GROUP = "action_projection"
+CABO_VLM_PROMPT_GROUP = "vlm_prompt"
+CABO_ACTION_PROMPT_GROUP = "action_prompt"
 CABO_GROUP_NAME = "name"
 
 

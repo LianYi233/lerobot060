@@ -49,8 +49,11 @@ class PI05Config(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
-    # Learned expert-side tokens between the frozen VLM prefix and action tokens.
-    # Set to 0 for an ablation without prompts; the VLM remains frozen.
+    # Only these two prompt banks train; the complete VLM and action path stay frozen.
+    # VLM prompts follow the observation/language prefix, using the VLM embedding width.
+    num_vlm_prompt_tokens: int = 16
+    # Expert prompts precede action tokens, using the action expert embedding width.
+    # Either bank can be disabled for an ablation with CABO disabled. Both may be 0 for inference only.
     num_prompt_tokens: int = 16
     prompt_init_std: float = 0.02
 
@@ -58,10 +61,11 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
-    # Training stage. Both stages freeze the VLM. ``next_action`` is kept as the public name for
+    # Training stage. Both stages freeze the VLM and action path. ``next_action`` is kept as the public name for
     # backwards compatibility; its base objective is action-only flow inpainting over the chunk.
     # The integrated trainer may route its final bridge updates through the standard
-    # observation-conditioned objective without changing this stage or its optimizer.
+    # observation-conditioned objective without changing this stage or its optimizer. Action-only
+    # inpainting updates expert prompts; the bridge and formal flow update both prompt banks.
     # A string enum preserves the two-value contract while remaining decodable by draccus CLI/config loading.
     training_stage: PI05TrainingStage = PI05TrainingStage.FLOW
     # Number of valid temporal action tokens to hide and reconstruct per sample. The mask is sampled
@@ -77,8 +81,8 @@ class PI05Config(PreTrainedConfig):
     # Total Stage-1 updates automatically run before a flow-training invocation. Set to 0 to start
     # formal flow training immediately. This is orchestration metadata and does not alter either loss.
     next_action_pretrain_steps: int = 1_000
-    # Finish integrated Stage 1 with observation-conditioned full-flow updates while the VLM stays
-    # frozen. These updates reuse the same Stage-1 model, optimizer, and scheduler. Set to 0 to keep
+    # Finish integrated Stage 1 with observation-conditioned full-flow updates of both prompt banks.
+    # These updates reuse the same Stage-1 model, optimizer, and scheduler. Set to 0 to keep
     # Stage 1 entirely action-only.
     next_action_bridge_steps: int = 250
 
@@ -123,17 +127,17 @@ class PI05Config(PreTrainedConfig):
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Legacy finetuning flags retained for checkpoint/CLI compatibility. PI05 always freezes the
-    # complete VLM and trains the prompts, action expert, and projections in both training stages.
+    # complete VLM, action expert, and projections; only the two prompt banks can train.
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
 
-    # Optimizer settings. Prompt and action parameters share this single AdamW learning rate.
+    # Optimizer settings. Both prompt banks share this scheduled AdamW learning rate;
+    # CABO can attenuate the action prompt's learning update after AdamW preconditioning.
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
-    # Global clipping is disabled for PI05. The optional CABO controller below acts on AdamW
-    # parameter updates, after gradient computation.
+    # Global clipping is disabled for PI05.
     optimizer_grad_clip_norm: float = 0.0
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
@@ -143,15 +147,15 @@ class PI05Config(PreTrainedConfig):
     clip_action_head_by_vlm: bool = False
     action_head_grad_clip_ratio: float = 10.0
 
-    # Prompt-relative CABO: in every training stage, preserve the prompt's scheduled learning rate
-    # and cap each action group's relative learning update at prompt_rate / this ratio. Weight
-    # decay is excluded from the measurement. A ratio of 1 means prompts update at least as much
-    # as each action group, relative to that group's parameter norm.
-    cabo_enabled: bool = False
-    cabo_prompt_update_ratio: float = 1.0
+    # CABO compares the two prompt banks using each AdamW learning delta's L2 norm divided
+    # by its parameter L2 norm (excluding decoupled weight decay). The default enforces
+    # action_prompt_relative_update <= vlm_prompt_relative_update / 2.
+    # Action-only inpainting bypasses CABO because the VLM prompt is not in its forward path.
+    cabo_enabled: bool = True
+    cabo_prompt_update_ratio: float = 2.0
 
-    # Deprecated VLM-reference settings retained only for loading older configurations. The
-    # prompt controller uses the current step immediately; EMA, warmup and floors are not applied.
+    # Deprecated backbone/EMA settings retained for loading older configurations; these do not
+    # affect prompt CABO, which uses the current VLM prompt update without an EMA or warmup.
     cabo_expert_update_ratio: float = 2.0
     cabo_projection_update_ratio: float = 5.0
     cabo_vlm_update_ema_decay: float = 0.95
@@ -170,18 +174,14 @@ class PI05Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # Older configs explicitly stored False. Loading them must never unfreeze the VLM.
+        # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
 
-        if (
-            isinstance(self.num_prompt_tokens, bool)
-            or not isinstance(self.num_prompt_tokens, int)
-            or self.num_prompt_tokens < 0
-        ):
-            raise ValueError(
-                f"num_prompt_tokens must be a non-negative integer, got {self.num_prompt_tokens}"
-            )
+        for name in ("num_vlm_prompt_tokens", "num_prompt_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value}")
         if not math.isfinite(self.prompt_init_std) or self.prompt_init_std <= 0:
             raise ValueError(f"prompt_init_std must be finite and greater than 0, got {self.prompt_init_std}")
 
@@ -261,8 +261,11 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"cabo_prompt_update_ratio must be finite and at least 1, got {self.cabo_prompt_update_ratio}"
             )
-        if self.cabo_active and self.num_prompt_tokens == 0:
-            raise ValueError("Prompt-relative CABO requires num_prompt_tokens > 0")
+        if self.cabo_enabled and (self.num_vlm_prompt_tokens == 0 or self.num_prompt_tokens == 0):
+            raise ValueError(
+                "CABO requires num_vlm_prompt_tokens > 0 and num_prompt_tokens > 0. "
+                "Set cabo_enabled=False for a single prompt bank or prompt-free inference."
+            )
         if self.training_stage == "flow" and self.clip_action_head_by_vlm:
             raise ValueError(
                 "clip_action_head_by_vlm requires trainable VLM parameters, but PI05 always freezes "
@@ -271,12 +274,12 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def cabo_active(self) -> bool:
-        """Whether prompt-relative CABO participates in any training stage."""
+        """Whether the prompt update controller is enabled; action-only steps bypass it at runtime."""
         return self.cabo_enabled
 
     @property
     def next_action_pretraining_active(self) -> bool:
-        """Whether a flow-training invocation should first run frozen-VLM Stage 1."""
+        """Whether a flow-training invocation should first run prompt-only Stage 1."""
         return self.training_stage == "flow" and self.next_action_pretrain_steps > 0
 
     def validate_features(self) -> None:

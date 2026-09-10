@@ -77,6 +77,7 @@ def test_pi05_prefix_preserves_image_and_already_scaled_language_embeddings():
     image_embeddings = torch.full((1, 2, 4), 2.0)
     language_embeddings = torch.full((1, 3, 4), 3.0)
     fake_core = SimpleNamespace(
+        config=SimpleNamespace(num_vlm_prompt_tokens=0),
         paligemma_with_expert=SimpleNamespace(
             embed_image=lambda _image: image_embeddings,
             embed_language_tokens=lambda _tokens: language_embeddings,

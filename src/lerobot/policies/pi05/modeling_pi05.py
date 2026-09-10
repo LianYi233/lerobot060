@@ -48,16 +48,14 @@ else:
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.cabo import (
-    CABO_ACTION_EXPERT_GROUP,
-    CABO_ACTION_PROJECTION_GROUP,
+    CABO_ACTION_PROMPT_GROUP,
     CABO_GROUP_NAME,
-    CABO_PROMPT_GROUP,
+    CABO_VLM_PROMPT_GROUP,
     OptimizerStepControl,
     adamw_group_relative_update_moments,
     get_named_param_group,
     relative_update_rate,
     require_adamw,
-    update_cabo_prompt_relative_update_scales,
     validate_adamw_param_group,
 )
 from lerobot.policies.pi05.configuration_pi05 import (
@@ -681,6 +679,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=True,
         )
 
+        self.vlm_prompt_tokens = nn.Embedding(config.num_vlm_prompt_tokens, paligemma_config.width)
+        nn.init.normal_(self.vlm_prompt_tokens.weight, std=config.prompt_init_std)
         self.prompt_tokens = nn.Embedding(config.num_prompt_tokens, action_expert_config.width)
         nn.init.normal_(self.prompt_tokens.weight, std=config.prompt_init_std)
 
@@ -709,12 +709,40 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_vlm(self) -> None:
-        """Keep the complete VLM frozen, including any adapters added after initialization."""
-        vlm = self.paligemma_with_expert.paligemma
-        vlm.requires_grad_(False)
-        vlm.eval()
-        for parameter in vlm.parameters():
-            parameter.grad = None
+        """Compatibility entry point for enforcing prompt-only training after adapter loading."""
+        self._freeze_backbones()
+
+    def _freeze_backbones(self) -> None:
+        """Freeze every parameter except the active VLM/expert prompt embeddings.
+
+        Preserve PEFT's active modules_to_save selection: its original prompt copies must stay
+        frozen. Autograd remains enabled through both backbones to reach the input prompts.
+        """
+        prompt_ids = set()
+        for module in (self.vlm_prompt_tokens, self.prompt_tokens):
+            modules_to_save = getattr(module, "modules_to_save", None)
+            if modules_to_save is None:
+                active_modules = [module]
+            else:
+                # Only PEFT's selected copies are used by forward. Never enable original or
+                # inactive copies, even after an external requires_grad_(True) on the policy.
+                active_modules = [
+                    modules_to_save[name]
+                    for name in module.active_adapters
+                    if name in modules_to_save and not module.disable_adapters
+                ]
+            prompt_ids.update(
+                id(parameter)
+                for active_module in active_modules
+                for parameter in active_module.parameters()
+                if parameter.requires_grad and parameter.numel() > 0
+            )
+        for parameter in self.parameters():
+            if id(parameter) not in prompt_ids:
+                parameter.requires_grad_(False)
+                parameter.grad = None
+        self.paligemma_with_expert.paligemma.eval()
+        self.paligemma_with_expert.gemma_expert.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -772,7 +800,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def embed_prefix(
         self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed [images, language, VLM prompts] without detaching prompt gradients."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -800,6 +828,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if self.config.num_vlm_prompt_tokens:
+            prompt_ids = torch.arange(self.config.num_vlm_prompt_tokens, device=lang_emb.device)
+            prompt_embs = self.vlm_prompt_tokens(prompt_ids).to(dtype=lang_emb.dtype)
+            embs.append(prompt_embs.unsqueeze(0).expand(lang_emb.shape[0], -1, -1))
+            pad_masks.append(
+                torch.ones(
+                    lang_emb.shape[0],
+                    self.config.num_vlm_prompt_tokens,
+                    dtype=torch.bool,
+                    device=lang_emb.device,
+                )
+            )
+            # VLM prompts read observations and one another; observation tokens cannot read
+            # prompts. Expert prompts/actions can read this complete prefix in later blocks.
+            att_masks += [1] + [0] * (self.config.num_vlm_prompt_tokens - 1)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -1381,14 +1425,12 @@ class PI05Policy(PreTrainedPolicy):
                 # embedding. It has no effect on ordinary flow, so adding the model default is exact.
                 remapped_state_dict[cls._INPAINTING_ROLE_KEY] = model.state_dict()[cls._INPAINTING_ROLE_KEY]
 
-            prompt_key = "model.prompt_tokens.weight"
-            if prompt_key not in remapped_state_dict:
-                # Base PI05 checkpoints have no prompts. Only this new parameter may be initialized;
-                # a saved prompt tensor with a mismatched length must still fail loading.
-                remapped_state_dict[prompt_key] = model.state_dict()[prompt_key]
-                logging.info(
-                    "Initialized %d prompt tokens absent from the PI05 checkpoint", config.num_prompt_tokens
-                )
+            for prompt_key in ("model.vlm_prompt_tokens.weight", "model.prompt_tokens.weight"):
+                if prompt_key not in remapped_state_dict:
+                    # Base/older checkpoints may predate either prompt bank. A saved tensor with
+                    # a mismatched shape must still fail; never replace an existing learned prompt.
+                    remapped_state_dict[prompt_key] = model.state_dict()[prompt_key]
+                    logging.info("Initialized %s absent from the PI05 checkpoint", prompt_key)
 
             # Inpainting and formal flow deliberately use an identical parameter set. Loading stays
             # strict across stages so no action-flow head can be silently dropped or reinitialized.
@@ -1494,7 +1536,7 @@ class PI05Policy(PreTrainedPolicy):
         return [self.model.paligemma_with_expert.paligemma]
 
     def _prompt_modules(self) -> list[nn.Module]:
-        return [self.model.prompt_tokens]
+        return [self.model.vlm_prompt_tokens, self.model.prompt_tokens]
 
     def _action_expert_modules(self) -> list[nn.Module]:
         return [self.model.paligemma_with_expert.gemma_expert]
@@ -1528,14 +1570,12 @@ class PI05Policy(PreTrainedPolicy):
 
     def _cabo_parameter_groups(
         self,
-    ) -> tuple[list[nn.Parameter], list[nn.Parameter], list[nn.Parameter]]:
-        prompt_parameters = _unique_trainable_parameters(self._prompt_modules())
-        expert_parameters = _unique_trainable_parameters(self._action_expert_modules())
-        projection_parameters = _unique_trainable_parameters(self._action_projection_modules())
+    ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        vlm_parameters = _unique_trainable_parameters([self.model.vlm_prompt_tokens])
+        action_parameters = _unique_trainable_parameters([self.model.prompt_tokens])
         expected_groups = {
-            CABO_PROMPT_GROUP: prompt_parameters,
-            CABO_ACTION_EXPERT_GROUP: expert_parameters,
-            CABO_ACTION_PROJECTION_GROUP: projection_parameters,
+            CABO_VLM_PROMPT_GROUP: vlm_parameters,
+            CABO_ACTION_PROMPT_GROUP: action_parameters,
         }
         group_ids = {
             name: {id(parameter) for parameter in parameters} for name, parameters in expected_groups.items()
@@ -1558,20 +1598,23 @@ class PI05Policy(PreTrainedPolicy):
         empty_groups = [name for name, parameters in expected_groups.items() if not parameters]
         if empty_groups:
             raise ValueError(
-                "CABO requires non-empty trainable prompt, action expert, and action projection groups; "
-                f"empty={empty_groups}"
+                f"CABO requires non-empty trainable VLM prompt and action prompt groups; empty={empty_groups}"
             )
-        return prompt_parameters, expert_parameters, projection_parameters
+        return vlm_parameters, action_parameters
 
     def get_optim_params(self):
         self.model._freeze_vlm()
+        if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
+            raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
         if not PI05Policy._is_cabo_active(self):
-            return [parameter for parameter in self.parameters() if parameter.requires_grad]
-        prompt_parameters, expert_parameters, projection_parameters = self._cabo_parameter_groups()
+            parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+            if not parameters:
+                raise ValueError("PI05 training requires at least one non-empty trainable prompt bank")
+            return parameters
+        vlm_parameters, action_parameters = self._cabo_parameter_groups()
         return [
-            {"params": prompt_parameters, CABO_GROUP_NAME: CABO_PROMPT_GROUP},
-            {"params": expert_parameters, CABO_GROUP_NAME: CABO_ACTION_EXPERT_GROUP},
-            {"params": projection_parameters, CABO_GROUP_NAME: CABO_ACTION_PROJECTION_GROUP},
+            {"params": vlm_parameters, CABO_GROUP_NAME: CABO_VLM_PROMPT_GROUP},
+            {"params": action_parameters, CABO_GROUP_NAME: CABO_ACTION_PROMPT_GROUP},
         ]
 
     def validate_optimizer_step_control(self, optimizer) -> None:
@@ -1580,15 +1623,14 @@ class PI05Policy(PreTrainedPolicy):
             return
 
         adamw = require_adamw(optimizer)
-        if len(adamw.param_groups) != 3:
+        if len(adamw.param_groups) != 2:
             raise ValueError(
-                f"CABO requires exactly three named AdamW parameter groups, got {len(adamw.param_groups)}"
+                f"CABO requires exactly two named AdamW parameter groups, got {len(adamw.param_groups)}"
             )
-        expected_prompt, expected_expert, expected_projection = self._cabo_parameter_groups()
+        expected_vlm, expected_action = self._cabo_parameter_groups()
         expected_groups = {
-            CABO_PROMPT_GROUP: {id(parameter) for parameter in expected_prompt},
-            CABO_ACTION_EXPERT_GROUP: {id(parameter) for parameter in expected_expert},
-            CABO_ACTION_PROJECTION_GROUP: {id(parameter) for parameter in expected_projection},
+            CABO_VLM_PROMPT_GROUP: {id(parameter) for parameter in expected_vlm},
+            CABO_ACTION_PROMPT_GROUP: {id(parameter) for parameter in expected_action},
         }
         for name, expected_ids in expected_groups.items():
             group = get_named_param_group(adamw, name)
@@ -1624,23 +1666,28 @@ class PI05Policy(PreTrainedPolicy):
         optimizer,
         accelerator,
     ) -> OptimizerStepControl:
-        """Keep each action group's relative AdamW learning update below the prompt's update."""
+        """Limit action-prompt AdamW learning updates relative to the VLM prompts.
+
+        Action-only inpainting has no VLM reference and keeps its scheduled action-prompt LR.
+        The bridge and formal flow compare current, weight-decay-free relative updates, retaining
+        the VLM LR and verifying the attenuated action update in the parameter's native dtype.
+        """
         if not PI05Policy._is_cabo_active(self):
             return OptimizerStepControl()
+        if getattr(self.config, "training_stage", "flow") == PI05TrainingStage.NEXT_ACTION and not getattr(
+            self, "_stage1_bridge_active", False
+        ):
+            return OptimizerStepControl(metrics={"cabo/active": 0.0, "cabo/action_only_bypass": 1.0})
 
         _ = batch
         adamw = require_adamw(optimizer)
-        prompt_group = get_named_param_group(adamw, CABO_PROMPT_GROUP)
-        expert_group = get_named_param_group(adamw, CABO_ACTION_EXPERT_GROUP)
-        projection_group = get_named_param_group(adamw, CABO_ACTION_PROJECTION_GROUP)
-
+        vlm_group = get_named_param_group(adamw, CABO_VLM_PROMPT_GROUP)
+        action_group = get_named_param_group(adamw, CABO_ACTION_PROMPT_GROUP)
         group_moments = []
         active_numels = []
-        for group in (prompt_group, expert_group, projection_group):
+        for group in (vlm_group, action_group):
             update_norm_sq, parameter_norm_sq, active_numel = adamw_group_relative_update_moments(
-                group,
-                adamw.state,
-                include_weight_decay=False,
+                group, adamw.state, include_weight_decay=False
             )
             group_moments.extend((update_norm_sq, parameter_norm_sq))
             active_numels.append(active_numel)
@@ -1649,100 +1696,69 @@ class PI05Policy(PreTrainedPolicy):
         num_processes = int(getattr(accelerator, "num_processes", 1))
         if num_processes > 1:
             moments = accelerator.reduce(moments, reduction="sum")
-
-        prompt_rate, expert_rate, projection_rate = (
+        vlm_rate, action_rate = (
             relative_update_rate(float(moments[index].item()), float(moments[index + 1].item()))
-            for index in (0, 2, 4)
+            for index in (0, 2)
         )
-        expert_scale, projection_scale, metrics = update_cabo_prompt_relative_update_scales(
-            prompt_rate=prompt_rate,
-            expert_rate=expert_rate,
-            projection_rate=projection_rate,
-            prompt_update_ratio=self.config.cabo_prompt_update_ratio,
-        )
-
-        # Native-dtype AdamW rounds its parameter writes: a scaled learning rate does not always
-        # produce exactly scale * delta, especially in bfloat16. Verify the candidate at the actual
-        # scaled LR, backing off if rounding would violate the prompt-relative limit. All ranks use
-        # the same globally reduced rates and therefore take the same branches and collectives.
-        action_groups = (expert_group, projection_group)
-        action_scales = [expert_scale, projection_scale]
-        scaled_rates = [expert_rate * expert_scale, projection_rate * projection_scale]
+        ratio = self.config.cabo_prompt_update_ratio
+        if not math.isfinite(ratio) or ratio < 1.0:
+            raise ValueError("CABO cabo_prompt_update_ratio must be finite and at least 1.0")
+        finite = all(math.isfinite(rate) and rate >= 0.0 for rate in (vlm_rate, action_rate))
+        update_limit = vlm_rate / ratio if finite else float("nan")
+        action_scale = 1.0
+        if finite and action_rate > update_limit:
+            action_scale = update_limit / action_rate
+            if action_scale * action_rate > update_limit:
+                action_scale = math.nextafter(action_scale, 0.0)
+        scaled_rate = action_rate * action_scale
         verification_passes = 0
-        if not metrics["cabo/update_nonfinite"]:
-            update_limit = prompt_rate / self.config.cabo_prompt_update_ratio
-            pending = [0.0 < scale < 1.0 for scale in action_scales]
+        if finite and 0.0 < action_scale < 1.0:
+            # Native-dtype rounding need not be linear in LR. All ranks make identical decisions
+            # from reduced moments, including when the reference has no gradient on one rank.
             for attempt in range(8):
-                if not any(pending):
-                    break
-                scaled_moments = []
-                for index, group in enumerate(action_groups):
-                    if pending[index]:
-                        candidate_group = {**group, "lr": float(group["lr"]) * action_scales[index]}
-                        update_sq, parameter_sq, _ = adamw_group_relative_update_moments(
-                            candidate_group, adamw.state, include_weight_decay=False
-                        )
-                    else:
-                        update_sq = torch.zeros_like(moments[0])
-                        parameter_sq = torch.zeros_like(moments[0])
-                    scaled_moments.extend((update_sq, parameter_sq))
-                checked_moments = torch.stack(scaled_moments)
+                candidate_group = {**action_group, "lr": float(action_group["lr"]) * action_scale}
+                update_sq, parameter_sq, _ = adamw_group_relative_update_moments(
+                    candidate_group, adamw.state, include_weight_decay=False
+                )
+                checked_moments = torch.stack((update_sq, parameter_sq))
                 if num_processes > 1:
                     checked_moments = accelerator.reduce(checked_moments, reduction="sum")
                 verification_passes += 1
-                for index in range(2):
-                    if not pending[index]:
-                        continue
-                    rate = relative_update_rate(
-                        float(checked_moments[2 * index].item()),
-                        float(checked_moments[2 * index + 1].item()),
-                    )
-                    scaled_rates[index] = rate
-                    if not math.isfinite(rate):
-                        metrics["cabo/update_nonfinite"] = 1.0
-                    elif rate <= update_limit:
-                        pending[index] = False
-                    elif attempt == 7:
-                        # A zero LR also removes weight decay and guarantees no parameter movement.
-                        action_scales[index] = 0.0
-                        scaled_rates[index] = 0.0
-                        pending[index] = False
-                    else:
-                        action_scales[index] *= 0.5
-                if metrics["cabo/update_nonfinite"]:
+                scaled_rate = relative_update_rate(
+                    float(checked_moments[0].item()), float(checked_moments[1].item())
+                )
+                if not math.isfinite(scaled_rate):
+                    finite = False
                     break
-        expert_scale, projection_scale = action_scales
-        metrics.update(
-            {
-                "cabo/expert_scale": expert_scale,
-                "cabo/projection_scale": projection_scale,
-                "cabo/scaled_expert_relative_update_rate": scaled_rates[0],
-                "cabo/scaled_projection_relative_update_rate": scaled_rates[1],
-                "cabo/candidate_verification_passes": float(verification_passes),
-                "cabo/prompt_active_numel": float(active_numels[0]),
-                "cabo/expert_active_numel": float(active_numels[1]),
-                "cabo/projection_active_numel": float(active_numels[2]),
-                "cabo/effective_prompt_lr": float(prompt_group["lr"]),
-                "cabo/effective_expert_lr": float(expert_group["lr"]) * expert_scale,
-                "cabo/effective_projection_lr": float(projection_group["lr"]) * projection_scale,
-            }
-        )
-        if metrics["cabo/update_nonfinite"]:
-            metrics.update(
-                {
-                    "optimizer_step/skipped": 1.0,
-                    "optimizer_step/nonfinite_cabo_update": 1.0,
-                }
-            )
-            return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
+                if scaled_rate <= update_limit:
+                    break
+                if attempt == 7:
+                    action_scale = 0.0
+                    scaled_rate = 0.0
+                else:
+                    action_scale *= 0.5
 
-        return OptimizerStepControl(
-            group_scales={
-                CABO_ACTION_EXPERT_GROUP: expert_scale,
-                CABO_ACTION_PROJECTION_GROUP: projection_scale,
-            },
-            metrics=metrics,
-        )
+        metrics = {
+            "cabo/active": 1.0,
+            "cabo/action_only_bypass": 0.0,
+            "cabo/vlm_prompt_relative_update_rate": vlm_rate,
+            "cabo/action_prompt_relative_update_rate": action_rate,
+            "cabo/prompt_update_ratio": ratio,
+            "cabo/action_prompt_relative_update_limit": update_limit,
+            "cabo/scaled_action_prompt_relative_update_rate": scaled_rate,
+            "cabo/vlm_prompt_scale": 1.0,
+            "cabo/action_prompt_scale": action_scale,
+            "cabo/candidate_verification_passes": float(verification_passes),
+            "cabo/vlm_prompt_active_numel": float(active_numels[0]),
+            "cabo/action_prompt_active_numel": float(active_numels[1]),
+            "cabo/effective_vlm_prompt_lr": float(vlm_group["lr"]),
+            "cabo/effective_action_prompt_lr": float(action_group["lr"]) * action_scale,
+            "cabo/update_nonfinite": float(not finite),
+        }
+        if not finite:
+            metrics.update({"optimizer_step/skipped": 1.0, "optimizer_step/nonfinite_cabo_update": 1.0})
+            return OptimizerStepControl(metrics=metrics, skip_optimizer_step=True)
+        return OptimizerStepControl(group_scales={CABO_ACTION_PROMPT_GROUP: action_scale}, metrics=metrics)
 
     @torch.no_grad()
     def clip_gradients(self, accelerator=None) -> dict[str, float]:
@@ -2136,27 +2152,24 @@ class PI05Policy(PreTrainedPolicy):
         return valid_count.sum(dtype=torch.float32) * action_dim
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Adapt the action expert while fully training and saving the prompt embeddings."""
-        common_projections = "action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
-        target_modules = (
-            rf"(.*\.paligemma_with_expert\.gemma_expert\..*\.self_attn\.(q|v)_proj"
-            rf"|model\.({common_projections}))"
-        )
+        """Use PEFT to save both prompt banks without adding backbone adapters."""
         return {
-            "target_modules": target_modules,
-            "modules_to_save": ["model.prompt_tokens"],
+            # PEFT's DUMMY_TARGET_MODULES sentinel permits a modules_to_save-only adapter.
+            "target_modules": "dummy-target-modules",
+            "modules_to_save": ["model.vlm_prompt_tokens", "model.prompt_tokens"],
         }
 
     def _validate_peft_config(self, peft_config) -> None:
         super()._validate_peft_config(peft_config)
-        # Even custom adapter settings must preserve the trainable prompt in adapter checkpoints.
+        # Even custom adapter settings must save both prompt banks.
         modules_to_save = list(peft_config.modules_to_save or [])
-        if "model.prompt_tokens" not in modules_to_save:
-            modules_to_save.append("model.prompt_tokens")
+        for name in ("model.vlm_prompt_tokens", "model.prompt_tokens"):
+            if name not in modules_to_save:
+                modules_to_save.append(name)
         peft_config.modules_to_save = modules_to_save
 
     def wrap_with_peft(self, peft_config=None, peft_cli_overrides: dict | None = None):
         policy = super().wrap_with_peft(peft_config, peft_cli_overrides)
-        # Custom target patterns can include the VLM. Freeze those adapters immediately as well.
+        # Freeze custom backbone/projection adapters as well; only active prompt copies train.
         self.model._freeze_vlm()
         return policy
