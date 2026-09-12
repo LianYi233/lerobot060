@@ -24,16 +24,22 @@ This repository's variant uses
 There are 16 trainable embeddings on each side by default (`num_vlm_prompt_tokens=16`,
 `num_prompt_tokens=16`, `prompt_init_std=0.02`), using their respective backbone widths.
 With the default VLM/expert variants, the two banks have **32,768 + 16,384 = 49,152 trainable
-parameters**. VLM prompts see observation/language tokens and all VLM prompts; expert prompts see
-the full VLM prefix and all expert prompts; actions see all four blocks. Observation/language
-tokens do not attend to the prompts.
+parameters**. Observation/language tokens attend only to their own block. VLM prompts attend to
+observation/language tokens and all VLM prompts; expert prompts attend to all expert prompts and
+action tokens. Both prompt banks retain self-attention and bidirectional attention within their
+own bank, but neither attends directly to the other prompt bank. Expert prompts do not attend
+directly to observation/language tokens. Actions attend to all four blocks, with bidirectional
+attention across the action chunk.
 
 The entire VLM, action expert, action projections, and timestep MLP stay frozen in every phase.
 `freeze_vision_encoder=true` and `train_expert_only=true` remain enforced legacy flags. The training
 curriculum is unchanged: action-only inpainting updates expert prompts; the observation-conditioned
-bridge and formal flow training update both prompt banks. At inference, VLM prompts are cached with
-the VLM prefix and expert prompts are processed with actions at each denoising step; the action
-chunk length is unchanged. With `cabo_enabled=false`, either prompt count may be `0` for an ablation.
+bridge and formal flow training update both prompt banks. In action-only inpainting, expert prompts
+still attend to their own bank and the action block while the VLM prefix is absent. At inference,
+VLM prompts remain independent of actions and are cached with the VLM prefix. Expert prompts read
+the current noisy action tokens and are recomputed at every denoising step; the action chunk length
+is unchanged.
+With `cabo_enabled=false`, either prompt count may be `0` for an ablation.
 Inpainting requires expert prompts, and training requires a nonempty bank. Both counts may be `0`
 for inference with CABO disabled.
 
@@ -70,6 +76,21 @@ adapters. Any custom backbone adapters remain frozen. Legacy adapters must save 
 set `num_vlm_prompt_tokens=0` for an expert-prompt-only adapter, or both counts to `0` for inference
 with an adapter containing neither bank; set `cabo_enabled=false` in either case. Initialize from a
 full-model checkpoint to add missing banks.
+
+## Training performance
+
+The defaults `attention_implementation="sdpa"` and `separate_frozen_observations=true` enable
+PyTorch SDPA and separate the frozen observation/language computation in the bridge and Stage 2.
+Each layer computes those tokens under `no_grad` and supplies constant keys and values to the
+prompt/action computation under the same visibility mask. Both prompt banks retain their gradients.
+With gradient checkpointing enabled, only the prompt/action computation is checkpointed once per
+layer; the frozen observation branch is not recomputed during backward. Cached inference uses the
+configured attention backend too.
+
+The default precision remains full FP32 (`dtype="float32"`); BF16 is opt-in with
+`--policy.dtype=bfloat16`, and `compile_model` remains `false` by default. For an eager comparison,
+use `--policy.attention_implementation=eager --policy.separate_frozen_observations=false` with the
+same precision and batch size. Throughput depends on the hardware and sequence lengths.
 
 ---
 

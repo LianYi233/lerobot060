@@ -56,12 +56,27 @@ Each bank uses its backbone's embedding width. With the default `gemma_2b` VLM a
 expert, these are `16 × 2048 = 32,768` VLM parameters and `16 × 1024 = 16,384` expert parameters,
 for **49,152 trainable parameters** in total.
 
-Observation/language tokens attend to their own block. VLM prompts attend to that block and all VLM
-prompts. Expert prompts attend to the full VLM prefix and all expert prompts. Action tokens attend
-to all four blocks. During action-only Stage 1, the VLM prefix, including VLM prompts, is absent;
-only expert prompts receive gradients. During inference, VLM prompts are cached with the VLM prefix,
-and expert prompts are processed with action tokens on every denoising step. Prompt outputs are not
-returned as actions, so the action chunk length is unchanged.
+The attention mask uses the following visibility rules. Rows are queries and columns are keys;
+`1` allows attention and `0` blocks it, subject to token padding masks.
+
+| Query block | Observation/language | VLM prompts | Expert prompts | Actions |
+| --- | --- | --- | --- | --- |
+| Observation/language | 1 | 0 | 0 | 0 |
+| VLM prompts | 1 | 1 | 0 | 0 |
+| Expert prompts | 0 | 0 | 1 | 1 |
+| Actions | 1 | 1 | 1 | 1 |
+
+Observation/language tokens attend only to their own block. VLM prompts attend to
+observation/language tokens and all VLM prompts; expert prompts attend to all expert prompts and
+action tokens. Both prompt banks retain self-attention and bidirectional attention within their
+own bank, but neither attends directly to the other prompt bank. Expert prompts do not attend
+directly to observation/language tokens. Action tokens attend to all four blocks, with bidirectional
+attention across the action chunk. During action-only Stage 1, the VLM prefix, including VLM
+prompts, is absent; expert prompts still attend to their own bank and the action block, and only
+expert prompts receive gradients. During inference, VLM prompts remain independent
+of actions and are cached with the VLM prefix. Expert prompts read the current noisy action tokens
+and are recomputed at every denoising step. Prompt outputs are not returned as actions, so the
+action chunk length is unchanged.
 
 The complete VLM, action expert, input/output projections, and timestep MLP remain frozen throughout
 action inpainting, the observation-conditioned bridge, and formal flow training. Only the two prompt
@@ -74,6 +89,24 @@ banks to be nonempty. Training requires at least one nonempty bank;
 action-only inpainting requires `num_prompt_tokens > 0`. Set `next_action_pretrain_steps=0` for
 VLM-prompt-only flow training. With CABO disabled, both counts may be `0` when loading a model for
 inference or an ablation without prompts.
+
+### Training performance
+
+Fresh configurations default to `attention_implementation="sdpa"` and
+`separate_frozen_observations=true`. SDPA lets PyTorch select an attention kernel for the current
+device and precision. During the bridge and Stage 2, each layer computes observation/language
+tokens under `no_grad` and supplies their constant keys and values to the prompt/action computation,
+subject to the same attention mask. Gradients to both prompt banks, including VLM prompts, remain
+connected. When gradient checkpointing is enabled, this path checkpoints the prompt/action
+computation once per layer; it does not recompute the frozen observation branch during backward.
+Cached inference also uses the configured attention backend.
+
+Precision still defaults to `dtype="float32"`, with full FP32 semantics preserved. BF16 remains
+an explicit option via `--policy.dtype=bfloat16`; compilation remains off by default
+(`compile_model=false`). For a comparison with the joint eager implementation, add
+`--policy.attention_implementation=eager --policy.separate_frozen_observations=false` to the same
+training command, keeping precision and batch size fixed. Actual throughput depends on the hardware
+and sequence lengths.
 
 ### Training Command Example
 
@@ -136,9 +169,9 @@ for loading older checkpoints and no longer affect training.
 
 ### Key Training Parameters
 
-- **`--policy.compile_model=true`**: Enables model compilation for faster training
-- **`--policy.gradient_checkpointing=true`**: Reduces memory usage significantly during training
-- **`--policy.dtype=bfloat16`**: Use mixed precision training for efficiency
+- **`--policy.compile_model=true`**: Enables optional model compilation (default: `false`)
+- **`--policy.gradient_checkpointing=true`**: Trades recomputation for activation memory (default: `false`)
+- **`--policy.dtype=bfloat16`**: Opts into BF16 mixed precision (default: `float32`)
 - For full FP32 training, use `accelerate launch --mixed_precision=no` with
   `--policy.dtype=float32 --policy.use_amp=false`. PI05 also disables TF32 matrix multiplications
   and cuDNN convolutions in this mode, including when `compile_model=true`.

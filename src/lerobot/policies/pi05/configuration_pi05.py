@@ -121,6 +121,8 @@ class PI05Config(PreTrainedConfig):
     )
 
     # Training settings
+    attention_implementation: str = "sdpa"  # "eager" retains the reference attention implementation.
+    separate_frozen_observations: bool = True  # Compute frozen observation tokens without autograd.
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
@@ -233,6 +235,8 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.attention_implementation not in ("sdpa", "eager"):
+            raise ValueError(f"Invalid attention_implementation: {self.attention_implementation}")
 
         if not math.isfinite(self.action_head_grad_clip_ratio) or self.action_head_grad_clip_ratio <= 0.0:
             raise ValueError(

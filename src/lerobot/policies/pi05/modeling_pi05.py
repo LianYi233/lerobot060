@@ -58,6 +58,7 @@ from lerobot.optim.cabo import (
     require_adamw,
     validate_adamw_param_group,
 )
+from lerobot.policies.pi05.attention_pi05 import pi05_attention_forward
 from lerobot.policies.pi05.configuration_pi05 import (
     DEFAULT_IMAGE_SIZE,
     PI05Config,
@@ -242,6 +243,35 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     return att_2d_masks & pad_2d_masks
 
 
+def make_pi05_att_2d_masks(
+    pad_masks: Tensor,
+    *,
+    prefix_length: int,
+    num_vlm_prompt_tokens: int,
+    num_prompt_tokens: int,
+    query_offset: int = 0,
+) -> Tensor:
+    """Mask [observations, VLM prompts, expert prompts, actions] by direct token visibility.
+
+    Observations read only observations. VLM prompts read observations and VLM prompts;
+    expert prompts read actions and expert prompts. Actions read every valid token.
+    ``query_offset=prefix_length`` builds only suffix query rows for cached denoising.
+    """
+    positions = torch.arange(pad_masks.shape[1], device=pad_masks.device)
+    queries = positions[query_offset:, None]
+    keys = positions[None, :]
+    observation_end = prefix_length - num_vlm_prompt_tokens
+    action_start = prefix_length + num_prompt_tokens
+
+    action_queries = queries >= action_start
+    allowed = torch.where(
+        queries < observation_end,
+        keys < observation_end,
+        torch.where(queries < prefix_length, keys < prefix_length, action_queries | (keys >= prefix_length)),
+    )
+    return allowed[None, :, :] & pad_masks[:, query_offset:, None] & pad_masks[:, None, :]
+
+
 def pad_vector(vector, new_dim):
     """Pad the last dimension of a vector to new_dim with zeros.
 
@@ -327,78 +357,98 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
-# Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(
-    layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
+def _layer_qkv(layer, hidden_states, condition):
+    normalized, gate = layernorm_forward(layer.input_layernorm, hidden_states, condition)
+    head_dim = layer.self_attn.head_dim
+    states = []
+    for projection in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
+        projected = projection(normalized)
+        states.append(
+            projected.view(*normalized.shape[:-1], projected.shape[-1] // head_dim, head_dim).transpose(1, 2)
+        )
+    query, key, value = states
+    return query, key, value, gate
+
+
+def _layer_output(layer, hidden_states, attention_output, gate, condition):
+    attention_output = attention_output.to(dtype=layer.self_attn.o_proj.weight.dtype)
+    residual = _gated_residual(hidden_states, layer.self_attn.o_proj(attention_output), gate)
+    normalized, gate = layernorm_forward(layer.post_attention_layernorm, residual, condition)
+    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+        normalized = normalized.to(dtype=torch.bfloat16)
+    return _gated_residual(residual, layer.mlp(normalized), gate)
+
+
+@torch.no_grad()
+def compute_layer_frozen_observations(
+    layer_idx, observations, attention_mask, position_ids, paligemma, attention_implementation="sdpa"
 ):
-    models = [paligemma.model.language_model, gemma_expert.model]
-    query_states = []
-    key_states = []
-    value_states = []
-    gates = []
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-        hidden_states, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond[i])
-        gates.append(gate)
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        query_states.append(query_state)
-        key_states.append(key_state)
-        value_states.append(value_state)
-    # Concatenate and process attention
-    query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
-    value_states = torch.cat(value_states, dim=2)
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        query_states.shape[2],
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
-    cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, unsqueeze_dim=1
-    )
-    batch_size = query_states.shape[0]
-    scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
-    # Attention computation
-    att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.model.language_model.layers[layer_idx].self_attn,
-        query_states,
-        key_states,
-        value_states,
+    """Advance frozen observations once and expose their constant per-layer keys and values."""
+    language_model = paligemma.model.language_model
+    layer = language_model.layers[layer_idx]
+    query, key, value, gate = _layer_qkv(layer, observations, None)
+    cos, sin = language_model.rotary_emb(query, position_ids)
+    query, key = modeling_gemma.apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
+    output, _ = pi05_attention_forward(
+        layer.self_attn,
+        query,
+        key,
+        value,
         attention_mask,
-        scaling,
+        layer.self_attn.scaling,
+        implementation=attention_implementation,
     )
-    # Get head_dim from the current layer, not from the model
-    head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
-    att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
-    # Process layer outputs
-    outputs_embeds = []
-    start_pos = 0
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-        end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
-        # first residual
-        out_emb = _gated_residual(hidden_states, out_emb, gates[i])
-        after_first_residual = out_emb.clone()
-        out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
-        # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-            out_emb = out_emb.to(dtype=torch.bfloat16)
-        out_emb = layer.mlp(out_emb)
-        # second residual
-        out_emb = _gated_residual(after_first_residual, out_emb, gate)
-        outputs_embeds.append(out_emb)
-        start_pos = end_pos
-    return outputs_embeds
+    output = output.reshape(observations.shape[0], observations.shape[1], query.shape[1] * query.shape[-1])
+    return _layer_output(layer, observations, output, gate, None), (key, value)
+
+
+def compute_layer_complete(
+    layer_idx,
+    inputs_embeds,
+    attention_mask,
+    position_ids,
+    adarms_cond,
+    paligemma,
+    gemma_expert,
+    attention_implementation="sdpa",
+    frozen_observation_kv=None,
+):
+    """Advance trainable token paths, optionally attending to constant observation keys/values."""
+    models = [paligemma.model.language_model, gemma_expert.model]
+    projected = [
+        _layer_qkv(models[i].layers[layer_idx], hidden, adarms_cond[i])
+        for i, hidden in enumerate(inputs_embeds)
+    ]
+    query = torch.cat([item[0] for item in projected], dim=2)
+    key = torch.cat([item[1] for item in projected], dim=2)
+    value = torch.cat([item[2] for item in projected], dim=2)
+    cos, sin = models[0].rotary_emb(query, position_ids)
+    query, key = modeling_gemma.apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
+    if frozen_observation_kv is not None:
+        key = torch.cat([frozen_observation_kv[0], key], dim=2)
+        value = torch.cat([frozen_observation_kv[1], value], dim=2)
+    attention = models[0].layers[layer_idx].self_attn
+    output, _ = pi05_attention_forward(
+        attention,
+        query,
+        key,
+        value,
+        attention_mask,
+        attention.scaling,
+        implementation=attention_implementation,
+    )
+    output = output.reshape(query.shape[0], query.shape[2], query.shape[1] * query.shape[-1])
+    outputs = []
+    start = 0
+    for i, hidden in enumerate(inputs_embeds):
+        end = start + hidden.shape[1]
+        outputs.append(
+            _layer_output(
+                models[i].layers[layer_idx], hidden, output[:, start:end], projected[i][3], adarms_cond[i]
+            )
+        )
+        start = end
+    return outputs
 
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
@@ -451,12 +501,18 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        attention_implementation: str = "sdpa",
+        separate_frozen_observations: bool = True,
+        num_vlm_prompt_tokens: int = 0,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.attention_implementation = attention_implementation
+        self.separate_frozen_observations = separate_frozen_observations
+        self.num_vlm_prompt_tokens = num_vlm_prompt_tokens
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -472,6 +528,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        vlm_config_hf.text_config._attn_implementation = attention_implementation
         vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
@@ -490,11 +547,14 @@ class PaliGemmaWithExpertModel(
             dtype="float32",
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            attn_implementation=attention_implementation,
         )
 
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        self.paligemma.model.language_model.config._attn_implementation = attention_implementation
+        self.gemma_expert.model.config._attn_implementation = attention_implementation
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
@@ -600,54 +660,72 @@ class PaliGemmaWithExpertModel(
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
-            # Process all layers with gradient checkpointing if enabled
+            # Observations cannot read prompts/actions under the PI05 mask. Their entire frozen
+            # path can run without autograd, while their per-layer KV remains available to prompts
+            # and actions. Keep this outside checkpointing so backward never recomputes observations.
+            observation_length = 0
+            observations = None
+            if self.separate_frozen_observations and self.train_expert_only and attention_mask is not None:
+                observation_length = inputs_embeds[0].shape[1] - self.num_vlm_prompt_tokens
+                if observation_length > 0:
+                    observations = inputs_embeds[0][:, :observation_length].detach()
+                    inputs_embeds = [inputs_embeds[0][:, observation_length:], inputs_embeds[1]]
+            observation_mask = (
+                attention_mask[:, :, :observation_length, :observation_length]
+                if attention_mask is not None
+                else None
+            )
+            train_attention_mask = (
+                attention_mask[:, :, observation_length:, :] if attention_mask is not None else None
+            )
+            observation_positions = position_ids[:, :observation_length]
+            train_positions = position_ids[:, observation_length:]
+
             for layer_idx in range(num_layers):
+                frozen_observation_kv = None
+                if observations is not None:
+                    observations, frozen_observation_kv = compute_layer_frozen_observations(
+                        layer_idx,
+                        observations,
+                        observation_mask,
+                        observation_positions,
+                        self.paligemma,
+                        self.attention_implementation,
+                    )
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
                         layer_idx,
                         inputs_embeds,
-                        attention_mask,
-                        position_ids,
+                        train_attention_mask,
+                        train_positions,
                         adarms_cond,
                         use_reentrant=False,
                         preserve_rng_state=False,
                         paligemma=self.paligemma,
                         gemma_expert=self.gemma_expert,
+                        attention_implementation=self.attention_implementation,
+                        frozen_observation_kv=frozen_observation_kv,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
                         layer_idx,
                         inputs_embeds,
-                        attention_mask,
-                        position_ids,
+                        train_attention_mask,
+                        train_positions,
                         adarms_cond,
                         paligemma=self.paligemma,
                         gemma_expert=self.gemma_expert,
+                        attention_implementation=self.attention_implementation,
+                        frozen_observation_kv=frozen_observation_kv,
                     )
 
-            # final norm
-            def compute_final_norms(inputs_embeds, adarms_cond):
-                outputs_embeds = []
-                for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = layernorm_forward(models[i].norm, hidden_states, adarms_cond[i])
-                    outputs_embeds.append(out_emb)
-                return outputs_embeds
-
-            # Apply gradient checkpointing to final norm if enabled
-            if use_gradient_checkpointing:
-                outputs_embeds = torch.utils.checkpoint.checkpoint(
-                    compute_final_norms,
-                    inputs_embeds,
-                    adarms_cond,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
-
-            prefix_output = outputs_embeds[0]
-            suffix_output = outputs_embeds[1]
+            prefix_output, _ = layernorm_forward(models[0].norm, inputs_embeds[0], adarms_cond[0])
+            suffix_output, _ = layernorm_forward(models[1].norm, inputs_embeds[1], adarms_cond[1])
+            if observations is not None:
+                with torch.no_grad():
+                    observations, _ = layernorm_forward(models[0].norm, observations, None)
+                prefix_output = torch.cat([observations, prefix_output], dim=1)
             prefix_past_key_values = None
 
         return [prefix_output, suffix_output], prefix_past_key_values
@@ -677,6 +755,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=True,
+            attention_implementation=config.attention_implementation,
+            separate_frozen_observations=config.separate_frozen_observations,
+            num_vlm_prompt_tokens=config.num_vlm_prompt_tokens,
         )
 
         self.vlm_prompt_tokens = nn.Embedding(config.num_vlm_prompt_tokens, paligemma_config.width)
@@ -777,7 +858,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
+        # These helpers wrap frozen modules. Without a differentiable input there is no
+        # backward graph to save; checkpointing the frozen vision encoder also interferes
+        # with torch.compile through Transformers' output-capturing context.
+        if (
+            self.gradient_checkpointing_enabled
+            and self.training
+            and any(isinstance(arg, Tensor) and arg.requires_grad for arg in args)
+        ):
             return torch.utils.checkpoint.checkpoint(
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
@@ -848,8 +936,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     device=lang_emb.device,
                 )
             )
-            # VLM prompts read observations and one another; observation tokens cannot read
-            # prompts. Expert prompts/actions can read this complete prefix in later blocks.
+            # Retain layout markers in the embedding API. make_pi05_att_2d_masks defines
+            # visibility: VLM prompts read observations and their own prompt bank.
             att_masks += [1] + [0] * (self.config.num_vlm_prompt_tokens - 1)
 
         embs = torch.cat(embs, dim=1)
@@ -902,8 +990,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             pad_masks.append(
                 torch.ones(bsize, self.config.num_prompt_tokens, dtype=torch.bool, device=action_emb.device)
             )
-            # Prompts see the VLM and one another, but never action tokens. The frozen VLM
-            # cannot see this block, so its prefix KV cache remains independent of the prompts.
+            # Expert prompts read actions and their own prompt bank under make_pi05_att_2d_masks.
+            # The VLM prefix cannot read this block and remains cacheable across denoising steps.
             att_masks += [1] + [0] * (self.config.num_prompt_tokens - 1)
 
         embs.append(action_time_emb)
@@ -987,7 +1075,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         inpainting_mask: Tensor,
     ) -> Tensor:
         """Predict the masked-action flow without a VLM prefix using the formal flow modules."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, time)
         visible = (~action_is_pad.to(device=x_t.device, dtype=torch.bool)) & (~inpainting_mask)
         num_prompts = self.config.num_prompt_tokens
         action_embs = suffix_embs[:, num_prompts:] + visible.unsqueeze(-1).to(suffix_embs.dtype) * (
@@ -999,7 +1087,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         expert_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
         suffix_embs = suffix_embs.to(dtype=expert_dtype)
-        att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        att_2d_masks = make_pi05_att_2d_masks(
+            suffix_pad_masks,
+            prefix_length=0,
+            num_vlm_prompt_tokens=0,
+            num_prompt_tokens=num_prompts,
+        )
         position_ids = (
             torch.arange(suffix_embs.shape[1], dtype=torch.long, device=x_t.device)
             .unsqueeze(0)
@@ -1026,8 +1119,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
         """Predict flow velocity for explicit noisy actions and timesteps."""
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, tokens, masks)
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1037,9 +1130,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        att_2d_masks = make_pi05_att_2d_masks(
+            pad_masks,
+            prefix_length=prefix_pad_masks.shape[1],
+            num_vlm_prompt_tokens=self.config.num_vlm_prompt_tokens,
+            num_prompt_tokens=self.config.num_prompt_tokens,
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
@@ -1055,9 +1151,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        # The joint transformer checkpoints each trainable layer internally. An outer checkpoint
+        # would replay the whole stack and then replay its individual layers again in backward.
+        suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1163,12 +1259,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_pi05_att_2d_masks(
+            prefix_pad_masks,
+            prefix_length=prefix_pad_masks.shape[1],
+            num_vlm_prompt_tokens=self.config.num_vlm_prompt_tokens,
+            num_prompt_tokens=0,
+        )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         prefix_outputs, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -1230,21 +1330,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
-
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, timestep)
         prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        full_att_2d_masks = make_pi05_att_2d_masks(
+            torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1),
+            prefix_length=prefix_len,
+            num_vlm_prompt_tokens=self.config.num_vlm_prompt_tokens,
+            num_prompt_tokens=self.config.num_prompt_tokens,
+            query_offset=prefix_len,
+        )
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = copy.deepcopy(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(

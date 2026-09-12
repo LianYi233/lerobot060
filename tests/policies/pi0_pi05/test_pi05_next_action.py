@@ -355,7 +355,9 @@ def test_flow_inpainting_action_block_is_bidirectional_and_padding_is_removed():
     num_prompts = core.config.num_prompt_tokens
     assert velocity.shape == x_t.shape
     assert allowed[:, :num_prompts, :num_prompts].all()
-    assert not allowed[:, :num_prompts, num_prompts:].any()
+    torch.testing.assert_close(
+        allowed[:, :num_prompts, num_prompts:], (~action_is_pad)[:, None, :].expand(-1, num_prompts, -1)
+    )
     assert allowed[0, num_prompts:, :].all()
     assert allowed[1, num_prompts:-3, :-3].all()
     assert not allowed[1, -3:, :].any()

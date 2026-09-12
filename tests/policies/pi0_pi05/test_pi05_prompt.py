@@ -196,17 +196,20 @@ def test_prompt_and_action_attention_blocks(num_vlm_prompts, num_prompts):
         _config(num_prompt_tokens=num_prompts, num_vlm_prompt_tokens=num_vlm_prompts, cabo_enabled=False)
     ).model
     inputs = _inputs()
-    prefix, prefix_pad, prefix_att = core.embed_prefix(**inputs)
+    prefix, prefix_pad, _ = core.embed_prefix(**inputs)
     actions = _actions()
-    suffix, suffix_pad, suffix_att, _ = core.embed_suffix(actions, torch.tensor([0.3, 0.7]))
+    suffix, suffix_pad, _, _ = core.embed_suffix(actions, torch.tensor([0.3, 0.7]))
 
     assert suffix.shape == (2, num_prompts + _HORIZON, _EXPERT_WIDTH)
     torch.testing.assert_close(suffix[:, num_prompts:], core.action_in_proj(actions))
     torch.testing.assert_close(
         suffix[:, :num_prompts], core.prompt_tokens.weight.unsqueeze(0).expand(2, -1, -1)
     )
-    allowed = modeling_pi05.make_att_2d_masks(
-        torch.cat([prefix_pad, suffix_pad], dim=1), torch.cat([prefix_att, suffix_att], dim=1)
+    allowed = modeling_pi05.make_pi05_att_2d_masks(
+        torch.cat([prefix_pad, suffix_pad], dim=1),
+        prefix_length=prefix.shape[1],
+        num_vlm_prompt_tokens=num_vlm_prompts,
+        num_prompt_tokens=num_prompts,
     )
     prefix_len = prefix.shape[1]
     observation_len = prefix_len - num_vlm_prompts
@@ -218,17 +221,21 @@ def test_prompt_and_action_attention_blocks(num_vlm_prompts, num_prompts):
     assert not allowed[:, :observation_len, observation_len:].any()
     assert allowed[:, observation_len:prefix_len, observation_len:prefix_len].all()
     torch.testing.assert_close(
+        allowed[:, :observation_len, :observation_len],
+        prefix_pad[:, :observation_len, None] & prefix_pad[:, None, :observation_len],
+    )
+    torch.testing.assert_close(
         allowed[:, observation_len:prefix_len, :observation_len],
         prefix_pad[:, None, :observation_len].expand(-1, num_vlm_prompts, -1),
     )
     action_start = prefix_len + num_prompts
     assert not allowed[:, :prefix_len, prefix_len:].any()
-    assert not allowed[:, prefix_len:action_start, action_start:].any()
-    assert allowed[:, prefix_len:action_start, prefix_len:action_start].all()
+    assert not allowed[:, prefix_len:action_start, :prefix_len].any()
+    assert allowed[:, prefix_len:action_start, prefix_len:].all()
     assert allowed[:, action_start:, prefix_len:].all()
     torch.testing.assert_close(
-        allowed[:, prefix_len:, :prefix_len],
-        prefix_pad[:, None, :].expand(-1, num_prompts + _HORIZON, -1),
+        allowed[:, action_start:, :prefix_len],
+        prefix_pad[:, None, :].expand(-1, _HORIZON, -1),
     )
 
 
@@ -251,7 +258,9 @@ def test_inpainting_prompts_remain_valid_and_positions_include_them(monkeypatch)
     assert torch.isfinite(velocity).all()
     allowed = captured["attention_mask"][:, 0].eq(0)
     assert allowed[:, :_PROMPTS, :_PROMPTS].all()
-    assert not allowed[:, :_PROMPTS, _PROMPTS:].any()
+    torch.testing.assert_close(
+        allowed[:, :_PROMPTS, _PROMPTS:], (~action_is_pad)[:, None, :].expand(-1, _PROMPTS, -1)
+    )
     assert allowed[0, _PROMPTS:, :].all()
     assert allowed[1, _PROMPTS : _PROMPTS + 2, : _PROMPTS + 2].all()
     assert not allowed[1, -2:, :].any()
@@ -265,15 +274,20 @@ def test_inpainting_prompts_remain_valid_and_positions_include_them(monkeypatch)
 
 
 @torch.no_grad()
-def test_action_changes_cannot_change_vlm_or_prompt_hidden_states():
+def test_action_changes_update_expert_prompts_but_not_vlm_prefix():
     core = PI05Policy(_config()).model.eval()
-    prefix, prefix_pad, prefix_att = core.embed_prefix(**_inputs())
+    prefix, prefix_pad, _ = core.embed_prefix(**_inputs())
     time = torch.tensor([0.3, 0.7])
 
     def forward_hidden_states(actions):
-        suffix, suffix_pad, suffix_att, condition = core.embed_suffix(actions, time)
+        suffix, suffix_pad, _, condition = core.embed_suffix(actions, time)
         pad = torch.cat([prefix_pad, suffix_pad], dim=1)
-        attention = modeling_pi05.make_att_2d_masks(pad, torch.cat([prefix_att, suffix_att], dim=1))
+        attention = modeling_pi05.make_pi05_att_2d_masks(
+            pad,
+            prefix_length=prefix.shape[1],
+            num_vlm_prompt_tokens=_VLM_PROMPTS,
+            num_prompt_tokens=_PROMPTS,
+        )
         outputs, _ = core.paligemma_with_expert(
             attention_mask=core._prepare_attention_masks_4d(attention),
             position_ids=pad.cumsum(dim=1) - 1,
@@ -287,7 +301,41 @@ def test_action_changes_cannot_change_vlm_or_prompt_hidden_states():
     second_prefix, second_suffix = forward_hidden_states(_actions() * 10)
 
     torch.testing.assert_close(first_prefix[prefix_pad], second_prefix[prefix_pad], rtol=0, atol=0)
+    assert not torch.allclose(first_suffix[:, :_PROMPTS], second_suffix[:, :_PROMPTS])
+    assert not torch.allclose(first_suffix[:, _PROMPTS:], second_suffix[:, _PROMPTS:])
+
+
+@torch.no_grad()
+def test_expert_prompts_cannot_read_observations_directly():
+    core = PI05Policy(_config()).model.eval()
+    # Isolate direct visibility: later action representations can carry VLM information.
+    core.paligemma_with_expert.paligemma.config.text_config.num_hidden_layers = 1
+    prefix, prefix_pad, _ = core.embed_prefix(**_inputs())
+    suffix, suffix_pad, _, condition = core.embed_suffix(_actions(), torch.tensor([0.3, 0.7]))
+    pad = torch.cat([prefix_pad, suffix_pad], dim=1)
+    allowed = modeling_pi05.make_pi05_att_2d_masks(
+        pad,
+        prefix_length=prefix.shape[1],
+        num_vlm_prompt_tokens=_VLM_PROMPTS,
+        num_prompt_tokens=_PROMPTS,
+    )
+
+    def forward_hidden_states(prefix_embs):
+        outputs, _ = core.paligemma_with_expert(
+            attention_mask=core._prepare_attention_masks_4d(allowed),
+            position_ids=pad.cumsum(dim=1) - 1,
+            inputs_embeds=[prefix_embs, suffix],
+            adarms_cond=[None, condition],
+            use_cache=False,
+        )
+        return outputs
+
+    changed_prefix = prefix.clone()
+    changed_prefix[:, :-_VLM_PROMPTS] = torch.randn_like(changed_prefix[:, :-_VLM_PROMPTS])
+    first_prefix, first_suffix = forward_hidden_states(prefix)
+    second_prefix, second_suffix = forward_hidden_states(changed_prefix)
     torch.testing.assert_close(first_suffix[:, :_PROMPTS], second_suffix[:, :_PROMPTS], rtol=0, atol=0)
+    assert not torch.allclose(first_prefix[:, -_VLM_PROMPTS:], second_prefix[:, -_VLM_PROMPTS:])
     assert not torch.allclose(first_suffix[:, _PROMPTS:], second_suffix[:, _PROMPTS:])
 
 
@@ -405,8 +453,9 @@ def test_training_requires_at_least_one_prompt_bank():
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("num_vlm_prompts", [0, _VLM_PROMPTS])
 @pytest.mark.parametrize("num_prompts", [0, _PROMPTS])
+@pytest.mark.parametrize("empty_observations", [False, True])
 @torch.no_grad()
-def test_cached_denoising_matches_full_forward(dtype, num_vlm_prompts, num_prompts):
+def test_cached_denoising_matches_full_forward(dtype, num_vlm_prompts, num_prompts, empty_observations):
     core = PI05Policy(
         _config(
             dtype=dtype,
@@ -416,13 +465,21 @@ def test_cached_denoising_matches_full_forward(dtype, num_vlm_prompts, num_promp
         )
     ).model.eval()
     inputs = _inputs()
+    if empty_observations:
+        inputs["img_masks"][0].fill_(False)
+        inputs["masks"].fill_(False)
     actions = _actions()
     time = torch.tensor([0.25, 0.75])
     full_velocity = core.predict_velocity(**inputs, x_t=actions, time=time)
-    prefix, prefix_pad, prefix_att = core.embed_prefix(**inputs)
+    prefix, prefix_pad, _ = core.embed_prefix(**inputs)
     _, cache = core.paligemma_with_expert(
         attention_mask=core._prepare_attention_masks_4d(
-            modeling_pi05.make_att_2d_masks(prefix_pad, prefix_att)
+            modeling_pi05.make_pi05_att_2d_masks(
+                prefix_pad,
+                prefix_length=prefix.shape[1],
+                num_vlm_prompt_tokens=num_vlm_prompts,
+                num_prompt_tokens=0,
+            )
         ),
         position_ids=prefix_pad.cumsum(dim=1) - 1,
         inputs_embeds=[prefix, None],
