@@ -84,10 +84,10 @@ esac
 FLOW_STEPS="${FLOW_STEPS_OVERRIDE:-${FLOW_STEPS_DEFAULT}}"
 
 DATASET_REPO_ID="${DATASET_REPO_ID:-libero}"
-DATASET_ROOT="${DATASET_ROOT:-/data/datasets/libero}"
-PRETRAINED_PATH="${PRETRAINED_PATH:-/data/models/lerobot/pi05_libero_base}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data1/wyn/chkpt/2601-lerobot/prompt-ablation}"
-LOG_ROOT="${LOG_ROOT:-/data1/wyn/logs/prompt-ablation}"
+DATASET_ROOT="${DATASET_ROOT:-/root/autodl-tmp/datasets/libero}"
+PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-tmp/models/pi05_libero_base}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"
+LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/logs/prompt-ablation}"
 GPU_IDS="${GPU_IDS:-0,1}"
 NUM_PROCESSES="${NUM_PROCESSES:-2}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -126,12 +126,12 @@ if ! command -v lerobot-train >/dev/null 2>&1; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
-export TMPDIR="${TMPDIR:-/data1/wyn/tmp}"
+export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
 export TMP="${TMP:-${TMPDIR}}"
 export TEMP="${TEMP:-${TMPDIR}}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/data1/wyn/cache/torchinductor}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/data1/wyn/cache/triton}"
-export HF_HOME="${HF_HOME:-/data1/wyn/cache/huggingface}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/autodl-tmp/cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/autodl-tmp/cache/triton}"
+export HF_HOME="${HF_HOME:-/root/autodl-tmp/cache/huggingface}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
