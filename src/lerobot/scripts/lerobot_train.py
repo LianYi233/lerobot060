@@ -682,6 +682,9 @@ def _train_single_stage(
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        tokenizer_name = getattr(active_cfg, "tokenizer_name", None)
+        if tokenizer_name:
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_name}
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
