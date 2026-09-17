@@ -6,16 +6,16 @@ usage() {
 Usage: bash train_pi05_prompt_ablation.sh VARIANT [SEED] [extra lerobot-train args...]
 
 Variants:
-  full_reference    750 inpainting + 250 bridge + 6000 flow, dual prompts, CABO
-  no_bridge         1000 inpainting + 0 bridge + 6000 flow, dual prompts, CABO
-  direct_dual       0 pretraining + 7000 flow, dual prompts, CABO
-  dual_prompt_only  0 pretraining + 7000 flow, dual prompts, CABO off
-  vlm_only          0 pretraining + 7000 flow, VLM prompt only, CABO off
-  action_only       0 pretraining + 7000 flow, action prompt only, CABO off
-  no_cabo           750 inpainting + 250 bridge + 6000 flow, dual prompts, CABO off
+  full_reference    750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO
+  no_bridge         1000 inpainting + 0 bridge + 3000 flow, dual prompts, CABO
+  direct_dual       0 pretraining + 3000 flow, dual prompts, CABO
+  dual_prompt_only  0 pretraining + 3000 flow, dual prompts, CABO off
+  vlm_only          0 pretraining + 3000 flow, VLM prompt only, CABO off
+  action_only       0 pretraining + 3000 flow, action prompt only, CABO off
+  no_cabo           750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO off
 
-The direct variants use 7000 flow updates so that their total update budget matches
-the 1000 + 6000 updates used by the staged variants.
+All variants use 3000 flow updates by default. Set FLOW_STEPS to override this
+for a one-off run.
 EOF
 }
 
@@ -38,7 +38,7 @@ CABO_ENABLED=true
 PRETRAIN_STEPS=1000
 BRIDGE_STEPS=250
 FLOW_STEPS_OVERRIDE="${FLOW_STEPS:-}"
-FLOW_STEPS_DEFAULT=6000
+FLOW_STEPS_DEFAULT=3000
 
 case "${VARIANT}" in
   full_reference)
@@ -49,25 +49,21 @@ case "${VARIANT}" in
   direct_dual)
     PRETRAIN_STEPS=0
     BRIDGE_STEPS=0
-    FLOW_STEPS_DEFAULT=7000
     ;;
   dual_prompt_only)
     PRETRAIN_STEPS=0
     BRIDGE_STEPS=0
-    FLOW_STEPS_DEFAULT=7000
     CABO_ENABLED=false
     ;;
   vlm_only)
     PRETRAIN_STEPS=0
     BRIDGE_STEPS=0
-    FLOW_STEPS_DEFAULT=7000
     ACTION_PROMPT_TOKENS=0
     CABO_ENABLED=false
     ;;
   action_only)
     PRETRAIN_STEPS=0
     BRIDGE_STEPS=0
-    FLOW_STEPS_DEFAULT=7000
     VLM_PROMPT_TOKENS=0
     CABO_ENABLED=false
     ;;
