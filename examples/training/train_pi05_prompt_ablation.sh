@@ -86,6 +86,7 @@ FLOW_STEPS="${FLOW_STEPS_OVERRIDE:-${FLOW_STEPS_DEFAULT}}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-libero}"
 DATASET_ROOT="${DATASET_ROOT:-/root/autodl-tmp/datasets/libero}"
 PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-tmp/models/pi05_libero_base}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/root/autodl-tmp/models/google/paligemma-3b-pt-224}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"
 LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/logs/prompt-ablation}"
 GPU_IDS="${GPU_IDS:-0}"
@@ -110,6 +111,10 @@ if [[ ! -d "${DATASET_ROOT}" ]]; then
 fi
 if [[ ! -d "${PRETRAINED_PATH}" ]]; then
   echo "Pretrained model does not exist: ${PRETRAINED_PATH}" >&2
+  exit 1
+fi
+if [[ ! -d "${TOKENIZER_PATH}" ]]; then
+  echo "Tokenizer does not exist: ${TOKENIZER_PATH}" >&2
   exit 1
 fi
 if [[ -e "${OUTPUT_DIR}" ]]; then
@@ -143,6 +148,7 @@ TRAIN_ARGS=(
   --policy.type=pi05
   --policy.training_stage=flow
   --policy.pretrained_path="${PRETRAINED_PATH}"
+  --policy.tokenizer_name="${TOKENIZER_PATH}"
   --policy.device=cuda
   --policy.dtype="${DTYPE}"
   --policy.compile_model="${COMPILE_MODEL}"
