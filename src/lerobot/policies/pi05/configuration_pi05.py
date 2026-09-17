@@ -48,6 +48,7 @@ class PI05Config(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
+    tokenizer_name: str = "google/paligemma-3b-pt-224"
 
     # Only these two prompt banks train; the complete VLM and action path stay frozen.
     # VLM prompts follow the observation/language prefix, using the VLM embedding width.
