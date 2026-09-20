@@ -761,6 +761,35 @@ def _train_single_stage(
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    # TRAINABLE_PARAMETER_REPORT_V1
+    if is_main_process:
+        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "other": 0}
+        logging.info("========== Trainable parameter report ==========")
+        logging.info("Training stage: %s", getattr(cfg.policy, "training_stage", "unknown"))
+        for _name, _parameter in policy.named_parameters():
+            if not _parameter.requires_grad:
+                continue
+            _count = _parameter.numel()
+            if "vlm_prompt_tokens" in _name.split("."):
+                _category = "vlm_prompt"
+            elif "prompt_tokens" in _name.split("."):
+                _category = "action_prompt"
+            else:
+                _category = "other"
+            _parameter_counts[_category] += _count
+            logging.info(
+                "TRAINABLE %s | shape=%s | params=%s",
+                _name, tuple(_parameter.shape), f"{_count:,}",
+            )
+        for _category, _count in _parameter_counts.items():
+            logging.info("%s: %s (%.6fM)", _category, f"{_count:,}", _count / 1e6)
+        logging.info(
+            "Trainable total: %s (%.6fM) | All parameters: %s | Trainable ratio: %.6f%%",
+            f"{num_learnable_params:,}", num_learnable_params / 1e6,
+            f"{num_total_params:,}", 100 * num_learnable_params / max(1, num_total_params),
+        )
+        logging.info("================================================")
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
