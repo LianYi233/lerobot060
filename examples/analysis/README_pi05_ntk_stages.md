@@ -17,13 +17,28 @@
 | 已有默认配方的 flow 3000 步完成 | 4000 | `RUN_DIR/checkpoints/003000/pretrained_model` |
 
 分析默认使用表中累计 3000 的版本。如果“3000 steps”指原脚本的 **flow 3000**，设置 `FINAL_FLOW_STEPS=3000`；图上会如实标成累计 4000。
-不修改现有消融训练的默认步数。
+不修改现有消融训练的默认步数。`full_reference` 现在默认开启阶段快照，并每 1000 个 flow 更新保存一次，
+因此一次默认训练会同时保留累计 3000 的 `002000` 和最终 flow 3000 的 `003000`。
 
 ## 2. 训练时保存准确的四个快照
 
 现有脚本原本只保存预训练结束的 1000 checkpoint，`SAVE_FREQ=750` 也不会改变其独立预训练保存频率。
-现在可以通过 `--policy.ntk_save_stage_snapshots=true`，额外保存每个训练阶段自己的初始 checkpoint，以及 priming 结束的 750 checkpoint。
-这是可选开关；未开启时原保存行为不变。所有快照保存完整模型、实际 prompts、预处理器和训练状态，额外占用与完整 checkpoint 相当的空间。
+现在直接运行 `full_reference` 就会自动传入 `--policy.ntk_save_stage_snapshots=true`，
+额外保存每个训练阶段自己的初始 checkpoint，以及 priming 结束的 750 checkpoint。
+其他 variant 默认不启用阶段快照，flow 默认仍每 3000 步保存。可用 `NTK_SAVE_STAGE_SNAPSHOTS=true/false`
+控制阶段快照，`SAVE_FREQ` 覆盖 flow 保存间隔。所有快照保存完整模型、实际 prompts、预处理器和训练状态，
+额外占用与完整 checkpoint 相当的空间。
+
+重新跑原来的 full_reference 配方并自动保存分析所需模型（换一个未使用的 `RUN_NAME`）：
+
+```bash
+RUN_NAME=pi05-full-reference-ntk-seed0 GPU_IDS=0 \
+  bash examples/training/train_pi05_prompt_ablation.sh full_reference 0
+```
+
+该命令沿用下述环境变量所指定的模型、数据和 tokenizer 路径；默认配方为 750 + 250 + 3000 flow。
+会保留预训练目录的 `000000 / 000750 / 001000`，以及 flow 目录的 `000000 / 001000 / 002000 / 003000`。
+其中 flow `000000` 与预训练 `001000` 是同一个阶段边界；整个实验的训练前模型应取预训练目录的 `000000`。
 
 累计训练 3000 步的新实验（先在当前训练环境 `pip install -e .`）：
 
@@ -40,7 +55,7 @@ FLOW_STEPS=2000 SAVE_FREQ=2000 \
   --policy.ntk_save_stage_snapshots=true
 ```
 
-若要沿用已有 **750 + 250 + 3000** 配方，改为 `FLOW_STEPS=3000 SAVE_FREQ=3000`。
+若要沿用已有 **750 + 250 + 3000** 配方，改为 `FLOW_STEPS=3000 SAVE_FREQ=1000`，同时保留累计 3000 与最终 flow 3000 的 checkpoint。
 训练结束后，完整 flow 阶段的 `checkpoints/000000` 对应累计 1000，**不能**当作整个实验训练前的快照。
 如果旧实验没有保存 0 或 750，无法从 1000/3000 的权重反推出这些时间点；需要重新运行并打开上述快照开关。脚本不会用随机初始化的 prompts 或别的 checkpoint 代替缺失时间点。
 

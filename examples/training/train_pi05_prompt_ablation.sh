@@ -16,6 +16,10 @@ Variants:
 
 All variants use 3000 flow updates by default. Set FLOW_STEPS to override this
 for a one-off run.
+full_reference automatically saves exact initialization and priming-end snapshots,
+and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000).
+Set NTK_SAVE_STAGE_SNAPSHOTS=false to disable extra stage snapshots, or SAVE_FREQ
+to override the flow checkpoint interval. Other variants keep their existing defaults.
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
 EOF
 }
@@ -44,9 +48,13 @@ PRETRAIN_STEPS=1000
 BRIDGE_STEPS=250
 FLOW_STEPS_OVERRIDE="${FLOW_STEPS:-}"
 FLOW_STEPS_DEFAULT=3000
+SAVE_FREQ_DEFAULT=3000
+NTK_SNAPSHOTS_DEFAULT=false
 
 case "${VARIANT}" in
   full_reference)
+    SAVE_FREQ_DEFAULT=1000
+    NTK_SNAPSHOTS_DEFAULT=true
     ;;
   no_bridge)
     BRIDGE_STEPS=0
@@ -93,7 +101,8 @@ LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/logs/prompt-ablation}"
 GPU_IDS="${GPU_IDS:-0}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
-SAVE_FREQ="${SAVE_FREQ:-3000}"
+SAVE_FREQ="${SAVE_FREQ:-${SAVE_FREQ_DEFAULT}}"
+NTK_SAVE_STAGE_SNAPSHOTS="${NTK_SAVE_STAGE_SNAPSHOTS:-${NTK_SNAPSHOTS_DEFAULT}}"
 CABO_RATIO="${CABO_RATIO:-2.0}"
 MASKED_STEPS="${MASKED_STEPS:-40}"
 DTYPE="${DTYPE:-float32}"
@@ -123,6 +132,10 @@ if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "Output already exists; refusing to overwrite: ${OUTPUT_DIR}" >&2
   exit 1
 fi
+if (( PRETRAIN_STEPS > 0 )) && [[ -e "${OUTPUT_DIR}_next_action_pretrain" ]]; then
+  echo "Pretraining output already exists; choose a new RUN_NAME: ${OUTPUT_DIR}_next_action_pretrain" >&2
+  exit 1
+fi
 if [[ "${DRY_RUN}" != true ]] && ! command -v accelerate >/dev/null 2>&1; then
   echo "accelerate is not available in the active environment" >&2
   exit 1
@@ -149,6 +162,7 @@ TRAIN_ARGS=(
   --policy.next_action_pretrain_steps="${PRETRAIN_STEPS}"
   --policy.next_action_bridge_steps="${BRIDGE_STEPS}"
   --policy.next_action_masked_steps="${MASKED_STEPS}"
+  --policy.ntk_save_stage_snapshots="${NTK_SAVE_STAGE_SNAPSHOTS}"
   --policy.cabo_enabled="${CABO_ENABLED}"
   --policy.cabo_prompt_update_ratio="${CABO_RATIO}"
   --policy.push_to_hub=false
@@ -173,6 +187,18 @@ fi
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
 echo "output=${OUTPUT_DIR}"
+echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
+if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then
+  PRETRAIN_OUTPUT_DIR="${OUTPUT_DIR}_next_action_pretrain"
+  printf 'NTK before training: %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" 0
+  if (( BRIDGE_STEPS > 0 )); then
+    printf 'NTK after priming:  %s/checkpoints/%06d/pretrained_model\n' \
+      "${PRETRAIN_OUTPUT_DIR}" "$((PRETRAIN_STEPS - BRIDGE_STEPS))"
+  fi
+  printf 'NTK after stage 2:  %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" "${PRETRAIN_STEPS}"
+  printf 'NTK final flow:     %s/checkpoints/%06d/pretrained_model (cumulative updates: %d)\n' \
+    "${OUTPUT_DIR}" "${FLOW_STEPS}" "$((PRETRAIN_STEPS + FLOW_STEPS))"
+fi
 
 if [[ "${DRY_RUN}" == true ]]; then
   printf '%q ' env "CUDA_VISIBLE_DEVICES=${GPU_IDS}" accelerate "${LAUNCH_ARGS[@]}" \
