@@ -1,4 +1,4 @@
-"""Publication figures for the four-checkpoint PI05 NTK protocol (no GPU required)."""
+"""Publication figures for completed stages of the PI05 NTK protocol (no GPU required)."""
 
 import argparse
 import csv
@@ -35,8 +35,12 @@ def plot_results(results_path):
     seeds = document["manifest"]["seeds"]
     out = results_path.parent
     lookup = {(row["stage"], row["seed"]): row for row in records}
-    if len(lookup) != len(records) or len(lookup) != len(stages) * len(seeds):
-        raise ValueError("Cannot draw four-stage trends from incomplete or duplicate seed records")
+    names = [stage["name"] for stage in stages]
+    if not names or names != list(STAGE_LABELS)[: len(names)] or not seeds:
+        raise ValueError("Expected nonempty consecutive stages starting before training and paired seeds")
+    expected = {(name, seed) for name in names for seed in seeds}
+    if len(lookup) != len(records) or set(lookup) != expected or len(seeds) != len(set(seeds)):
+        raise ValueError("Cannot draw stage trends from incomplete or duplicate seed records")
     groups = list(records[0]["groups"])
     if any(set(row["groups"]) != set(groups) for row in records):
         raise ValueError("Missing parameter group in a stage/seed")
@@ -104,7 +108,16 @@ def plot_results(results_path):
             energies = {module: values(scope, module, "parameter_normalized_energy") for module in COLORS}
             title = "Backbone sensitivity" if scope == "backbone" else "Prompt sensitivity"
             notes = "Points: paired probe seeds; bars/bands: median and IQR (not training-run uncertainty)."
-            fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=True, sharey=True, layout="constrained")
+            rows, columns = (2, 2) if len(stages) == 4 else (1, len(stages))
+            fig, axes = plt.subplots(
+                rows,
+                columns,
+                figsize=(5 * columns, 3.5 * rows + (1 if rows == 1 else 0)),
+                sharex=True,
+                sharey=True,
+                squeeze=False,
+                layout="constrained",
+            )
             for index, (stage, axis) in enumerate(zip(stages, axes.flat, strict=True)):
                 for module, color in COLORS.items():
                     x, y = ranks[module][index], energies[module][index]
@@ -132,7 +145,7 @@ def plot_results(results_path):
 
             # Paired trajectories preserve the user's original x/y axes.
             fig, axis = plt.subplots(figsize=(7, 5), layout="constrained")
-            markers = ("o", "s", "^", "D")
+            markers = ("o", "s", "^", "D")[: len(stages)]
             for module, color in COLORS.items():
                 x, y = np.median(ranks[module], axis=1), np.median(energies[module], axis=1)
                 axis.plot(x, y, color=color, label=LABELS[module])
@@ -172,7 +185,7 @@ def plot_results(results_path):
                 if metric == "parameter_normalized_energy":
                     energy_scale(axis, list(energies.values()))
                 # Keep 750 and 1000 readable at their actual (unequally spaced) positions.
-                # Full stage names are supplied by the companion four-panel figure.
+                # Full stage names are supplied by the companion stage-panel figure.
                 axis.set_xticks(steps)
                 axis.set(xlabel="Cumulative optimizer updates", ylabel=metric_label, title=title)
                 axis.tick_params(axis="x", labelsize=8)

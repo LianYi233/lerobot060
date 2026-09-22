@@ -61,6 +61,7 @@ def checkpoint_dir(path):
 
 
 def resolve_stages(args):
+    selected = STAGES[: STAGES.index(args.through_stage) + 1]
     if args.final_flow_steps <= 0:
         raise ValueError("--final-flow-steps must be positive (2000 means 3000 cumulative updates)")
     paths = {name: getattr(args, name) for name in STAGES}
@@ -74,12 +75,14 @@ def resolve_stages(args):
             "final": run / f"checkpoints/{args.final_flow_steps:06d}",
         }
         paths = {key: paths[key] or defaults[key] for key in STAGES}
-    if any(path is None for path in paths.values()):
-        raise ValueError("Supply --run-dir or all of --before, --priming, --stage2, --final")
+    if any(paths[name] is None for name in selected):
+        raise ValueError("Supply --run-dir or explicit checkpoint paths for every selected stage")
     local_steps = (0, 750, 1000, args.final_flow_steps)
     total_steps = (0, 750, 1000, 1000 + args.final_flow_steps)
     stages = []
     for name, local_step, total_step in zip(STAGES, local_steps, total_steps, strict=True):
+        if name not in selected:
+            continue
         path = checkpoint_dir(paths[name])
         for filename in ("config.json", "train_config.json", "model.safetensors", "policy_preprocessor.json"):
             if not (path / filename).is_file():
@@ -116,12 +119,24 @@ def resolve_stages(args):
                 "config": config,
             }
         )
-    if len({stage["checkpoint"] for stage in stages}) != 4:
-        raise ValueError("The four checkpoints must be distinct")
+    if len({stage["checkpoint"] for stage in stages}) != len(stages):
+        raise ValueError("The selected checkpoints must be distinct")
     for field in COMPARABLE_FIELDS:
         if any(stage["config"].get(field) != stages[0]["config"].get(field) for stage in stages[1:]):
             raise ValueError(f"Incomparable checkpoint configuration: {field}")
     return stages
+
+
+def validate_manifest_extension(previous, current):
+    """Reuse completed stages only when all measurement settings stay identical."""
+    previous_protocol = {key: value for key, value in previous.items() if key != "stages"}
+    current_protocol = {key: value for key, value in current.items() if key != "stages"}
+    old_stages, new_stages = previous["stages"], current["stages"]
+    if previous_protocol != current_protocol or old_stages != new_stages[: len(old_stages)]:
+        raise ValueError(
+            "Output protocol/checkpoints have changed. Only appending later stages is supported; "
+            "use a new --output-dir for other changes"
+        )
 
 
 def file_identity(path):
@@ -370,10 +385,8 @@ def run(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.json"
-    if manifest_path.exists() and read_json(manifest_path) != manifest:
-        raise ValueError(
-            "Output protocol/checkpoints have changed. Use a new --output-dir to avoid mixing results"
-        )
+    if manifest_path.exists():
+        validate_manifest_extension(read_json(manifest_path), manifest)
     write_json(manifest_path, manifest)
     records = []
     signature = None
@@ -383,7 +396,7 @@ def run(args):
             logging.info("Loading %s: %s", stage["name"], stage["checkpoint"])
             policy, groups = load_policy(stage, args.scope, args.device)
             current_signature = {
-                group: [(name, list(p.shape)) for name, p in members] for group, members in groups.items()
+                group: [[name, list(p.shape)] for name, p in members] for group, members in groups.items()
             }
             if signature is not None and signature != current_signature:
                 raise ValueError("Parameter groups differ across checkpoints")
@@ -402,7 +415,16 @@ def run(args):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        records.extend(read_json(output_dir / f"{stage['name']}_seed{seed}.json") for seed in seeds)
+        for seed in seeds:
+            record = read_json(output_dir / f"{stage['name']}_seed{seed}.json")
+            if any(record[key] != stage[key] for key in ("local_step", "total_step")) or (
+                record["stage"] != stage["name"] or record["seed"] != seed
+            ):
+                raise ValueError(f"Cached record does not match {stage['name']} seed {seed}")
+            if signature is not None and record["parameter_groups"] != signature:
+                raise ValueError("Parameter groups differ across checkpoints or cached records")
+            signature = record["parameter_groups"]
+            records.append(record)
     write_json(output_dir / "results.json", {"manifest": manifest, "records": records})
     from lerobot.scripts.plot_pi05_ntk_stages import plot_results
 
@@ -413,6 +435,12 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-dir", help="Formal-flow output directory; auto-resolves its pretraining sibling"
+    )
+    parser.add_argument(
+        "--through-stage",
+        choices=STAGES,
+        default="final",
+        help="Analyze from before through this stage; stage2 needs only the 0/750/1000 snapshots",
     )
     for stage in STAGES:
         parser.add_argument(

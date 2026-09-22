@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.scripts.analyze_pi05_ntk_stages import make_parser, resolve_stages
+from lerobot.scripts import analyze_pi05_ntk_stages as analysis
+from lerobot.scripts.analyze_pi05_ntk_stages import make_parser, resolve_stages, validate_manifest_extension
 from lerobot.scripts.plot_pi05_ntk_stages import plot_results
 from lerobot.utils.ntk import compress_gradients, projected_jacobian_rows, spectral_metrics
 
@@ -105,13 +106,90 @@ def test_missing_priming_is_not_silently_substituted(tmp_path):
         resolve_stages(make_parser().parse_args(["--run-dir", str(run)]))
 
 
-def test_plot_complete_paired_time_series(tmp_path):
+def test_first_three_stages_do_not_require_final_checkpoint(tmp_path):
+    run = _fake_run(tmp_path)
+    (run / "checkpoints/002000/pretrained_model/model.safetensors").unlink()
+    args = make_parser().parse_args(["--run-dir", str(run), "--through-stage=stage2"])
+    assert [stage["total_step"] for stage in resolve_stages(args)] == [0, 750, 1000]
+    args.through_stage = "final"
+    with pytest.raises(FileNotFoundError, match="final: missing"):
+        resolve_stages(args)
+    args.through_stage = "stage2"
+    (tmp_path / "run_next_action_pretrain/checkpoints/000750/pretrained_model/model.safetensors").unlink()
+    with pytest.raises(FileNotFoundError, match="priming: missing"):
+        resolve_stages(args)
+
+
+@pytest.mark.parametrize("change", ["settings", "weights", "truncate"])
+def test_cached_measurements_reject_incompatible_changes(change):
+    previous = {"seeds": [0, 1], "stages": [{"name": "before", "weights": "original"}]}
+    current = json.loads(json.dumps(previous))
+    if change == "settings":
+        current["seeds"] = [0, 2]
+    elif change == "weights":
+        current["stages"][0]["weights"] = "different"
+    else:
+        current["stages"] = []
+    with pytest.raises(ValueError, match="Only appending"):
+        validate_manifest_extension(previous, current)
+
+
+def test_append_final_stage_reuses_all_completed_seeds(tmp_path, monkeypatch):
+    from lerobot.scripts import plot_pi05_ntk_stages as plotting
+
+    run = _fake_run(tmp_path)
+    output = tmp_path / "analysis"
+    args = make_parser().parse_args(
+        [
+            "--run-dir",
+            str(run),
+            "--through-stage=stage2",
+            "--output-dir",
+            str(output),
+            "--device=cpu",
+            "--dataset-repo-id=test",
+            "--dataset-root",
+            str(tmp_path),
+            "--seeds=0,1",
+        ]
+    )
+    monkeypatch.setattr(analysis, "load_samples", lambda *_: ([{"action": torch.ones(1, 2)}], [0]))
+    loaded, measured = [], []
+
+    def load_policy(stage, *_):
+        loaded.append(stage["name"])
+        parameter = torch.nn.Parameter(torch.ones(2))
+        return stage["name"], {"prompts/vlm": [("weight", parameter)]}
+
+    def analyze_seed(policy, groups, samples, seed, args):
+        measured.append((policy, seed))
+        return {"prompts/vlm": spectral_metrics(np.eye(2), 2)}
+
+    monkeypatch.setattr(analysis, "load_policy", load_policy)
+    monkeypatch.setattr(analysis, "analyze_seed", analyze_seed)
+    monkeypatch.setattr(plotting, "plot_results", lambda *_: None)
+    analysis.run(args)
+    assert loaded == ["before", "priming", "stage2"]
+    assert len(measured) == 6
+    cached = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in output.glob("*_seed*.json")}
+    args.through_stage = "final"
+    analysis.run(args)
+    assert loaded == ["before", "priming", "stage2", "final"]
+    assert measured[6:] == [("final", 0), ("final", 1)]
+    assert all((path.read_bytes(), path.stat().st_mtime_ns) == old for path, old in cached.items())
+    result = json.loads((output / "results.json").read_text())
+    assert len(result["records"]) == 8
+    assert len(result["manifest"]["stages"]) == 4
+
+
+@pytest.mark.parametrize("stage_count", [1, 2, 3, 4])
+def test_plot_complete_paired_time_series(tmp_path, stage_count):
     pytest.importorskip("matplotlib")
     records = []
     stages = [
         {"name": name, "total_step": step}
         for name, step in zip(("before", "priming", "stage2", "final"), (0, 750, 1000, 3000), strict=True)
-    ]
+    ][:stage_count]
     for index, stage in enumerate(stages):
         for seed in (0, 1):
             groups = {}
@@ -134,7 +212,7 @@ def test_plot_complete_paired_time_series(tmp_path):
     path.write_text(json.dumps(result))
     plot_results(path)
     assert len(list(tmp_path.glob("*.png"))) == len(list(tmp_path.glob("*.pdf"))) == 4
-    assert len((tmp_path / "metrics.csv").read_text().splitlines()) == 17
+    assert len((tmp_path / "metrics.csv").read_text().splitlines()) == stage_count * 4 + 1
     result["records"].pop()
     path.write_text(json.dumps(result))
     with pytest.raises(ValueError, match="incomplete"):

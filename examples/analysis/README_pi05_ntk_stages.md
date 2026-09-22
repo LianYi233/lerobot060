@@ -80,6 +80,34 @@ FINAL_FLOW_STEPS=3000 \
   bash examples/analysis/analyze_pi05_ntk_stages.sh "$RUN_DIR" 0
 ```
 
+### 训练尚未结束：先分析前三个时间点
+
+只要预训练目录中 `000000 / 000750 / 001000` 三个 checkpoint 已完整保存，就可以先画训练前、
+priming 后和 stage 2 后的散点图与变化趋势，无需最终 flow checkpoint：
+
+```bash
+# RUN_DIR 是本次实验的正式 flow 输出目录，不带 _next_action_pretrain 后缀。
+# 下面的 1 是示例空闲 GPU 编号，请按实际机器修改。
+bash examples/analysis/analyze_pi05_ntk_stages.sh "$RUN_DIR" 1 --through-stage=stage2 --dry-run
+bash examples/analysis/analyze_pi05_ntk_stages.sh "$RUN_DIR" 1 --through-stage=stage2
+```
+
+图片自动保存到 `$RUN_DIR/ntk_stages`（或 `NTK_OUTPUT_DIR`）。阶段散点图此时为三个面板，
+轨迹和指标趋势图也只包含累计 0、750、1000 步。支持 `--through-stage=before/priming/stage2/final`，
+默认 `final` 仍检查全部四个时间点，不会自动跳过缺失的 750 模型。
+
+训练结束后，保持相同数据、样本、种子、scope、估计参数和输出目录，去掉 `--through-stage=stage2`：
+
+```bash
+# 默认 full_reference 的最终 flow checkpoint 为 003000，累计更新 4000。
+FINAL_FLOW_STEPS=3000 \
+  bash examples/analysis/analyze_pi05_ntk_stages.sh "$RUN_DIR" 1
+```
+
+脚本会复用前三个时间点已保存的结果，只计算最后一个时间点，并更新同名图片为四阶段版本。
+若目标是累计 3000 步，使用 `FINAL_FLOW_STEPS=2000`。完整 backbone NTK 需要额外显存，
+训练同时进行时请使用另一张空闲且显存充足的 GPU。分析过程不会更新训练权重。
+
 也支持独立指定四个路径：
 
 ```bash
@@ -150,12 +178,13 @@ JSON 保存 kernel、谱、参数量、参数名称/形状、sketch trace 误差
 ## 5. 输出与断点续跑
 
 每个时间点/seed 完成后原子保存一次 JSON；中断后用同一命令继续。
-manifest 记录数据样本摘要、checkpoint 元数据、种子、估计器和源代码摘要；配置变化会要求使用新输出目录。
+manifest 记录数据样本摘要、checkpoint 元数据、种子、估计器和源代码摘要；允许在相同协议下追加后续时间点，
+其他配置变化会要求使用新输出目录。
 
 每个 scope 输出以下 PNG 和可编辑矢量 PDF：
 
-- `backbone_stages` / `prompts_stages`：四个时间点的 2×2 散点图，共用坐标轴。
-- `backbone_trajectory` / `prompts_trajectory`：保留原横纵轴的四阶段中位数轨迹图。
+- `backbone_stages` / `prompts_stages`：所选时间点的散点图，共用坐标轴；四阶段为 2×2，前三阶段为 1×3。
+- `backbone_trajectory` / `prompts_trajectory`：保留原横纵轴的所选阶段中位数轨迹图。
 - `backbone_effective_rank` / `prompts_effective_rank`：有效秩随累计步数的变化。
 - `backbone_tangent_energy` / `prompts_tangent_energy`：参数归一化能量随累计步数的变化。
 
