@@ -16,10 +16,15 @@ Variants:
 
 All variants use 3000 flow updates by default. Set FLOW_STEPS to override this
 for a one-off run.
+Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
 EOF
 }
 
 VARIANT="${1:-}"
+if [[ "${VARIANT}" == --help || "${VARIANT}" == -h ]]; then
+  usage
+  exit 0
+fi
 if [[ -z "${VARIANT}" ]]; then
   usage
   exit 2
@@ -97,7 +102,8 @@ VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 COMPILE_MODEL="${COMPILE_MODEL:-true}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 
-RUN_NAME="pi05-${VARIANT}-seed${SEED}"
+RUN_NAME="${RUN_NAME:-pi05-${VARIANT}-seed${SEED}}"
+DRY_RUN="${DRY_RUN:-false}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 LOG_FILE="${LOG_ROOT}/${RUN_NAME}.log"
 
@@ -117,25 +123,14 @@ if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "Output already exists; refusing to overwrite: ${OUTPUT_DIR}" >&2
   exit 1
 fi
-if ! command -v accelerate >/dev/null 2>&1; then
+if [[ "${DRY_RUN}" != true ]] && ! command -v accelerate >/dev/null 2>&1; then
   echo "accelerate is not available in the active environment" >&2
   exit 1
 fi
-if ! command -v lerobot-train >/dev/null 2>&1; then
+if [[ "${DRY_RUN}" != true ]] && ! command -v lerobot-train >/dev/null 2>&1; then
   echo "lerobot-train is not available; install this checkout with: pip install -e ." >&2
   exit 1
 fi
-
-mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
-export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
-export TMP="${TMP:-${TMPDIR}}"
-export TEMP="${TEMP:-${TMPDIR}}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/autodl-tmp/cache/torchinductor}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/autodl-tmp/cache/triton}"
-export HF_HOME="${HF_HOME:-/root/autodl-tmp/cache/huggingface}"
-export PYTHONUNBUFFERED=1
-export TOKENIZERS_PARALLELISM=false
-mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
 
 TRAIN_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -178,6 +173,24 @@ fi
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
 echo "output=${OUTPUT_DIR}"
+
+if [[ "${DRY_RUN}" == true ]]; then
+  printf '%q ' env "CUDA_VISIBLE_DEVICES=${GPU_IDS}" accelerate "${LAUNCH_ARGS[@]}" \
+    lerobot-train "${TRAIN_ARGS[@]}" "${EXTRA_ARGS[@]}"
+  printf '\n'
+  exit 0
+fi
+
+mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
+export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
+export TMP="${TMP:-${TMPDIR}}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/autodl-tmp/cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/autodl-tmp/cache/triton}"
+export HF_HOME="${HF_HOME:-/root/autodl-tmp/cache/huggingface}"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
 
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" \
   accelerate "${LAUNCH_ARGS[@]}" "$(command -v lerobot-train)" \
