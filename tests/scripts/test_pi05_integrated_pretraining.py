@@ -383,3 +383,49 @@ def test_integrated_pretraining_supports_non_default_chunk_when_mask_count_fits(
     assert pretrain_cfg.policy.chunk_size == 40
     assert pretrain_cfg.policy.next_action_masked_steps == 40
     assert pretrain_cfg.policy.next_action_full_mask_probability == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("fsdp", [False, True])
+@pytest.mark.parametrize("main_rank", [False, True])
+def test_ntk_initial_snapshot_is_exact_and_all_fsdp_ranks_gather(tmp_path, monkeypatch, fsdp, main_rank):
+    from accelerate import DistributedType
+
+    cfg = _make_flow_config(tmp_path, ntk_save_stage_snapshots=True)
+    cfg.validate()
+    cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+    assert cfg.policy.ntk_save_stage_snapshots
+    assert cfg.save_freq == 1000
+    assert train_module._pi05_stage1_bridge_start_step(cfg) == 750
+    accelerator = _FakeAccelerator()
+    accelerator.is_main_process = main_rank
+    accelerator.num_processes = 2
+    accelerator.distributed_type = DistributedType.FSDP if fsdp else DistributedType.MULTI_GPU
+    calls, gathers = [], []
+    policy, optimizer = object(), object()
+
+    def gather(model, optim):
+        assert model is policy and optim is optimizer
+        gathers.append(True)
+        return {"weight": 1}, {"moment": 2}
+
+    monkeypatch.setattr(train_module, "gather_fsdp_state_dicts", gather)
+    monkeypatch.setattr(train_module, "save_checkpoint", lambda **kwargs: calls.append(kwargs))
+    train_module._save_pi05_ntk_initial_snapshot(
+        cfg, policy, optimizer, None, "preprocessor", "postprocessor", accelerator, 0
+    )
+    assert len(gathers) == int(fsdp)
+    assert len(calls) == int(main_rank)
+    if main_rank:
+        assert calls[0]["step"] == 0
+        assert calls[0]["checkpoint_dir"] == cfg.output_dir / "checkpoints/000000"
+        assert calls[0]["policy"] is policy
+        assert calls[0]["preprocessor"] == "preprocessor"
+    assert accelerator.wait_calls == 1
+    # Never overwrite step zero on resume or when snapshots are disabled.
+    cfg.resume = True
+    train_module._save_pi05_ntk_initial_snapshot(cfg, policy, optimizer, None, None, None, accelerator, 0)
+    cfg.resume = False
+    cfg.policy.ntk_save_stage_snapshots = False
+    train_module._save_pi05_ntk_initial_snapshot(cfg, policy, optimizer, None, None, None, accelerator, 0)
+    assert len(calls) == int(main_rank)
+    assert accelerator.wait_calls == 1

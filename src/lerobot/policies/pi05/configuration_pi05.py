@@ -86,6 +86,9 @@ class PI05Config(PreTrainedConfig):
     # These updates reuse the same Stage-1 model, optimizer, and scheduler. Set to 0 to keep
     # Stage 1 entirely action-only.
     next_action_bridge_steps: int = 250
+    # Save the exact initialized prompts and the priming/bridge boundary for longitudinal NTK.
+    # Opt-in: ordinary training keeps its existing checkpoint schedule.
+    ntk_save_stage_snapshots: bool = False
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32

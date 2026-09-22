@@ -424,6 +424,42 @@ def _pi05_next_action_pretrained_model_dir(pretrain_cfg: TrainPipelineConfig) ->
     return checkpoint_dir / PRETRAINED_MODEL_DIR
 
 
+def _save_pi05_ntk_initial_snapshot(
+    cfg, policy, optimizer, scheduler, preprocessor, postprocessor, accelerator, step
+) -> None:
+    """Save actual initialized prompts before the first update, collectively under FSDP."""
+    from accelerate import DistributedType
+
+    if not (
+        getattr(cfg.policy, "ntk_save_stage_snapshots", False)
+        and cfg.save_checkpoint
+        and not cfg.resume
+        and step == 0
+    ):
+        return
+    is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+    model_state_dict, optim_state_dict = (
+        gather_fsdp_state_dicts(policy, optimizer) if is_fsdp else (None, None)
+    )
+    if accelerator.is_main_process:
+        logging.info("Saving exact step-0 model for longitudinal NTK analysis")
+        save_checkpoint(
+            checkpoint_dir=get_step_checkpoint_dir(cfg.output_dir, cfg.steps, 0),
+            step=0,
+            cfg=cfg,
+            policy=accelerator.unwrap_model(policy),
+            optimizer=optimizer,
+            scheduler=scheduler,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            num_processes=accelerator.num_processes,
+            batch_size=cfg.batch_size,
+            model_state_dict=model_state_dict,
+            optim_state_dict=optim_state_dict,
+        )
+    accelerator.wait_for_everyone()
+
+
 def _pi05_stage1_bridge_start_step(cfg: TrainPipelineConfig) -> int | None:
     """Return the zero-based Stage-1 update where observation-conditioned flow begins."""
     policy_cfg = cfg.policy
@@ -779,14 +815,18 @@ def _train_single_stage(
             _parameter_counts[_category] += _count
             logging.info(
                 "TRAINABLE %s | shape=%s | params=%s",
-                _name, tuple(_parameter.shape), f"{_count:,}",
+                _name,
+                tuple(_parameter.shape),
+                f"{_count:,}",
             )
         for _category, _count in _parameter_counts.items():
             logging.info("%s: %s (%.6fM)", _category, f"{_count:,}", _count / 1e6)
         logging.info(
             "Trainable total: %s (%.6fM) | All parameters: %s | Trainable ratio: %.6f%%",
-            f"{num_learnable_params:,}", num_learnable_params / 1e6,
-            f"{num_total_params:,}", 100 * num_learnable_params / max(1, num_total_params),
+            f"{num_learnable_params:,}",
+            num_learnable_params / 1e6,
+            f"{num_total_params:,}",
+            100 * num_learnable_params / max(1, num_total_params),
         )
         logging.info("================================================")
 
@@ -918,6 +958,11 @@ def _train_single_stage(
 
     policy.train()
 
+    ntk_snapshots = getattr(cfg.policy, "ntk_save_stage_snapshots", False)
+    _save_pi05_ntk_initial_snapshot(
+        cfg, policy, optimizer, lr_scheduler, preprocessor, postprocessor, accelerator, step
+    )
+
     train_metrics = {
         # Per-rank loss reflects only one shard of the global batch; mean recovers the loss DDP
         # is actually optimizing. grad_norm and lr are already identical on every rank (post
@@ -997,6 +1042,9 @@ def _train_single_stage(
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        if ntk_snapshots and step == pi05_stage1_bridge_start_step:
+            # `step` counts completed updates: 750 here is after priming, before bridge update 1.
+            is_saving_step = True
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
