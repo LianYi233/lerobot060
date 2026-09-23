@@ -253,3 +253,35 @@ bash examples/analysis/replot_pi05_ntk_with_loss.sh "$RUN_DIR" \
 此时前 1000 步没有 loss 数据的部分会留空，NTK 四面板与箭头仍保留。若 CSV 已经采用累计步数则不加偏移。
 可用 `--step-column='Step' --loss-column='run-name - train/loss'` 明确列名；导出了多个 run 时必须选择其中一个。
 也可提供完整的两列 `cumulative_step,loss` CSV。脚本不登录 W&B，也不会上传任何训练数据。
+
+## 7. 无 loss 数据：四图美化与可编辑 PPT 示意图
+
+已有四阶段 NTK 结果时，只重新绘制散点图，不需要训练日志、loss CSV、模型或 GPU：
+
+```bash
+RUN_DIR=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation/pi05-full-reference-ntk-seed0
+bash examples/analysis/replot_pi05_ntk_panels.sh "$RUN_DIR"
+```
+
+输出目录为 `$RUN_DIR/ntk_stages/panels/`。每个 scope 保存四张独立面板
+`{scope}_before / priming / stage2 / final`，以及一行四图 `{scope}_four_stages`，
+均导出 PNG、PDF、SVG。蓝色圆点对应 VLM，橙色菱形对应 action expert；
+淡色点为配对 seed，实心标记和误差线为中位数与 IQR。四阶段使用相同坐标范围，保留真实指标值。
+
+下载随本次任务提供的 `PrimingVLA-NTK-Loss-Editable-v3.pptx` 并放到训练机器后，
+可以一次生成图片并自动回填 PPT：
+
+```bash
+bash examples/analysis/replot_pi05_ntk_panels.sh "$RUN_DIR" \
+  --pptx-template=/root/autodl-tmp/PrimingVLA-NTK-Loss-Editable-v3.pptx
+```
+
+完整结果保存在 `$RUN_DIR/ntk_stages/panels/PrimingVLA-NTK-Loss-Filled.pptx`，
+含 backbone 和 prompts 两页。上方为真实 NTK 图，下方为用户指定的 **loss 示意曲线**，
+不是训练记录或对训练 loss 的估计。示意曲线不标定数值，并在图中明确标注为 schematic。
+PPT 的 loss 曲线、阶段箭头、文字与分区为原生可编辑对象；loss 曲线可右键“编辑顶点”。
+NTK 面板作为高分辨率图片插入，同时保留单独的 SVG/PDF 矢量文件。
+
+模板上方在回填前只有待填图位置，没有虚构 NTK 点；脚本会删除待填文字并替换图片。
+原模板和 `results.json` 均保持不变。模板明确对应累计 0、750、1000、4000 步；
+如果已有 NTK 结果最后是累计 3000，脚本会拒绝将它改标为 4000。
