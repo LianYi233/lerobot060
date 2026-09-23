@@ -198,3 +198,58 @@ python -m lerobot.scripts.plot_pi05_ntk_stages "$RUN_DIR/ntk_stages/results.json
 ```
 
 依赖沿用 PI05 训练环境，并安装 `matplotlib`。真实权重和数据只在用户训练机器上可用；提交时的 CPU 测试验证解析 Jacobian、估计器、快照步数解析与绘图，不代替真实 GPU 分析。
+
+## 6. 仅重绘：上排四阶段 NTK，下排 loss 曲线
+
+已有四阶段 `results.json` 后，下面的命令不加载模型、数据集或 PyTorch，不计算 NTK，不需要 GPU。
+只依赖 NumPy 和 Matplotlib。上排为四个共用坐标范围的散点图，下排为累计训练步数上的 loss；
+四根箭头分别指向 0、750、1000 和最终 checkpoint 的累计步数（默认 full_reference 为 4000）。
+
+```bash
+RUN_DIR=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation/pi05-full-reference-ntk-seed0
+bash examples/analysis/replot_pi05_ntk_with_loss.sh "$RUN_DIR"
+```
+
+默认读取 `$RUN_DIR/ntk_stages/results.json`，以及
+`/root/autodl-tmp/logs/prompt-ablation/pi05-full-reference-ntk-seed0.log`。
+可用 `TRAIN_LOG=/actual/path/run.log` 或 `--training-log=/actual/path/run.log` 指定日志，
+用 `NTK_RESULTS=/actual/path/results.json` 指定 NTK 结果。
+`--scope=backbone` 可只输出 backbone 图；默认同时绘制 backbone 和 prompts。
+
+新图保存到 `$RUN_DIR/ntk_stages/with_loss/`：
+
+- `backbone_ntk_with_loss.png/pdf/svg` 和 `prompts_ntk_with_loss.png/pdf/svg`。
+- `loss_curve.csv`：整理后的累计步数、loss 与训练阶段。
+- `plot_metadata.json`：输入来源、文件摘要及绘图参数。
+
+原始 NTK 结果和图片保持不变。若需要额外平滑，可加 `--smooth-window=5`，即对每个训练目标内
+连续 5 个已记录的 loss 做尾随均值，并保留浅色原始曲线；默认不额外平滑。
+
+### 本地日志与 W&B 的步数区别
+
+当前训练器在前 1000 步预训练中关闭 W&B，因此该配方的 W&B flow run 通常只覆盖累计 1000–4000 步。
+启动脚本通过 `tee` 保存的完整 `.log` 则包含 priming、bridge 和 flow。
+重绘时，预训练 local step 保持不变，flow local step 加 1000。
+训练器会将 1200/1400 等步数取整显示为 `1K`，脚本依据配置中的 `log_freq` 和完整、连续的记录恢复精确步数，
+不能把日志中的 `1K` 直接当作每条记录的真实更新数。缺失或拼接的日志可能无法恢复；此时请改用精确步数 CSV。
+若日志没有保存 `log_freq`，可显式传入当时真实的 `--log-freq=200`。
+
+loss 是训练日志保存的窗口均值；默认每 200 步一条，并且文本仅保存三位小数。
+跨越 750 步目标切换的窗口（例如 601–800）单独画为灰色叉号，不与相邻目标连线或一起平滑。
+step 0 通常没有 loss，750 也不一定正好有记录；不会为它们插值或伪造 loss。
+箭头指示 checkpoint 的时间位置，不声称该位置存在 loss 观测。不同阶段的训练目标也不完全相同。
+
+### 使用 W&B 导出的 CSV
+
+需要具体 run 导出的数据，`https://wandb.ai/home` 本身不包含可直接读取的某次实验历史。
+导出一个 run 的 `train/loss`，优先选择 `train/steps` 为横轴；脚本也识别 `Step`、`_step`。
+若 CSV 只包含 flow 的 local 0–3000 步，明确加上偏移：
+
+```bash
+bash examples/analysis/replot_pi05_ntk_with_loss.sh "$RUN_DIR" \
+  --loss-csv=/path/to/flow_loss.csv --step-offset=1000
+```
+
+此时前 1000 步没有 loss 数据的部分会留空，NTK 四面板与箭头仍保留。若 CSV 已经采用累计步数则不加偏移。
+可用 `--step-column='Step' --loss-column='run-name - train/loss'` 明确列名；导出了多个 run 时必须选择其中一个。
+也可提供完整的两列 `cumulative_step,loss` CSV。脚本不登录 W&B，也不会上传任何训练数据。
