@@ -187,6 +187,7 @@ manifest 记录数据样本摘要、checkpoint 元数据、种子、估计器和
 - `backbone_trajectory` / `prompts_trajectory`：保留原横纵轴的所选阶段中位数轨迹图。
 - `backbone_effective_rank` / `prompts_effective_rank`：有效秩随累计步数的变化。
 - `backbone_tangent_energy` / `prompts_tangent_energy`：参数归一化能量随累计步数的变化。
+- `similarity/{scope}_stage_similarity`：VLM 与 Action head 的跨阶段 CKA 热图（至少两个阶段且保存了 kernel 时自动生成，详见第 8 节）。
 
 蓝色为 VLM，橙色为 action expert；正能量使用 log 纵轴；误差条/阴影为配对 seed 的中位数和 IQR。
 另有 `metrics.csv`、`results.json` 和 `manifest.json`。
@@ -285,3 +286,71 @@ NTK 面板作为高分辨率图片插入，同时保留单独的 SVG/PDF 矢量�
 模板上方在回填前只有待填图位置，没有虚构 NTK 点；脚本会删除待填文字并替换图片。
 原模板和 `results.json` 均保持不变。模板明确对应累计 0、750、1000、4000 步；
 如果已有 NTK 结果最后是累计 3000，脚本会拒绝将它改标为 4000。
+
+## 8. 仅重绘：跨阶段 NTK 相似度热图
+
+每个 scope 输出 **两张热图**：VLM 一张、Action head 一张，并额外保存两图并排的组合图。
+每张完整结果为 **4×4**；横纵坐标均是 checkpoint 的累计步数 **0、750、1000、4000**，
+每个格子比较两个 checkpoint 的 NTK 结构，不是“每阶段各画一张样本矩阵”。
+坐标从现有 manifest 读取；若最后是累计 3000，会如实显示 3000。
+
+已有 `results.json` 后，在训练环境内直接运行；只需要 NumPy、Matplotlib，无需模型、数据集、loss 或 GPU：
+
+```bash
+git pull --ff-only origin prompt-ablation
+RUN_DIR=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation/pi05-full-reference-ntk-seed0
+bash examples/analysis/replot_pi05_ntk_similarity.sh "$RUN_DIR"
+```
+
+默认自动绘制结果中已有的 backbone / prompts scopes。只画 backbone：
+
+```bash
+bash examples/analysis/replot_pi05_ntk_similarity.sh "$RUN_DIR" --scope=backbone
+```
+
+默认只显示下三角（含对角线），避免重复信息；`--full-matrix` 显示完整对称矩阵。
+两张图均采用相同的 **0–1 灰度色阶**，越深表示相似度越高，无背景网格。
+格子标注中位数，保留两位小数；完整精度和四分位数保存在 JSON 中。
+支持仅有前两个或前三个阶段的结果，分别生成 2×2、3×3 矩阵。
+
+默认输出到 `$RUN_DIR/ntk_stages/similarity/`：
+
+- `{scope}_stage_similarity.png/pdf/svg`：VLM、Action head 并排，共用色条。
+- `{scope}_vlm_stage_similarity.png/pdf/svg`、`{scope}_action_stage_similarity.png/pdf/svg`：独立图片。
+- `stage_similarity_pairs.csv`：每个 scope/module、配对 probe seed、不同阶段对的原始 CKA。
+- `stage_similarity.json`：中位数、25%/75% 分位数、每个 seed 的矩阵、样本顺序、输入文件摘要与绘图设置。
+
+`scope` 为 `backbone` 或 `prompts`。PDF/SVG 保留矢量文字和绘图元素。
+可用 `--output-dir=/path/to/figures` 改输出目录，`NTK_RESULTS=/path/to/results.json` 改输入文件。
+原来的散点图和 `results.json` 不会被这个重画命令改动。
+以后运行原来的 NTK 分析或 `plot_pi05_ntk_stages`，存在至少两个阶段的完整 kernel 时，
+也会自动生成 `similarity/` 下的图；仅有 scalar metrics 的旧结果仍能画原来的图。
+
+### 比较的具体含义
+
+对同一个模块、同一个 probe seed，令两个 checkpoint 的样本 NTK 为 K_s、K_t，计算：
+
+```text
+H = I - 11^T / N
+A_s = H K_s H
+CKA(s,t) = <A_s, A_t>_F / (||A_s||_F ||A_t||_F)
+```
+
+先在**相同 seed** 内计算每个阶段对的 CKA，再跨 seed 取中位数与 IQR；
+不混配不同 seed，也不先平均 kernel 再计算相似度。
+这里使用通常的 biased-HSIC normalization，合法非退化 PSD kernel 的 CKA 位于 0–1。
+输入必须来自同一个 shared-probe 分析 manifest，保持样本及顺序、输出探针、noise/timestep、
+参数组和 sketch 设置一致。脚本检查阶段/seed 完整性、步数、样本维数、kernel 的有限性/对称性/PSD，
+并在保存了参数签名时检查签名一致；不要手工合并不同协议的 JSON。
+零矩阵或中心化后为零的常数矩阵，其 CKA 未定义，脚本会报出对应阶段与模块，不会填成 1。
+
+相似度消除了整体幅度缩放，补充原图的 tangent energy 和 effective rank：
+即使秩和能量相近，样本间的梯度响应关系仍可能不同。
+0↔750、750↔1000、1000↔4000 分别对应 priming、bridge、adaptation 的结构变化；
+0↔4000 表示相对初始状态的整体变化。高相似度表示当前固定样本上的中心化梯度结构相近，
+不直接证明语义能力保持、任务成功率提升或参数未更新。
+即使 backbone 冻结，训练后的 prompts 和其他模块也可能改变其 NTK。
+
+backbone 的 CKA 继承 CountSketch 与输出探针近似，prompts 的 CKA 继承输出探针近似。
+IQR 反映 probe/flow 随机性，**不是多次独立训练的不确定性**。
+方法参考 [Kornblith et al., ICML 2019, Similarity of Neural Network Representations Revisited](https://proceedings.mlr.press/v97/kornblith19a.html)；这里将核对齐用于跨 checkpoint 的 NTK 比较。

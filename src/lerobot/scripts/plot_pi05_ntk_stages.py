@@ -193,6 +193,12 @@ def plot_results(results_path):
                 style(axis)
                 save(fig, f"{scope}_{'effective_rank' if metric == 'effective_rank' else 'tangent_energy'}")
     print(f"Saved metrics.csv and PNG/PDF figures to {out}")
+    # Original scalar-only exports remain usable. Current analysis saves all
+    # kernels, so also provide stage similarity whenever comparisons are possible.
+    if len(stages) >= 2 and all("kernel" in group for row in records for group in row["groups"].values()):
+        from lerobot.scripts.plot_pi05_ntk_similarity import plot_similarity
+
+        plot_similarity(results_path)
 
 
 def main():
