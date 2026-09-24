@@ -474,11 +474,17 @@ def eval_policy(
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            frames = np.stack([env.envs[i].render() for i in range(n_to_render_now)])
         elif hasattr(env, "call"):
             # Here we must render all frames and discard any we don't need.
             # Covers AsyncVectorEnv and _LazyAsyncVectorEnv (which wraps one).
-            ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+            frames = np.stack(env.call("render")[:n_to_render_now])
+        else:
+            return
+        visualizer = getattr(policy, "_eval_attention_visualizer", None)
+        if visualizer is not None:
+            frames = visualizer.render_frames(frames)
+        ep_frames.append(frames)
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []

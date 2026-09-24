@@ -1,0 +1,158 @@
+"""Real tiny PI0.5 inference, plus independent attention and alignment checks."""
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from transformers.models.gemma.modeling_gemma import eager_attention_forward
+
+from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.pi05.attention_visualization import (
+    AttentionVideoConfig,
+    PI05AttentionRecorder,
+    overlay_attention,
+    selected_attention,
+)
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+from tests.policies.pi0_pi05.test_pi05_prompt import (
+    PI05Policy,
+    _config,
+    _restore_matmul_precision,  # noqa: F401
+    _tiny_real_pi05,  # noqa: F401
+)
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+def test_selected_rows_match_eager_with_full_key_normalization(kv_heads):
+    torch.manual_seed(8)
+    query = torch.randn(1, 4, 6, 8)
+    key = torch.randn(1, kv_heads, 13, 8)
+    value = torch.randn_like(key)
+    mask = torch.zeros(1, 1, 6, 13)
+    mask[..., 3] = torch.finfo(torch.float32).min
+    module = SimpleNamespace(num_key_value_groups=4 // kv_heads, training=False)
+    _, reference = eager_attention_forward(module, query, key, value, mask, 0.25)
+    actual = selected_attention(query, key, mask, 0.25, 2, 5)
+    torch.testing.assert_close(actual, reference[:, :, 2:5].mean(dim=(1, 2)))
+    assert actual[0, 3] == 0
+    assert actual[0, :4].sum() < 1  # camera probabilities are not renormalized
+    bool_mask = mask == 0
+    torch.testing.assert_close(actual, selected_attention(query, key, bool_mask, 0.25, 2, 5))
+    mask[..., 2, :] = torch.finfo(torch.float32).min
+    with pytest.raises(ValueError, match="fully masked"):
+        selected_attention(query, key, mask, 0.25, 2, 5)
+
+
+def test_overlay_preserves_patch_orientation_and_does_not_invent_zero_hotspots():
+    rgb = np.full((16, 16, 3), 128, dtype=np.uint8)
+    patches = np.array([[0, 1], [0, 0]], dtype=np.float32)
+    overlay = overlay_attention(rgb, patches, alpha=1)
+    np.testing.assert_array_equal(overlay[0, 0], rgb[0, 0])
+    assert overlay[0, -1, 0] > overlay[0, -1, 1]  # top-right patch stays top-right
+    np.testing.assert_array_equal(overlay_attention(rgb, patches * 0), rgb)
+    uniform = overlay_attention(rgb, np.ones((2, 2)))
+    np.testing.assert_array_equal(uniform[0, 0], uniform[-1, -1])
+
+
+def make_policy_and_batch():
+    policy = PI05Policy(
+        _config(
+            num_inference_steps=3,
+            n_action_steps=2,
+            input_features={
+                "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+                "observation.images.image2": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            },
+        )
+    ).eval()
+    batch = {
+        "observation.images.image": torch.rand(1, 3, 16, 16),
+        "observation.images.image2": torch.rand(1, 3, 16, 16),
+        OBS_LANGUAGE_TOKENS: torch.tensor([[1, 2, 0]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.tensor([[True, True, False]]),
+    }
+    return policy, batch
+
+
+@pytest.mark.parametrize("source", ["action", "vlm_prompt"])
+@pytest.mark.parametrize("backend", ["sdpa", "eager"])
+def test_real_pi05_capture_preserves_actions_rng_weights_and_queue_alignment(source, backend):
+    policy, batch = make_policy_and_batch()
+    composite = policy.model.paligemma_with_expert
+    decoders = [composite.paligemma.model.language_model, composite.gemma_expert.model]
+    for decoder in decoders:
+        decoder.config._attn_implementation = backend
+    original_configs = [layer.self_attn.config for decoder in decoders for layer in decoder.layers]
+    weights = {key: value.clone() for key, value in policy.state_dict().items()}
+    torch.manual_seed(100)
+    expected = torch.stack([policy.select_action(batch) for _ in range(5)])
+    expected_rng = torch.get_rng_state()
+    policy.reset()
+    torch.manual_seed(100)
+    with PI05AttentionRecorder(policy, AttentionVideoConfig(source=source, camera=1)) as recorder:
+        recorded = []
+        for step in range(5):
+            recorded.append(policy.select_action(batch))
+            assert recorder.prediction_step == step - step % 2
+            assert recorder.step - recorder.prediction_step == step % 2
+        assert recorder.steps == [0, 2, 4]
+        assert recorder.counts == ([3] * 3 if source == "action" else [1] * 3)
+        assert np.stack(recorder.maps).shape == (3, 2, 2)
+        assert all(0 < float(m.sum()) < 1 for m in recorder.maps)
+        expected_image = (
+            (batch["observation.images.image2"][0].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+        )
+        np.testing.assert_array_equal(recorder.image, expected_image)
+        frame = recorder.render_frames(np.zeros((1, 16, 16, 3), dtype=np.uint8))
+        assert frame.shape == (1, 320, 768, 3)
+        assert frame.dtype == np.uint8
+        np.testing.assert_array_equal(frame[0, 24:280, :256], 0)
+        recorder.reset_episode()
+        assert recorder.latest_map is None and recorder.image is None and recorder.maps == []
+    torch.testing.assert_close(torch.stack(recorded), expected, atol=0, rtol=0)
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+    assert not hasattr(policy, "_eval_attention_visualizer")
+    assert "embed_prefix" not in policy.model.__dict__
+    assert original_configs == [layer.self_attn.config for decoder in decoders for layer in decoder.layers]
+    for key, value in policy.state_dict().items():
+        torch.testing.assert_close(value, weights[key], atol=0, rtol=0)
+
+
+def test_missing_camera_and_exception_restore_instrumentation():
+    policy, batch = make_policy_and_batch()
+    del batch["observation.images.image2"]
+    with (
+        pytest.raises(ValueError, match="missing/padded"),
+        PI05AttentionRecorder(policy, AttentionVideoConfig(camera=1)),
+    ):
+        policy.select_action(batch)
+    assert not hasattr(policy, "_eval_attention_visualizer")
+    assert "select_action" not in policy.__dict__
+
+
+def test_peft_wrapped_policy_is_instrumented_without_bypassing_active_adapters():
+    peft = pytest.importorskip("peft")
+    base, batch = make_policy_and_batch()
+    wrapped = peft.get_peft_model(base, peft.LoraConfig(r=2, target_modules=["q_proj"]))
+    torch.manual_seed(71)
+    expected = wrapped.select_action(batch)
+    wrapped.reset()
+    torch.manual_seed(71)
+    with PI05AttentionRecorder(wrapped, AttentionVideoConfig()) as recorder:
+        actual = wrapped.select_action(batch)
+        assert wrapped._eval_attention_visualizer is recorder
+        assert recorder.policy is base
+        assert len(recorder.maps) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not hasattr(wrapped, "_eval_attention_visualizer")
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"source": "action_prompt"}, {"alpha": 1.5}, {"vmax": float("nan")}, {"layer": 99}]
+)
+def test_invalid_settings_fail_before_inference(kwargs):
+    policy, _ = make_policy_and_batch()
+    with pytest.raises(ValueError), PI05AttentionRecorder(policy, AttentionVideoConfig(**kwargs)):
+        pass
+    assert not hasattr(policy, "_eval_attention_visualizer")

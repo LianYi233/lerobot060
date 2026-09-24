@@ -139,6 +139,10 @@ if len(entries) != 1:
     raise RuntimeError("Cannot uniquely resolve lerobot-eval in this Python environment")
 entry = entries[0]
 module = importlib.import_module(entry.module)
+attention_manifest = {}
+if os.environ.get("LEROBOT_EVAL_ATTENTION") == "1":
+    from lerobot.scripts.libero_attention import install_attention_evaluation, require_saved_attention_videos
+    attention_manifest = install_attention_evaluation(module)
 original_all = module.eval_policy_all
 original_one = module.run_one
 original_rollout = module.rollout
@@ -172,6 +176,7 @@ manifest = {
     "model_files": [[str(p.relative_to(model)), p.stat().st_size, p.stat().st_mtime_ns]
                     for p in sorted(model.rglob("*")) if p.is_file()],
     "evaluator_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+    **attention_manifest,
 }
 manifest_file = output / "resume_manifest.json"
 if manifest_file.exists():
@@ -196,6 +201,8 @@ def read_record(group, task_id, episodes):
     if (len(metrics.get("successes", [])) != episodes
             or any(type(v) is not bool for v in metrics["successes"])):
         raise RuntimeError(f"Incomplete or invalid saved results: {p}")
+    if attention_manifest:
+        require_saved_attention_videos(metrics)
     return metrics
 
 state = {"bar": None, "task_done": 0, "task_total": 0,
