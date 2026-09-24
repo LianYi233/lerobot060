@@ -309,7 +309,14 @@ bash examples/analysis/replot_pi05_ntk_similarity.sh "$RUN_DIR" --scope=backbone
 ```
 
 默认只显示下三角（含对角线），避免重复信息；`--full-matrix` 显示完整对称矩阵。
-两张图均采用相同的 **0–1 灰度色阶**，越深表示相似度越高，无背景网格。
+两张图均采用相同的 **0–1 红橙色阶**：低值为浅橙，高值为深红，无背景网格。
+格子内数字根据背景亮度自动使用黑色或白色，保证橙色中间值与深红色高值都清晰可读。
+如需调整配色，修改 `src/lerobot/scripts/plot_pi05_ntk_similarity.py` 顶部的 `HEATMAP_COLORS`：
+
+```python
+HEATMAP_COLORS = ("#FFF4E8", "#FED7AA", "#FB923C", "#E34A33", "#A50F15")
+```
+
 格子标注中位数，保留两位小数；完整精度和四分位数保存在 JSON 中。
 支持仅有前两个或前三个阶段的结果，分别生成 2×2、3×3 矩阵。
 

@@ -1,4 +1,4 @@
-"""Compare saved PI05 NTKs across checkpoints with paired-seed, grayscale CKA heatmaps.
+"""Compare saved PI05 NTKs across checkpoints with paired-seed, orange-red CKA heatmaps.
 
 Only NumPy and Matplotlib are needed; no model, dataset, training loss or GPU is loaded.
 """
@@ -13,6 +13,8 @@ import numpy as np
 
 STAGES = ("before", "priming", "stage2", "final")
 MODULES = {"vlm": "VLM", "action": "Action head"}
+# Low similarity: pale orange; high similarity: deep red. Shared by all modules.
+HEATMAP_COLORS = ("#FFF4E8", "#FED7AA", "#FB923C", "#E34A33", "#A50F15")
 
 
 def centered_unit_kernel(kernel):
@@ -169,7 +171,13 @@ def plot_similarity(results_path, output_dir=None, scope="auto", full_matrix=Fal
     source = results_path.read_bytes()
     summary, pairs = compute_similarity(json.loads(source), scope)
     summary["source"] = {"path": str(results_path.resolve()), "sha256": hashlib.sha256(source).hexdigest()}
-    summary["plot"] = {"color_limits": [0, 1], "full_matrix": full_matrix, "annotation_decimals": 2}
+    summary["plot"] = {
+        "color_limits": [0, 1],
+        "full_matrix": full_matrix,
+        "annotation_decimals": 2,
+        "colormap": "ntk_orange_red",
+        "colors": list(HEATMAP_COLORS),
+    }
     out = Path(output_dir) if output_dir is not None else results_path.parent / "similarity"
     out.mkdir(parents=True, exist_ok=True)
     (out / "stage_similarity.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
@@ -178,7 +186,7 @@ def plot_similarity(results_path, output_dir=None, scope="auto", full_matrix=Fal
         writer.writeheader()
         writer.writerows(pairs)
 
-    cmap = LinearSegmentedColormap.from_list("ntk_gray", ["#F7F7F7", "#303030"])
+    cmap = LinearSegmentedColormap.from_list("ntk_orange_red", HEATMAP_COLORS)
     cmap.set_bad("white")
     steps = [str(stage["total_step"]) for stage in summary["stages"]]
     count = len(steps)
@@ -200,6 +208,11 @@ def plot_similarity(results_path, output_dir=None, scope="auto", full_matrix=Fal
             for column in range(count):
                 if not mask[row, column]:
                     value = data[row, column]
+                    # Choose black/white from the actual cell luminance, so
+                    # orange midtones remain readable when the palette changes.
+                    rgb = np.asarray(cmap(float(value))[:3])
+                    linear_rgb = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+                    luminance = float(linear_rgb @ [0.2126, 0.7152, 0.0722])
                     axis.text(
                         column + 0.5,
                         row + 0.5,
@@ -207,7 +220,7 @@ def plot_similarity(results_path, output_dir=None, scope="auto", full_matrix=Fal
                         ha="center",
                         va="center",
                         fontsize=11,
-                        color="white" if value >= 0.55 else "#303030",
+                        color="white" if luminance < 0.179 else "black",
                     )
         return mesh
 
