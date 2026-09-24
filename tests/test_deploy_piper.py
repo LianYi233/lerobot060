@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 FILE = Path(__file__).resolve().parents[1] / "deploy_piper_vlaa.py"
+sys.path.insert(0, str(FILE.parent))
 spec = importlib.util.spec_from_file_location("deploy", FILE)
 deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
@@ -79,12 +80,21 @@ class DeploymentTests(unittest.TestCase):
     def test_parser_requires_metadata_only_for_hardware(self):
         self.assertTrue(self.args().dry_run)
         self.assertTrue(deploy.parse_args(["--check_env"]).check_env)
+        self.assertTrue(deploy.parse_args(["--check_robot"]).check_robot)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             deploy.parse_args(["--dry_run"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             deploy.parse_args(["--policy_path", "/tmp/checkpoint"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args("--quantile_sampling")
+
+    def test_robot_diagnostic_does_not_import_model_or_require_checkpoint(self):
+        with (
+            patch.object(deploy, "check_robot_connection") as check,
+            patch.dict(sys.modules, {"torch": None, "transformers": None}),
+        ):
+            deploy.main(["--check_robot", "--can_port", "can0"])
+        check.assert_called_once_with("can0")
 
     def test_checkout_precedes_other_lerobot_installation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +105,7 @@ class DeploymentTests(unittest.TestCase):
 import importlib.util
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]).parent))
 sys.path.insert(0, sys.argv[1])
 spec = importlib.util.spec_from_file_location("deployment", sys.argv[2])
 deployment = importlib.util.module_from_spec(spec)
@@ -293,25 +304,6 @@ assert Path(lerobot.__file__).resolve() == source / "lerobot/__init__.py"
                 for key in set(sys.modules) - before
             )
         )
-
-    def test_connection_rollback_keeps_original_cleanup(self):
-        sdk = Mock()
-        sdk.ConnectPort.side_effect = RuntimeError("CAN open failed")
-        robot = deploy.PiperConnectionMixin()
-        robot._connected = False
-        robot._sdk = None
-        robot._pipelines = {}
-        robot.config = Namespace(can_port="can0")
-        modules = {
-            "piper_sdk": Namespace(C_PiperInterface_V2=lambda port: sdk),
-            "lerobot.utils.errors": Namespace(DeviceAlreadyConnectedError=RuntimeError),
-        }
-        with patch.dict(sys.modules, modules), self.assertRaisesRegex(RuntimeError, "CAN open failed"):
-            robot.connect()
-        sdk.DisableArm.assert_called_once_with(7)
-        sdk.DisconnectPort.assert_called_once()
-        self.assertFalse(robot._connected)
-        self.assertIsNone(robot._sdk)
 
 
 if __name__ == "__main__":

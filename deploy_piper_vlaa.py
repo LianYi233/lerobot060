@@ -4,6 +4,8 @@ r"""Piper 真机部署：piper 分支基于 prompt-ablation 的 PI05 flow + 双 
 从本仓库根目录运行；入口优先加载同目录 src/，复用原部署环境的 Piper 驱动接口。
 环境检查（无需 checkpoint，不连接硬件）：python deploy_piper_vlaa.py --check_env
 完整说明见 examples/piper/README.md。
+--check_robot 只读 CAN/机械臂反馈；真实执行默认 --motion_speed 20。
+故障锁定后停止策略并尝试固件急停；退出不主动失能，不保证故障时保持力矩。
 训练所得 config、完整模型权重、pre/postprocessor JSON 及其引用的 safetensors
 必须一起复制。不能仅复制两个 prompt tensor，也不能沿用旧 quantile regression 权重。
 
@@ -44,6 +46,8 @@ from pathlib import Path
 
 import numpy as np
 
+from piper_deploy_guard import GuardedPiperMixin as PiperConnectionMixin, check_robot_connection
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,83 +87,6 @@ def validate_pi05_source(config_class, source):
             "请拉取完整 piper 分支，不要手动补配置字段。"
         )
     print(f"PI05 config source: {actual}")
-
-
-class PiperConnectionMixin:
-    """Private connection rollback; shared Piper source stays unchanged."""
-
-    def connect(self, calibrate: bool = True) -> None:
-        from lerobot.utils.errors import DeviceAlreadyConnectedError
-
-        if self._connected:
-            raise DeviceAlreadyConnectedError(f"{self} is already connected.")
-
-        # 连接机械臂
-        try:
-            from piper_sdk import C_PiperInterface_V2
-        except ImportError as e:
-            raise ImportError("请安装 piper_sdk: pip install piper_sdk") from e
-
-        try:
-            logger.info(f"Connecting to Piper arm on {self.config.can_port} ...")
-            sdk = C_PiperInterface_V2(self.config.can_port)
-            self._sdk = sdk  # 登记后再连接，保证中途失败也能清理
-            sdk.ConnectPort()
-            sdk.EnableArm(7)
-            self._enable_arm(sdk)
-            sdk.GripperCtrl(0, 1000, 0x01, 0)
-            logger.info("Piper arm connected.")
-
-            # 连接相机
-            try:
-                import pyrealsense2 as rs
-            except ImportError as e:
-                raise ImportError("请安装 pyrealsense2: pip install pyrealsense2") from e
-
-            for cam_name, serial in self.config.camera_serials.items():
-                pipeline = rs.pipeline()
-                self._pipelines[cam_name] = pipeline
-                cfg = rs.config()
-                cfg.enable_device(serial)
-                cfg.enable_stream(
-                    rs.stream.color, self.config.image_width, self.config.image_height, rs.format.bgr8, 30
-                )
-                pipeline.start(cfg)
-                logger.info(f"Camera {cam_name} (SN:{serial}) connected.")
-
-            self._connected = True
-        except BaseException:
-            # 包含连接途中 Ctrl-C；清理错误不能覆盖原始连接错误。
-            self._cleanup_failed_connection()
-            raise
-
-    def _cleanup_failed_connection(self) -> None:
-        """Release every acquired resource after an incomplete connection."""
-        sdk = self._sdk
-        pipelines = list(self._pipelines.values())
-        self._sdk = None
-        self._pipelines.clear()
-        self._connected = False
-
-        def attempt(description, cleanup):
-            try:
-                cleanup()
-            except BaseException as error:
-                logger.warning("Piper connection cleanup failed for %s: %s", description, error)
-
-        if sdk is not None:
-            attempt("arm", lambda: sdk.DisableArm(7))
-            attempt("gripper", lambda: sdk.GripperCtrl(0, 1000, 0x02, 0))
-        for pipeline in pipelines:
-            attempt("camera", pipeline.stop)
-        if sdk is not None:
-
-            def disconnect_port():
-                close_port = getattr(sdk, "DisconnectPort", None)
-                if callable(close_port):
-                    close_port()
-
-            attempt("CAN port", disconnect_port)
 
 
 # 关节安全限位（弧度），对应 joint_1 ~ joint_6
@@ -204,6 +131,8 @@ def configure_deployment(policy_cfg, args, dataset_fps=None):
         raise ValueError("control_hz / 数据集 fps 必须为有限正数")
     if not args.dry_run and control_hz is None:
         raise ValueError("缺少训练数据 fps，请提供 --dataset_info / --dataset_root")
+    if not 1 <= args.motion_speed <= 100:
+        raise ValueError("motion_speed 必须为 1..100 的整数百分比")
     if args.num_episodes <= 0 or args.steps_per_episode <= 0:
         raise ValueError("num_episodes 和 steps_per_episode 必须大于 0")
     if not math.isfinite(args.inference_timeout) or args.inference_timeout <= 0:
@@ -367,6 +296,7 @@ def create_robot(args, ds_features, camera_map):
     if args.camera_serials is not None:
         robot_cfg.camera_serials = args.camera_serials
     robot = DeploymentPiper(robot_cfg)
+    robot._motion_speed = args.motion_speed
     # Validate before connect(), because the original connect routine enables the arm/gripper.
     if set(robot.action_features) != set(ds_features["action"]["names"]):
         raise ValueError("Piper 驱动 action_features 与训练动作名称不一致")
@@ -653,7 +583,11 @@ def parse_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--policy_path", help="正式 flow 阶段完整 pretrained_model 目录")
-    parser.add_argument("--check_env", action="store_true", help="检查本分支 PI05 导入，无需权重和硬件")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check_env", action="store_true", help="检查本分支 PI05 导入，无需权重和硬件")
+    mode.add_argument(
+        "--check_robot", action="store_true", help="只读 CAN/机械臂状态，不使能、不发动作、不连接相机"
+    )
     parser.add_argument("--tokenizer_path", help="本机 PaliGemma tokenizer 目录，覆盖训练时记录的路径")
     dataset = parser.add_mutually_exclusive_group()
     dataset.add_argument("--dataset_root", help="对应真机训练任务目录（只读取 meta/info.json）")
@@ -663,6 +597,9 @@ def parse_args(argv=None):
     parser.add_argument("--num_episodes", type=int, default=5)
     parser.add_argument("--steps_per_episode", type=int, default=1000)
     parser.add_argument("--can_port", default="can0")
+    parser.add_argument(
+        "--motion_speed", type=int, default=20, help="MOVE J 速度百分比，默认 20；独立于动作 Hz"
+    )
     parser.add_argument("--control_hz", type=float, help="默认读取训练数据 fps，覆盖后动作播放速度将改变")
     parser.add_argument(
         "--steps_per_chunk", type=int, help="每次预测后执行步数，默认 checkpoint.n_action_steps"
@@ -677,11 +614,13 @@ def parse_args(argv=None):
     compilation.add_argument("--compile", dest="compile_model", action="store_true")
     compilation.add_argument("--no_compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=False)
-    parser.add_argument("--dry_run", action="store_true", help="完整模型合成观测测试，不连接硬件")
+    mode.add_argument("--dry_run", action="store_true", help="完整模型合成观测测试，不连接硬件")
     args = parser.parse_args(argv)
-    if not args.check_env and not args.policy_path:
-        parser.error("需要 --policy_path；只检查环境时使用 --check_env")
-    if not args.check_env and not args.dry_run and not (args.dataset_root or args.dataset_info):
+    if not (args.check_env or args.check_robot) and not args.policy_path:
+        parser.error("需要 --policy_path；诊断可用 --check_env / --check_robot")
+    if not (args.check_env or args.check_robot or args.dry_run) and not (
+        args.dataset_root or args.dataset_info
+    ):
         parser.error("实机运行需要 --dataset_root 或 --dataset_info，以核对训练时的关节顺序和 fps")
     return args
 
@@ -691,6 +630,10 @@ def main(argv=None):
     source = activate_checkout_source()
     if sys.version_info < (3, 12):  # noqa: UP036 -- also run directly in old deployment environments
         raise RuntimeError(f"piper 分支需要 Python >=3.12，当前为 {sys.version.split()[0]}")
+
+    if args.check_robot:
+        check_robot_connection(args.can_port)
+        return
 
     # ML imports are deferred: --help and source-level tests need no robot SDK/GPU.
     import torch
@@ -790,7 +733,7 @@ def main(argv=None):
 
     try:
         robot.connect()
-        print("机器人已连接。")
+        print(f"机器人已连接；MOVE J 速度参数={args.motion_speed}%，故障监测已启用。")
         worker.start()
         for ep in range(1, args.num_episodes + 1):
             input(f"\n[Episode {ep}/{args.num_episodes}] 按 Enter 开始推理...")
@@ -811,10 +754,12 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\n已中断。")
     finally:
-        worker.stop()
-        if robot.is_connected:
-            robot.disconnect()
-        print("机器人已断开连接。")
+        try:
+            if robot.is_connected:
+                robot.disconnect()
+        finally:
+            worker.stop()
+        print("控制程序已结束；请现场确认机械臂状态。")
 
 
 if __name__ == "__main__":

@@ -25,11 +25,13 @@ test ! -e src/lerobot/robots/piper && \
   cp -a /home/drx/DJC/lerobot-main/src/lerobot/robots/piper src/lerobot/robots/
 ```
 
-仓库及此前上传的单个部署脚本均不包含完整 Piper 驱动，因而该目录不能从 GitHub 拉取。
+仓库不跟踪部署机的自定义 Piper 驱动，因而该目录不能从 GitHub 拉取。
 它至少需要提供 `lerobot.robots.piper.PiperConfig` 和
 `lerobot.robots.piper.piper.Piper`，以及原有的 SDK、本地依赖和相机配置。
 部署沿用原脚本的驱动约定：`joint_1.pos` 至 `joint_6.pos` 为弧度，`gripper.pos` 为 0..1；
 使用前确认这与训练数据和本地驱动一致。
+`piper_deploy_guard.py` 适配本次上传的驱动和 `piper-sdk==0.6.1`，通过部署子类覆盖连接、
+发送与退出处理；不会覆盖你本地的驱动文件、相机序列号或 RGB 观测转换。
 
 新目录后续更新：
 
@@ -139,22 +141,62 @@ HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
 
 ## 5. 真机执行
 
+先停止其他控制程序，按现场流程确认机械臂已停稳，并执行只读诊断：
+
+```bash
+python deploy_piper_wyn.py --check_robot --can_port can0
+```
+
+该模式不加载模型、不导入相机驱动，不使能、不发送动作或复位命令。
+先读取 `ip -json -details -statistics link show dev can0`，要求接口 UP、
+`ERROR-ACTIVE` 和 1000000 bit/s；随后仅接收机械臂状态、关节、夹爪和电机反馈。
+输出包括 `arm_status`、`err_code`、各关节电压、使能和故障位。
+只读检查允许电机处于失能状态，但拒绝控制器故障、反馈过期及 CAN 异常。
+`ROBOT_READ_OK` 仅代表当时的通信和反馈检查通过，不代表负载下可靠或可无人值守运行。
+
+若仍显示 `ERROR-WARNING` / `ERROR-PASSIVE` / `BUS-OFF`，先排查机械臂供电、
+CAN 接线与接头、终端配置、USB-CAN 连接。不得靠忽略故障、增加发送队列、自动重连
+或修改 `restart-ms` 后直接恢复策略来掩盖故障。`error-warn` / `error-pass` 是累计状态
+计数，需比较时间上相邻的输出；`bus-off=0` 不等于总线正常。内核的 UVC 错误属于
+相机控制请求，单独这一条不能证明 USB-CAN 掉线。
+
+硬件问题排除、只读检查通过且现场已准备好后，才能开始动作测试：
+
 ```bash
 HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
   --policy_path /home/drx/Downloads/wyn/piper-move-tennis-pi05-dualprompt-cabo2-fp32/checkpoints/006000/pretrained_model \
   --dataset_info /home/drx/Downloads/wyn/tennis_info.json \
   --task "move the tennis from yellow plate to blue plate" \
+  --motion_speed 20 \
   --num_episodes 5 \
   --steps_per_episode 1000
 ```
 
-连接动作沿用原脚本：启用机械臂和夹爪，再连接相机。每轮按 Enter 开始；轮次间自行重置
-任务场景。Ctrl-C 退出后执行驱动断开流程。未实现自动回初始位或成功率判定。
+连接时先核对 CAN 和反馈，再启动相机，最后进行初始使能；夹爪以反馈的当前开度使能。
+每轮按 Enter 开始，轮次间自行重置任务场景。未实现自动回初始位或成功率判定。
+原驱动将 `MOVE J` 速度写死为 100%；部署现在使用 `--motion_speed`（1..100，默认 20）。
+这不是动作 Hz，也不是碰撞保护：降低此值会改变关节跟踪和任务表现，比较成功率时应记录
+并统一该参数。不要将调低速度当作通信故障已修复。
+
+运行时检查每次 CAN 发送返回值：SDK 0.6.1 上层控制接口只记录发送错误而不抛异常，
+适配层在其 `GetCanBus().SendCanMessage` 接口拦截返回值。任一帧失败立即抛出
+`PiperFaultError`，锁定后续动作，当前 chunk 中剩余帧也不会继续发送。
+后台监测覆盖推理和等待 Enter 的时段，检查内核 CAN 状态、反馈时效、电机失能及
+碰撞/过流/欠压等故障，首个故障打印 `PIPER_FAULT` 和最近的 CAN/反馈快照。
+反馈检查采用 SDK 各消息组的时间戳，超过 0.5 秒拒绝运行；聚合时间戳不能证明每一个
+电机反馈帧都及时更新，Python 线程也不提供硬实时保障。
+
+发生故障、Ctrl-C 或正常退出时，都只尝试一次固件快速急停 `MotionCtrl_1(1, 0, 0)`，
+然后关闭相机和通信。不再额外调用原驱动的 `DisableArm(7)` 或夹爪失能/清错命令。
+**CAN 入队成功不代表机械臂已收到；断电或通信故障时无法保证停止或保持力矩。**
+现场必须确认机械臂状态，并按厂商与实验室流程完成停机/支撑。下次测试前需要人工确认
+故障已排除并完成必要的控制器恢复；脚本不会自动清错、重新使能或调用 `ResetPiper()`。
+SDK 的恢复命令可能导致失力矩，不能将其直接塞进异常处理后重试。
 
 状态与动作分量按数据元信息各自的 `names` 排序。默认执行频率为训练数据 `fps`，
 默认每个 chunk 执行 checkpoint 的 `n_action_steps` 步；可用 `--steps_per_chunk 8`
 缩短每次执行段，`--control_hz` 只改变执行频率。等待推理会额外增加 chunk 间的间隔，
-脚本在这段时间持续发送当前位置。每次观测只预测一个完整动作段，使用训练时保存的
+脚本在这段时间持续发送当前位置，发送失败或反馈异常同样会中止。每次观测只预测一个完整动作段，使用训练时保存的
 前后处理器恢复动作单位，随后应用原脚本关节限位和非有限值检查。默认关闭 compile。
 
 相机名称默认去掉模型 key 的 `observation.images.` 前缀，需要改名时显式传入：
@@ -165,8 +207,8 @@ HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
 ```
 
 示例只说明参数格式；请按 checkpoint 和驱动的实际相机填写所有视角。
-图像默认认为驱动输出 RGB；原连接代码请求 RealSense BGR8，驱动的 `get_observation()`
-可能已转换为 RGB。若驱动返回原始 BGR，传入 `--camera_color_order bgr`。
+图像默认认为驱动输出 RGB；本次上传的驱动请求 RealSense BGR8，并在 `get_observation()`
+转换为 RGB，因此保持默认即可。若换用返回原始 BGR 的驱动，传入 `--camera_color_order bgr`。
 不要在未检查驱动输出前重复交换通道。
 
 ## 本地代码验证
@@ -175,8 +217,12 @@ HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
 
 ```bash
 uv run --no-project python tests/test_deploy_piper.py
+uv run --no-project python tests/test_piper_guard.py
+# 使用真实 SDK 的编码器及假 CAN 发送端进一步验证，无硬件连接：
+uv run --no-project --with piper-sdk==0.6.1 python tests/test_piper_guard.py
 ```
 
 覆盖源码加载优先级、旧配置拒绝、训练元信息顺序、相机通道、prompt 权重缺失、
-归一化处理器文件、动作段执行、异常传播及连接失败清理。真机 SDK 和实际 checkpoint
-需要在部署机另外验证。
+归一化处理器文件、动作段执行、异常传播，以及 CAN 发送失败后中止、故障锁定、
+后台故障监测、只读诊断和不失能的退出处理。SDK 测试使用真实协议编码器和假 CAN 发送端，
+不构造硬件连接；实际机械臂、相机、负载和 checkpoint 仍需在部署机验证。
