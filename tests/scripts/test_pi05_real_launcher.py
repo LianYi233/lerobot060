@@ -1,6 +1,8 @@
 """Exercise real shell dispatch using metadata fixtures, without loading ML dependencies."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -9,9 +11,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples/training/train_pi05_real.sh"
+AUTODL = ROOT / "examples/training/train_piper_autodl.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -95,6 +99,29 @@ class RealLauncherTest(unittest.TestCase):
         return subprocess.run(
             ["bash", str(LAUNCHER), *args],
             env=dict(self.env, **env),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def run_autodl(self, *args, **env):
+        auto_env = dict(
+            self.env, DATASET_BASE=str(self.work / "datasets/May-pick-and-place"), RUN_GROUP="retrain-test"
+        )
+        for name in (
+            "GPU_IDS",
+            "NUM_PROCESSES",
+            "DTYPE",
+            "MIXED_PRECISION",
+            "CABO_RATIO",
+            "NTK_SAVE_STAGE_SNAPSHOTS",
+            "WANDB_ENABLE",
+            "NUM_WORKERS",
+        ):
+            auto_env.pop(name, None)
+        return subprocess.run(
+            ["bash", str(AUTODL), *args],
+            env=dict(auto_env, **env),
             capture_output=True,
             text=True,
             check=False,
@@ -187,6 +214,126 @@ class RealLauncherTest(unittest.TestCase):
         result = self.run_launcher("1", "full_reference", "0", "--policy.path=/wrong/model")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("environment variables", result.stderr)
+
+    def test_autodl_defaults_train_four_separate_fp32_models(self):
+        commands = self.command_args(self.run_autodl())
+        self.assertEqual(len(commands), 4)
+        for command, folder in zip(commands, MODULE.TASKS.values(), strict=True):
+            for arg in (
+                "CUDA_VISIBLE_DEVICES=0,1",
+                "--multi_gpu",
+                "--num_processes=2",
+                "--mixed_precision=no",
+                "--policy.dtype=float32",
+                "--steps=6000",
+                "--save_freq=3000",
+                "--batch_size=8",
+                "--policy.num_vlm_prompt_tokens=16",
+                "--policy.num_prompt_tokens=16",
+                "--policy.cabo_enabled=true",
+                "--policy.cabo_prompt_update_ratio=2.0",
+                "--policy.next_action_pretrain_steps=1000",
+                "--policy.next_action_bridge_steps=250",
+                "--policy.chunk_size=50",
+                "--policy.n_action_steps=8",
+                "--policy.next_action_masked_steps=40",
+                "--policy.ntk_save_stage_snapshots=false",
+                "--wandb.enable=false",
+                f"--policy.pretrained_path={self.work / 'models/pi05_libero_base'}",
+                f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}",
+                f"--output_dir={self.work / 'chkpt/2601-lerobot/piper/retrain-test' / f'pi05-may-{folder}-full_reference-seed0'}",
+            ):
+                self.assertIn(arg, command)
+        self.assertFalse((self.work / "chkpt").exists())
+        self.assertFalse((self.work / "logs").exists())
+
+    def test_autodl_single_gpu_precision_overrides_and_quoted_paths(self):
+        (command,) = self.command_args(
+            self.run_autodl(
+                "3",
+                "no_bridge",
+                "7",
+                "--wandb.notes=AutoDL tennis rerun",
+                GPU_IDS="1",
+                DTYPE="bfloat16",
+                FLOW_STEPS="3000",
+                BATCH_SIZE="4",
+                N_ACTION_STEPS="50",
+                OUTPUT_ROOT=str(self.work / "custom output"),
+            )
+        )
+        for arg in (
+            "CUDA_VISIBLE_DEVICES=1",
+            "--num_processes=1",
+            "--mixed_precision=bf16",
+            "--policy.dtype=bfloat16",
+            "--steps=3000",
+            "--batch_size=4",
+            "--seed=7",
+            "--policy.n_action_steps=50",
+            "--policy.next_action_bridge_steps=0",
+            "--wandb.notes=AutoDL tennis rerun",
+        ):
+            self.assertIn(arg, command)
+        self.assertNotIn("--multi_gpu", command)
+        output = next(arg for arg in command if arg.startswith("--output_dir="))
+        self.assertIn(str(self.work / "custom output"), output)
+
+    def test_autodl_invalid_settings_fail_before_launch(self):
+        for env in (
+            {"DTYPE": "float32", "MIXED_PRECISION": "bf16"},
+            {"GPU_IDS": "0", "NUM_PROCESSES": "2"},
+            {"FLOW_STEPS": "0"},
+            {"SAVE_FREQ": "0"},
+            {"BATCH_SIZE": "-1"},
+            {"RUN_GROUP": "../old-run"},
+        ):
+            with self.subTest(env=env):
+                result = self.run_autodl("all", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Launching:", result.stdout)
+
+    def simulate_training(self, fail_task=None):
+        launched = []
+
+        def train(command, *, env, cwd, check):
+            launched.append(env)
+            output = Path(env["OUTPUT_ROOT"]) / env["RUN_NAME"]
+            output.mkdir(parents=True)
+            failed = Path(env["DATASET_ROOT"]).name == MODULE.TASKS.get(fail_task)
+            return subprocess.CompletedProcess(command, 17 if failed else 0)
+
+        with (
+            patch.dict(os.environ, dict(self.env, DRY_RUN="false"), clear=True),
+            patch.object(sys, "argv", [str(LAUNCHER), "all"]),
+            patch.object(MODULE, "check_cuda"),
+            patch.object(MODULE.subprocess, "run", side_effect=train),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = MODULE.main()
+        return code, launched
+
+    def test_completed_tasks_export_their_own_deployment_metadata(self):
+        for number, folder in MODULE.TASKS.items():
+            path = self.work / "datasets/May-pick-and-place" / folder / "meta/info.json"
+            info = json.loads(path.read_text())
+            info["total_frames"] = int(number) * 120
+            path.write_text(json.dumps(info))
+        code, launched = self.simulate_training()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launched), 4)
+        for env in launched:
+            output = Path(env["OUTPUT_ROOT"]) / env["RUN_NAME"] / "dataset_info.json"
+            source = Path(env["DATASET_ROOT"]) / "meta/info.json"
+            self.assertEqual(output.read_bytes(), source.read_bytes())
+
+    def test_failed_training_stops_queue_and_does_not_export_success_metadata(self):
+        code, launched = self.simulate_training(fail_task="2")
+        self.assertEqual(code, 17)
+        self.assertEqual(len(launched), 2)
+        first, second = launched
+        self.assertTrue((Path(first["OUTPUT_ROOT"]) / first["RUN_NAME"] / "dataset_info.json").is_file())
+        self.assertFalse((Path(second["OUTPUT_ROOT"]) / second["RUN_NAME"] / "dataset_info.json").exists())
 
 
 if __name__ == "__main__":

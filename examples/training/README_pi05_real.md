@@ -1,5 +1,10 @@
 # May-pick-and-place 真机数据训练（prompt-ablation）
 
+**在 `piper` 分支的 AutoDL 四任务重训入口：**
+`bash examples/training/train_piper_autodl.sh all`，见
+[AutoDL 重训说明](../piper/README_TRAIN_AUTODL.md)。该入口默认正式 flow 6000 步、两卡、
+每 3000 步保存、部署执行段 8 步；下文原入口的默认值仍为 flow 3000 步。
+
 入口：`bash examples/training/train_pi05_real.sh TASK [VARIANT] [SEED] [额外训练参数...]`。
 默认 `VARIANT=full_reference`、`SEED=0`，复用本分支的 PI05 prompt-only 训练流程。
 VLM、action expert 和投影层保持冻结；只训练所选 prompt。数据格式是 **LeRobot v3.0**，
@@ -116,6 +121,7 @@ $OUTPUT_ROOT/pi05-may-1-put_the_apple_on_the_yellow_plate-full_reference-seed0/c
 
 日志位于 `$LOG_ROOT/<相同运行名称>.log`。前置阶段保存到同级的
 `<运行名称>_next_action_pretrain/checkpoints/001000/pretrained_model`。
+每个任务成功训练后，运行目录还会保存 `dataset_info.json`，供真机部署的 `--dataset_info` 使用。
 重复运行时如果输出目录已存在，脚本会停止；使用新的 `OUTPUT_ROOT` 或 seed 开启独立实验。
 该入口用于新训练，断点恢复应使用 checkpoint 的训练配置和原生 `lerobot-train --resume=true` 流程。
 

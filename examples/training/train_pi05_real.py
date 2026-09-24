@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -189,6 +190,10 @@ def main() -> int:
     # Ensure training imports this branch even if another checkout is installed.
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     num_processes = positive_int(env, "NUM_PROCESSES", 1)
+    positive_int(env, "BATCH_SIZE", 8)
+    positive_int(env, "SAVE_FREQ", 500)
+    if "FLOW_STEPS" in env:
+        positive_int(env, "FLOW_STEPS", 3000)
     gpu_ids = [item.strip() for item in env["GPU_IDS"].split(",")]
     if any(not item or item == "-1" for item in gpu_ids) or len(set(gpu_ids)) != len(gpu_ids):
         raise ValueError("GPU_IDS must contain distinct GPU IDs, e.g. 0 or 0,1")
@@ -252,6 +257,12 @@ def main() -> int:
         result = subprocess.run(command, env=task_env, cwd=REPO_ROOT, check=False)
         if result.returncode:
             return result.returncode
+        if env["DRY_RUN"] != "true":
+            # Keep each successful policy paired with the metadata required by --dataset_info.
+            # Saved model processors already contain the task's normalization statistics.
+            info_path = Path(task_env["OUTPUT_ROOT"]) / task_env["RUN_NAME"] / "dataset_info.json"
+            shutil.copy2(Path(task_env["DATASET_ROOT"]) / "meta/info.json", info_path)
+            print(f"Deployment metadata: {info_path}", flush=True)
     return 0
 
 

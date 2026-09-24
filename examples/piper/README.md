@@ -5,6 +5,9 @@
 `deploy_piper_vlaa.py` 使用此版本 PI05 的 flow 推理，支持双 prompt 和 prompt 消融配置。
 `deploy_piper_wyn.py` 是兼容入口，转发到同一实现；两者的参数和源码选择完全一致。
 
+在 AutoDL 重新训练四个任务，使用 `examples/training/train_piper_autodl.sh`，
+路径、参数和模型传回方式见 [四任务训练说明](README_TRAIN_AUTODL.md)。
+
 之前的 `lerobot.processor.core` 导入错误和 `num_vlm_prompt_tokens` 缺失说明部署机混用了
 不同版本源码。入口现在优先加载旁边的 `src/`，并核对配置来源及必要字段。不要继续向旧版
 `PI05Config` 手动补字段，也不要把旧部署目录的 `policies/` 或 `processor/` 复制进来。
