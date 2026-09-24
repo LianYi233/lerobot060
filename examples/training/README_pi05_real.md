@@ -2,8 +2,8 @@
 
 **在 `piper` 分支的 AutoDL 四任务重训入口：**
 `bash examples/training/train_piper_autodl.sh all`，见
-[AutoDL 重训说明](../piper/README_TRAIN_AUTODL.md)。该入口默认正式 flow 6000 步、两卡、
-每 3000 步保存、部署执行段 8 步；下文原入口的默认值仍为 flow 3000 步。
+[AutoDL 重训说明](../piper/README_TRAIN_AUTODL.md)。该入口默认正式 flow 12000 步、单卡、
+仅保存 6000/9000/12000 步、部署执行段 8 步；下文原入口的默认值仍为 flow 3000 步。
 
 入口：`bash examples/training/train_pi05_real.sh TASK [VARIANT] [SEED] [额外训练参数...]`。
 默认 `VARIANT=full_reference`、`SEED=0`，复用本分支的 PI05 prompt-only 训练流程。
@@ -107,6 +107,8 @@ CHUNK_SIZE=8 MASKED_STEPS=6 N_ACTION_STEPS=8 \
 | `FLOW_STEPS` | 3000，指正式 flow 阶段 |
 | `full_reference` 前置阶段 | 750 步 action priming + 250 步 bridge，随后 3000 步 flow |
 | `BATCH_SIZE` / `SAVE_FREQ` | 每卡 8 / flow 每 500 步保存，最后一步也保存 |
+| `SAVE_STEPS` | 默认未设置；JSON 列表覆盖 `SAVE_FREQ`，例如 `[6000,9000,12000]`，最终步始终保存 |
+| `KEEP_PRETRAIN_CHECKPOINT` | 原入口默认 `true`；AutoDL 入口为 `false`，任务成功后清理前置临时权重 |
 | `CHUNK_SIZE` / `MASKED_STEPS` / `N_ACTION_STEPS` | 50 / 40 / 50；改变 chunk 时默认 mask 数为约 80% |
 | `DTYPE` / `MIXED_PRECISION` | `float32` / `no`，沿用本分支配置 |
 | `VIDEO_BACKEND` | `pyav` |

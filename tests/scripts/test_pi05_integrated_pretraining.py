@@ -192,7 +192,7 @@ def test_flow_inpainting_sampler_keeps_episode_tail_anchors(tmp_path):
     assert sampler.indices == list(range(78))
 
 
-def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_path):
+def test_stage2_preserves_requested_save_frequency_after_stage1(monkeypatch, tmp_path):
     cfg = _make_flow_config(tmp_path, next_action_pretrain_steps=1_200)
     cfg.save_freq = 137
     cfg.validate()
@@ -212,7 +212,26 @@ def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_
 
     train_module._run_pi05_next_action_pretraining(cfg, accelerator)
 
-    assert cfg.save_freq == 3_000
+    assert cfg.save_freq == 137
+
+
+def test_explicit_flow_checkpoints_survive_stage_transition(monkeypatch, tmp_path):
+    cfg = _make_flow_config(tmp_path)
+    cfg.steps = 12_000
+    cfg.save_steps = [6_000, 9_000, 12_000]
+    cfg.save_freq = 3_000
+    cfg.validate()
+
+    def fake_train_single_stage(stage_cfg, accelerator, *, enable_pi05_stage1_bridge=False):
+        assert enable_pi05_stage1_bridge
+        stage_cfg.validate_checkpoint_schedule()
+        assert stage_cfg.save_steps == [1_000]
+        assert [step for step in range(1, 1_001) if stage_cfg.should_save_checkpoint(step)] == [1_000]
+        train_module._pi05_next_action_pretrained_model_dir(stage_cfg).mkdir(parents=True)
+
+    monkeypatch.setattr(train_module, "_train_single_stage", fake_train_single_stage)
+    train_module._run_pi05_next_action_pretraining(cfg, _FakeAccelerator())
+    assert [step for step in range(1, 12_001) if cfg.should_save_checkpoint(step)] == [6_000, 9_000, 12_000]
 
 
 @pytest.mark.parametrize("cabo_enabled", [False, True])
@@ -256,7 +275,7 @@ def test_one_command_runs_next_action_then_flow_with_fresh_stage_configs(monkeyp
     assert stages[1][0].policy.num_prompt_tokens == stages[0][0].policy.num_prompt_tokens
     assert stages[1][0].policy.num_vlm_prompt_tokens == stages[0][0].policy.num_vlm_prompt_tokens
     assert stages[1][0].save_checkpoint
-    assert stages[1][0].save_freq == 3_000
+    assert stages[1][0].save_freq == 10_000
     expected_model_dir = (
         tmp_path / "flow_next_action_pretrain" / "checkpoints" / "001000" / "pretrained_model"
     )

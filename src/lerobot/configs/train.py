@@ -113,6 +113,9 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 10_000
+    # When set, replace periodic saves with these completed steps (the final step is always saved).
+    # [] saves only the final checkpoint; None keeps the save_freq behavior.
+    save_steps: list[int] | None = None
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -218,6 +221,7 @@ class TrainPipelineConfig(HubMixin):
             self.reward_model.pretrained_path = str(policy_dir)
 
     def validate(self) -> None:
+        self.validate_checkpoint_schedule()
         self._resolve_pretrained_from_cli()
 
         if self.policy is None and self.reward_model is None:
@@ -279,6 +283,26 @@ class TrainPipelineConfig(HubMixin):
 
         if self.save_checkpoint_to_hub and not (self.policy is not None and self.policy.repo_id):
             raise ValueError("save_checkpoint_to_hub requires --policy.repo_id.")
+
+    def validate_checkpoint_schedule(self) -> None:
+        if self.save_steps is None:
+            if self.save_freq <= 0:
+                raise ValueError("save_freq must be positive when save_steps is not set")
+            return
+        if not isinstance(self.save_steps, list) or any(
+            type(step) is not int or not 1 <= step <= self.steps for step in self.save_steps
+        ):
+            raise ValueError("save_steps must be a list of integer steps between 1 and steps")
+
+    def should_save_checkpoint(self, step: int) -> bool:
+        """Decide after an update, including when resuming between explicit save steps."""
+        if not self.save_checkpoint or not 1 <= step <= self.steps:
+            return False
+        if step == self.steps:
+            return True
+        if self.save_steps is not None:
+            return step in self.save_steps
+        return step % self.save_freq == 0
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

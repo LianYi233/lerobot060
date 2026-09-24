@@ -76,7 +76,6 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 _PI05_NEXT_ACTION_PRETRAIN_DIR = "next_action_pretrain"
-_PI05_STAGE2_SAVE_FREQ = 3_000
 
 
 @torch.no_grad()
@@ -403,6 +402,8 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     pretrain_cfg.sample_weighting = None
     pretrain_cfg.save_checkpoint = True
     pretrain_cfg.save_freq = pretrain_steps
+    # Formal-flow milestones must not suppress the transfer checkpoint or leak into Stage 1.
+    pretrain_cfg.save_steps = [pretrain_steps] if cfg.save_steps is not None else None
     pretrain_cfg.save_checkpoint_to_hub = False
     pretrain_cfg.wandb = dataclasses.replace(pretrain_cfg.wandb, enable=False, run_id=None)
     pretrain_cfg.job = dataclasses.replace(pretrain_cfg.job, target="local")
@@ -543,14 +544,12 @@ def _run_pi05_next_action_pretraining(
     accelerator.free_memory()
     cfg.policy.pretrained_path = pretrained_model_dir
     cfg.policy.pretrained_revision = None
-    # Stage 1 keeps only its final transfer checkpoint. Once it succeeds, persist the formal
-    # observation-conditioned flow stage at a finer, fixed cadence (plus the existing final save).
-    cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
         "PI0.5 Stage 1 complete; rebuilding the model, optimizer, and scheduler for "
-        "formal flow training with checkpoints every %d steps.",
+        "formal flow training with save_steps=%s, save_freq=%d (final step always saved).",
+        cfg.save_steps,
         cfg.save_freq,
     )
 
@@ -1041,7 +1040,7 @@ def _train_single_stage(
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_saving_step = cfg.should_save_checkpoint(step)
         if ntk_snapshots and step == pi05_stage1_bridge_start_step:
             # `step` counts completed updates: 750 here is after priming, before bridge update 1.
             is_saving_step = True

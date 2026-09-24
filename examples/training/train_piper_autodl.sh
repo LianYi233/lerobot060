@@ -10,16 +10,18 @@ TASK: all (default), 1 (apple), 2 (cuboid), 3 (tennis), 4 (red cube)
 VARIANT: full_reference (default), or an existing prompt-ablation variant
 SEED: 0 (default)
 
-Default: GPUs 0,1; batch 8 per GPU; FP32; 750 priming + 250 bridge + 6000 flow
-updates; 16+16 prompts; CABO ratio 2; checkpoints at flow 3000 and 6000.
+Default: GPU 0; batch 8; FP32; 750 priming + 250 bridge + 12000 flow
+updates; 16+16 prompts; CABO ratio 2; checkpoints at flow 6000, 9000 and 12000.
+Temporary pretraining checkpoints are removed after each successful task.
 Training predicts 50 actions; deployment executes 8 actions per observation.
 All four tasks train separately, in sequence, from the same base checkpoint.
 
 Set DATASET_BASE, PRETRAINED_PATH and TOKENIZER_PATH to the actual local paths.
 Set RUN_GROUP to reuse a chosen output group, or leave it unset for a timestamp.
 DRY_RUN=true validates metadata/paths and prints commands without using a GPU.
-GPU_IDS=0 selects one GPU; NUM_PROCESSES defaults to the GPU list length.
-FLOW_STEPS=3000 selects a shorter formal flow stage.
+GPU_IDS=0,1 selects two GPUs; NUM_PROCESSES defaults to the GPU list length.
+FLOW_STEPS=3000 selects a shorter formal flow stage; SAVE_STEPS='[3000]' saves its final model.
+SAVE_STEPS overrides SAVE_FREQ; KEEP_PRETRAIN_CHECKPOINT=true retains Stage-1 weights.
 See examples/piper/README_TRAIN_AUTODL.md for setup, logs and checkpoint transfer.
 EOF
   exit 0
@@ -37,7 +39,7 @@ fi
 
 # Edit these three defaults, or export the variables before running this script.
 export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
-export DATASET_BASE="${DATASET_BASE:-/root/datasets/May-pick-and-place}"
+export DATASET_BASE="${DATASET_BASE:-${WORK_ROOT}/datasets/May-pick-and-place}"
 export PRETRAINED_PATH="${PRETRAINED_PATH:-${WORK_ROOT}/models/pi05_libero_base}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-${WORK_ROOT}/models/google/paligemma-3b-pt-224}"
 
@@ -49,12 +51,14 @@ fi
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${WORK_ROOT}/chkpt/2601-lerobot/piper/${RUN_GROUP}}"
 export LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs/piper/${RUN_GROUP}}"
 
-export GPU_IDS="${GPU_IDS:-0,1}"
+export GPU_IDS="${GPU_IDS:-0}"
 IFS=',' read -r -a PIPER_GPU_LIST <<< "${GPU_IDS}"
 export NUM_PROCESSES="${NUM_PROCESSES:-${#PIPER_GPU_LIST[@]}}"
 export BATCH_SIZE="${BATCH_SIZE:-8}"
-export FLOW_STEPS="${FLOW_STEPS:-6000}"
+export FLOW_STEPS="${FLOW_STEPS:-12000}"
 export SAVE_FREQ="${SAVE_FREQ:-3000}"
+export SAVE_STEPS="${SAVE_STEPS:-[6000,9000,12000]}"
+export KEEP_PRETRAIN_CHECKPOINT="${KEEP_PRETRAIN_CHECKPOINT:-false}"
 export DTYPE="${DTYPE:-float32}"
 case "${DTYPE}" in
   float32) EXPECTED_PRECISION=no ;;

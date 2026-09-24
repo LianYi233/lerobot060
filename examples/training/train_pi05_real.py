@@ -35,6 +35,24 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 
 
+def cleanup_pretrain_checkpoint(output_dir: Path, flow_steps: int) -> None:
+    """Discard this fresh run's transfer weights only after a final flow model exists."""
+    stage_dir = output_dir.with_name(f"{output_dir.name}_next_action_pretrain")
+    checkpoints = stage_dir / "checkpoints"
+    if not checkpoints.exists():
+        return
+    if stage_dir.is_symlink() or checkpoints.is_symlink():
+        raise ValueError(f"Refusing to clean a linked pretraining directory: {checkpoints}")
+    step_id = str(flow_steps).zfill(max(6, len(str(flow_steps))))
+    final_model = output_dir / "checkpoints" / step_id / "pretrained_model"
+    if not all((final_model / name).is_file() for name in ("config.json", "model.safetensors")):
+        raise ValueError(f"Keeping pretraining weights: final flow model is incomplete at {final_model}")
+    shutil.rmtree(checkpoints)
+    print(f"Removed temporary pretraining checkpoints: {checkpoints}", flush=True)
+    if not any(stage_dir.iterdir()):
+        stage_dir.rmdir()
+
+
 def read_json(path: Path) -> dict:
     if not path.is_file():
         raise ValueError(f"Missing file: {path}")
@@ -160,10 +178,14 @@ def main() -> int:
         "--job_name",
         "--config_path",
         "--resume",
+        "--steps",
+        "--save_steps",
+        "--save_checkpoint",
+        "--policy.ntk_save_stage_snapshots",
     }
     if any(arg.split("=", 1)[0] in managed for arg in extra):
         parser.error(
-            "Use the documented environment variables for data/model paths, normalization and chunks; "
+            "Use the documented environment variables for paths, normalization, chunks and checkpoint steps; "
             "feature, output and resume overrides are not supported by this fresh-run launcher"
         )
     env = os.environ.copy()
@@ -185,15 +207,26 @@ def main() -> int:
     env.setdefault("BATCH_SIZE", "8")
     env.setdefault("SAVE_FREQ", "500")
     env.setdefault("DRY_RUN", "false")
+    env.setdefault("KEEP_PRETRAIN_CHECKPOINT", "true")
     if env["DRY_RUN"] not in ("true", "false"):
         raise ValueError("DRY_RUN must be true or false")
+    if env["KEEP_PRETRAIN_CHECKPOINT"] not in ("true", "false"):
+        raise ValueError("KEEP_PRETRAIN_CHECKPOINT must be true or false")
+    if env["KEEP_PRETRAIN_CHECKPOINT"] == "false" and env.get("NTK_SAVE_STAGE_SNAPSHOTS") != "false":
+        raise ValueError("Set NTK_SAVE_STAGE_SNAPSHOTS=false before discarding pretraining checkpoints")
     # Ensure training imports this branch even if another checkout is installed.
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     num_processes = positive_int(env, "NUM_PROCESSES", 1)
     positive_int(env, "BATCH_SIZE", 8)
     positive_int(env, "SAVE_FREQ", 500)
-    if "FLOW_STEPS" in env:
-        positive_int(env, "FLOW_STEPS", 3000)
+    flow_steps = positive_int(env, "FLOW_STEPS", 3000)
+    if "SAVE_STEPS" in env:
+        save_steps = json.loads(env["SAVE_STEPS"])
+        if not isinstance(save_steps, list) or any(
+            type(step) is not int or not 1 <= step <= flow_steps for step in save_steps
+        ):
+            raise ValueError("SAVE_STEPS must be a JSON list of integer steps between 1 and FLOW_STEPS")
+        env["SAVE_STEPS"] = json.dumps(sorted(set(save_steps)), separators=(",", ":"))
     gpu_ids = [item.strip() for item in env["GPU_IDS"].split(",")]
     if any(not item or item == "-1" for item in gpu_ids) or len(set(gpu_ids)) != len(gpu_ids):
         raise ValueError("GPU_IDS must contain distinct GPU IDs, e.g. 0 or 0,1")
@@ -263,6 +296,8 @@ def main() -> int:
             info_path = Path(task_env["OUTPUT_ROOT"]) / task_env["RUN_NAME"] / "dataset_info.json"
             shutil.copy2(Path(task_env["DATASET_ROOT"]) / "meta/info.json", info_path)
             print(f"Deployment metadata: {info_path}", flush=True)
+            if env["KEEP_PRETRAIN_CHECKPOINT"] == "false":
+                cleanup_pretrain_checkpoint(info_path.parent, flow_steps)
     return 0
 
 

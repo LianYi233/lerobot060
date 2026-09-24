@@ -174,6 +174,9 @@ TRAIN_ARGS=(
   --save_checkpoint=true
   --save_freq="${SAVE_FREQ}"
 )
+if [[ -n "${SAVE_STEPS:-}" ]]; then
+  TRAIN_ARGS+=(--save_steps="${SAVE_STEPS}")
+fi
 
 LAUNCH_ARGS=(
   launch
@@ -187,7 +190,11 @@ fi
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
 echo "output=${OUTPUT_DIR}"
-echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
+if [[ -n "${SAVE_STEPS:-}" ]]; then
+  echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoints=${SAVE_STEPS} (plus final step; SAVE_FREQ ignored)"
+else
+  echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
+fi
 if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then
   PRETRAIN_OUTPUT_DIR="${OUTPUT_DIR}_next_action_pretrain"
   printf 'NTK before training: %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" 0

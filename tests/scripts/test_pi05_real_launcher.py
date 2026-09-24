@@ -46,6 +46,8 @@ class RealLauncherTest(unittest.TestCase):
             "N_ACTION_STEPS",
             "NORMALIZATION_MODE",
             "SAVE_FREQ",
+            "SAVE_STEPS",
+            "KEEP_PRETRAIN_CHECKPOINT",
             "BATCH_SIZE",
             "RUN_NAME",
         ):
@@ -105,9 +107,7 @@ class RealLauncherTest(unittest.TestCase):
         )
 
     def run_autodl(self, *args, **env):
-        auto_env = dict(
-            self.env, DATASET_BASE=str(self.work / "datasets/May-pick-and-place"), RUN_GROUP="retrain-test"
-        )
+        auto_env = dict(self.env, RUN_GROUP="retrain-test")
         for name in (
             "GPU_IDS",
             "NUM_PROCESSES",
@@ -220,13 +220,13 @@ class RealLauncherTest(unittest.TestCase):
         self.assertEqual(len(commands), 4)
         for command, folder in zip(commands, MODULE.TASKS.values(), strict=True):
             for arg in (
-                "CUDA_VISIBLE_DEVICES=0,1",
-                "--multi_gpu",
-                "--num_processes=2",
+                "CUDA_VISIBLE_DEVICES=0",
+                "--num_processes=1",
                 "--mixed_precision=no",
                 "--policy.dtype=float32",
-                "--steps=6000",
+                "--steps=12000",
                 "--save_freq=3000",
+                "--save_steps=[6000,9000,12000]",
                 "--batch_size=8",
                 "--policy.num_vlm_prompt_tokens=16",
                 "--policy.num_prompt_tokens=16",
@@ -244,6 +244,7 @@ class RealLauncherTest(unittest.TestCase):
                 f"--output_dir={self.work / 'chkpt/2601-lerobot/piper/retrain-test' / f'pi05-may-{folder}-full_reference-seed0'}",
             ):
                 self.assertIn(arg, command)
+            self.assertNotIn("--multi_gpu", command)
         self.assertFalse((self.work / "chkpt").exists())
         self.assertFalse((self.work / "logs").exists())
 
@@ -257,6 +258,7 @@ class RealLauncherTest(unittest.TestCase):
                 GPU_IDS="1",
                 DTYPE="bfloat16",
                 FLOW_STEPS="3000",
+                SAVE_STEPS="[3000]",
                 BATCH_SIZE="4",
                 N_ACTION_STEPS="50",
                 OUTPUT_ROOT=str(self.work / "custom output"),
@@ -268,6 +270,7 @@ class RealLauncherTest(unittest.TestCase):
             "--mixed_precision=bf16",
             "--policy.dtype=bfloat16",
             "--steps=3000",
+            "--save_steps=[3000]",
             "--batch_size=4",
             "--seed=7",
             "--policy.n_action_steps=50",
@@ -287,24 +290,59 @@ class RealLauncherTest(unittest.TestCase):
             {"SAVE_FREQ": "0"},
             {"BATCH_SIZE": "-1"},
             {"RUN_GROUP": "../old-run"},
+            {"SAVE_STEPS": "[0,6000]"},
+            {"SAVE_STEPS": "[6000,13000]"},
+            {"SAVE_STEPS": "[true,6000]"},
+            {"SAVE_STEPS": "6000"},
+            {"SAVE_STEPS": "bad-json"},
+            {"KEEP_PRETRAIN_CHECKPOINT": "invalid"},
+            {"NTK_SAVE_STAGE_SNAPSHOTS": "true"},
         ):
             with self.subTest(env=env):
                 result = self.run_autodl("all", **env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("Launching:", result.stdout)
 
-    def simulate_training(self, fail_task=None):
+    def test_explicit_schedule_takes_precedence_and_supports_final_only(self):
+        for schedule, expected in (("[9000,6000,6000]", "[6000,9000]"), ("[]", "[]")):
+            with self.subTest(schedule=schedule):
+                (command,) = self.command_args(self.run_autodl("1", SAVE_STEPS=schedule, SAVE_FREQ="1"))
+                self.assertIn(f"--save_steps={expected}", command)
+        (command,) = self.command_args(
+            self.run_autodl("1", "dual_prompt_only", FLOW_STEPS="2", SAVE_STEPS="[2]")
+        )
+        self.assertIn("--steps=2", command)
+        self.assertIn("--save_steps=[2]", command)
+
+    def simulate_training(self, fail_task=None, keep_pretrain="true", incomplete_final=False):
         launched = []
 
         def train(command, *, env, cwd, check):
             launched.append(env)
             output = Path(env["OUTPUT_ROOT"]) / env["RUN_NAME"]
             output.mkdir(parents=True)
+            pretrain = output.with_name(f"{output.name}_next_action_pretrain")
+            self.touch(pretrain / "checkpoints/001000/pretrained_model/model.safetensors")
+            for step in ("006000", "009000", "012000"):
+                self.touch(output / "checkpoints" / step / "pretrained_model/config.json")
+                if not incomplete_final or step != "012000":
+                    self.touch(output / "checkpoints" / step / "pretrained_model/model.safetensors")
             failed = Path(env["DATASET_ROOT"]).name == MODULE.TASKS.get(fail_task)
             return subprocess.CompletedProcess(command, 17 if failed else 0)
 
         with (
-            patch.dict(os.environ, dict(self.env, DRY_RUN="false"), clear=True),
+            patch.dict(
+                os.environ,
+                dict(
+                    self.env,
+                    DRY_RUN="false",
+                    FLOW_STEPS="12000",
+                    SAVE_STEPS="[6000,9000,12000]",
+                    KEEP_PRETRAIN_CHECKPOINT=keep_pretrain,
+                    NTK_SAVE_STAGE_SNAPSHOTS="false",
+                ),
+                clear=True,
+            ),
             patch.object(sys, "argv", [str(LAUNCHER), "all"]),
             patch.object(MODULE, "check_cuda"),
             patch.object(MODULE.subprocess, "run", side_effect=train),
@@ -334,6 +372,34 @@ class RealLauncherTest(unittest.TestCase):
         first, second = launched
         self.assertTrue((Path(first["OUTPUT_ROOT"]) / first["RUN_NAME"] / "dataset_info.json").is_file())
         self.assertFalse((Path(second["OUTPUT_ROOT"]) / second["RUN_NAME"] / "dataset_info.json").exists())
+
+    def test_success_removes_only_temporary_weights_and_failure_keeps_recovery(self):
+        code, launched = self.simulate_training(fail_task="2", keep_pretrain="false")
+        self.assertEqual(code, 17)
+        self.assertEqual(len(launched), 2)
+        for index, env in enumerate(launched):
+            output = Path(env["OUTPUT_ROOT"]) / env["RUN_NAME"]
+            pretrain = output.with_name(f"{output.name}_next_action_pretrain")
+            self.assertEqual((pretrain / "checkpoints").exists(), index == 1)
+            for step in ("006000", "009000", "012000"):
+                self.assertTrue(
+                    (output / "checkpoints" / step / "pretrained_model/model.safetensors").exists()
+                )
+
+    def test_cleanup_requires_a_complete_final_model(self):
+        with self.assertRaisesRegex(ValueError, "Keeping pretraining weights"):
+            self.simulate_training(keep_pretrain="false", incomplete_final=True)
+        output = self.work / "chkpt/2601-lerobot/prompt-ablation-real"
+        self.assertEqual(len(list(output.glob("*_next_action_pretrain/checkpoints/001000"))), 1)
+
+    def test_cleanup_rejects_symlinked_stage_directory(self):
+        output = self.work / "output"
+        previous = self.work / "previous_run"
+        self.touch(previous / "checkpoints/001000/pretrained_model/model.safetensors")
+        output.with_name("output_next_action_pretrain").symlink_to(previous, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "linked pretraining directory"):
+            MODULE.cleanup_pretrain_checkpoint(output, 12000)
+        self.assertTrue((previous / "checkpoints/001000/pretrained_model/model.safetensors").exists())
 
 
 if __name__ == "__main__":

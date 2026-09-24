@@ -6,13 +6,13 @@
 
 ## 1. 获取代码和准备环境
 
-建议在 AutoDL 新建 `piper` checkout，保留原来的 `prompt-ablation` 工作目录：
+在 AutoDL 现有仓库中切换到 `piper`（如有未提交修改，先自行提交或暂存）：
 
 ```bash
-cd /root
-git clone --single-branch --branch piper \
-  https://github.com/LianYi233/lerobot060.git lerobot-piper
-cd /root/lerobot-piper
+cd /root/lerobot060
+git fetch origin
+git switch piper
+git pull --ff-only origin piper
 ```
 
 如果已有该目录且当前分支为 `piper`，使用 `git pull --ff-only origin piper` 更新。
@@ -30,14 +30,13 @@ python -m pip install -e '.[training,pi]'
 ## 2. 设置路径
 
 ```bash
-export DATASET_BASE=/root/datasets/May-pick-and-place
+export DATASET_BASE=/root/autodl-tmp/datasets/May-pick-and-place
 export PRETRAINED_PATH=/root/autodl-tmp/models/pi05_libero_base
 export TOKENIZER_PATH=/root/autodl-tmp/models/google/paligemma-3b-pt-224
-export RUN_GROUP=piper-retrain-01
+export RUN_GROUP=piper-a100-12k-01
 ```
 
-这三个数据/模型路径沿用之前 AutoDL 的位置；按实际目录修改。如果数据放在数据盘，
-将第一行改为 `/root/autodl-tmp/datasets/May-pick-and-place`。
+以上是当前 AutoDL 默认路径；如果模型位置不同，按实际目录修改。
 预训练目录需含完整权重、配置及 pre/postprocessor；tokenizer 必须在本地完整保存。
 入口默认离线加载，避免训练服务器旧路径或 Hub 网络连接问题；不会自动下载缺失文件。
 
@@ -61,7 +60,7 @@ Parquet 文件、各相机视频是否存在，以及 state/action 的归一化�
 DRY_RUN=true bash examples/training/train_piper_autodl.sh all
 ```
 
-正式训练，默认使用 GPU 0、1：
+正式训练，默认使用一张 A100（GPU 0）：
 
 ```bash
 bash examples/training/train_piper_autodl.sh all
@@ -71,10 +70,10 @@ bash examples/training/train_piper_autodl.sh all
 开始；不会将前一任务的权重传给后一任务。所有任务的路径预检通过后才启动第一个训练。
 某个任务报错时停止整个队列，保留已有日志和 checkpoint。
 
-只训练一个任务，或改为单卡：
+只训练一个任务，或将每卡 batch 改为 4：
 
 ```bash
-# 两卡重训网球任务
+# 单卡重训网球任务
 bash examples/training/train_piper_autodl.sh 3
 
 # 单卡顺序训练四个任务，自动使用一个进程
@@ -84,7 +83,7 @@ GPU_IDS=0 BATCH_SIZE=4 bash examples/training/train_piper_autodl.sh all
 正式运行前如需验证真实视频读取和前后向，可用独立目录做两步测试：
 
 ```bash
-RUN_GROUP=piper-smoke-01 GPU_IDS=0 BATCH_SIZE=1 FLOW_STEPS=2 SAVE_FREQ=1 \
+RUN_GROUP=piper-smoke-01 GPU_IDS=0 BATCH_SIZE=1 FLOW_STEPS=2 SAVE_STEPS='[2]' \
 COMPILE_MODEL=false NUM_WORKERS=0 \
   bash examples/training/train_piper_autodl.sh 1 dual_prompt_only 0
 ```
@@ -97,13 +96,14 @@ COMPILE_MODEL=false NUM_WORKERS=0 \
 | 配置 | 默认值 |
 | --- | --- |
 | recipe / seed | `full_reference` / `0` |
-| GPU / 每卡 batch | `0,1` / `8`（默认全局 batch 为 16） |
+| GPU / 每卡 batch | `0` / `8`（默认全局 batch 为 8） |
 | 精度 | `DTYPE=float32`、`MIXED_PRECISION=no` |
 | 可训练参数 | VLM prompt 16 tokens + action prompt 16 tokens；骨干和投影层冻结 |
 | CABO | 启用，`CABO_RATIO=2.0` |
 | 前置训练 | 总计 1000 步，包含 750 步 action priming + 250 步 bridge |
-| 正式 flow | `FLOW_STEPS=6000`；连同前置阶段，每个任务共 7000 步 |
-| 保存 | flow 第 3000、6000 步；前置训练结束另存 001000 |
+| 正式 flow | `FLOW_STEPS=12000`；连同前置阶段，每个任务共 13000 次更新 |
+| 保存 | `SAVE_STEPS='[6000,9000,12000]'`，只保留这三个 flow checkpoint |
+| 前置临时权重 | 阶段衔接需暂存 001000；该任务成功且最终模型存在后自动清理 |
 | 训练动作段 / mask | 50 / 40 |
 | 部署默认执行段 | `N_ACTION_STEPS=8`，每次预测后仅执行前 8 步再读取观测 |
 | 归一化 / 视频 | 数据集自身 `QUANTILES` / `pyav` |
@@ -114,9 +114,16 @@ COMPILE_MODEL=false NUM_WORKERS=0 \
 8 步；若需复现原来执行 50 步的配置，可显式设置 `N_ACTION_STEPS=50`。
 训练读取数据集 fps，部署也读取相同元信息；不要通过修改训练 fps 来降低机械臂速度。
 
-可用环境变量覆盖参数，例如 `FLOW_STEPS=3000`、`BATCH_SIZE=4`、
+可用环境变量覆盖参数，例如 `FLOW_STEPS=3000 SAVE_STEPS='[3000]'`、`BATCH_SIZE=4`、
 `DTYPE=bfloat16`（自动配套 `MIXED_PRECISION=bf16`）。不同精度或 batch 会改变实验配置。
 支持原有消融，例如 `bash examples/training/train_piper_autodl.sh all no_bridge 0`。
+
+`SAVE_STEPS` 优先于 `SAVE_FREQ`，最终一步始终保存；`SAVE_STEPS='[]'` 表示只存最终模型。
+默认不会保存 3000 步或 NTK 的 0/750 步快照。修改 `FLOW_STEPS` 时同时修改 `SAVE_STEPS`，
+保存步数超过总步数会在预检时报错。前置训练有独立的保存计划，不继承 flow 的保存步数。
+如需保留前置权重，设置 `KEEP_PRETRAIN_CHECKPOINT=true`。任务失败时自动保留临时权重；
+清理只作用于本次新建任务，已有运行目录仍拒绝覆盖。`checkpoints/last` 是指向最终保存点的
+符号链接，不是另一份模型。更新代码不会改变已运行进程的步数或保存策略。
 
 ## 5. 输出、日志和传回真机
 
@@ -131,8 +138,9 @@ COMPILE_MODEL=false NUM_WORKERS=0 \
 ```text
 pi05-may-3-move_the_tennis_from_yellow_plate_to_blue_plate-full_reference-seed0/
   dataset_info.json
-  checkpoints/003000/pretrained_model/
   checkpoints/006000/pretrained_model/
+  checkpoints/009000/pretrained_model/
+  checkpoints/012000/pretrained_model/
 ```
 
 训练成功后自动将该任务的 `meta/info.json` 复制为 `dataset_info.json`，便于与模型一起
