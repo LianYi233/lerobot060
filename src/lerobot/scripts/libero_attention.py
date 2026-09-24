@@ -11,12 +11,17 @@ from pathlib import Path
 import numpy as np
 
 from lerobot.policies.pi05 import attention_visualization
-from lerobot.policies.pi05.attention_visualization import AttentionVideoConfig, PI05AttentionRecorder
+from lerobot.policies.pi05.attention_visualization import (
+    AttentionVideoConfig,
+    PI05AttentionRecorder,
+    load_attention_font,
+)
 
 
 def install_attention_evaluation(evaluator):
     """Install before the launcher's existing progress/resume wrappers."""
     config = AttentionVideoConfig.from_env()
+    font = load_attention_font(config.font_path)  # Validate before loading a multi-GB checkpoint.
     original_one = evaluator.run_one
     original_rollout = evaluator.rollout
     one_signature = inspect.signature(original_one)
@@ -108,6 +113,11 @@ def install_attention_evaluation(evaluator):
     print(f"Attention videos enabled: {asdict(config)}", flush=True)
     return {
         "attention": asdict(config),
+        "attention_font": {
+            "family": font.getname()[0],
+            "path": str(font.path),
+            "sha256": hashlib.sha256(Path(font.path).read_bytes()).hexdigest(),
+        },
         "attention_code_sha256": hashlib.sha256(
             Path(__file__).read_bytes() + Path(attention_visualization.__file__).read_bytes()
         ).hexdigest(),

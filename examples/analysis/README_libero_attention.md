@@ -24,7 +24,15 @@ BASE_CKPT="$RUN_DIR/checkpoints" GPU_ID=0 \
 
 ## 视频内容与文件
 
-视频横向展示三个面板：实时环境、产生当前动作块的模型输入、该输入上的红橙色注意力叠加。
+视频横向展示三个面板：实时环境、产生当前动作块的模型输入、该输入上的注意力叠加。
+热图低值呈蓝紫色，高值过渡到亮红、橙黄和亮黄色，默认颜色覆盖强度为 0.82。
+所有文字统一使用 Times New Roman；程序自动查找并核对字体名称，不会静默替换为其他字体。
+如果服务器没有安装该字体，上传已有的 Times New Roman 常规字体文件，并指定实际路径：
+
+```bash
+export ATTENTION_FONT_PATH=/root/fonts/times.ttf
+```
+
 热图使用实际传入视觉编码器的像素，已包含 LIBERO 方向变换、缩放和 padding，不再额外翻转。
 执行队列中的后续动作时，输入图与热图保持在上次预测时刻；左侧实时画面继续更新。
 底部标注输入步数、queued-action age、注意力来源、层号、相机、该相机的注意力总质量及颜色范围。
@@ -48,6 +56,28 @@ NPZ 保存每次重新预测的原始 patch 概率 `maps`（预测次数 × 网�
 `input_steps`、`denoise_pass_counts`、`image_attention_mass`。JSON 记录来源、实际层号、相机 feature key 等。
 标准 224×224 输入、14×14 patch 对应 16×16 网格；程序依据实际视觉配置推导并核对 token 数。
 视频插值只用于显示，不改变 NPZ 数据。
+
+## 已有视频直接重绘
+
+在现有 LeRobot 环境、仓库根目录运行以下命令，无需加载 checkpoint 或使用 GPU：
+
+```bash
+PYTHONPATH=src python -m lerobot.scripts.replot_libero_attention \
+  --input-dir /root/autodl-tmp/eval/2601-lerobot-attention \
+  --output-dir /root/autodl-tmp/eval/2601-lerobot-attention-restyled
+```
+
+输入目录可以是整个评测目录或单个任务目录，须保留视频及同名 `.attention.npz`、
+`.attention.json`。工具递归处理视频，在新目录中保留相对路径和三个面板的排列，
+重绘全部文字与热图，原视频不变。再次运行相同命令会跳过已完成的视频。
+字体可通过上面的 `ATTENTION_FONT_PATH` 或 `--font-path /实际路径/times.ttf` 指定。
+如需更强的颜色覆盖，可加 `--alpha 0.9`。
+
+默认保留原始颜色数值上限，NPZ 原样复制，注意力概率不变；仅颜色和字体变化。
+模型输入画面来自原视频的中间面板，重新编码会带来轻微压缩差异。
+输入和输出目录须相互独立；修改重绘设置时使用新的输出目录。
+若重新运行在线评测，也请设置新的 `BASE_OUTPUT`（如 `...-attention-v2`），
+避免与旧版本的断点续测 manifest 冲突。
 
 ## 注意力定义
 
@@ -78,8 +108,9 @@ VLM 前缀每次预测只运行一次，因而不涉及多次 denoising 的聚�
 | `ATTENTION_LAYER` | `-1` | 层号从 0 开始，负数从末尾计数 |
 | `ATTENTION_CAMERA` | `0` | 模型图像顺序中的索引；通常 0 外部相机，1 手腕相机，JSON 保存实际 key |
 | `ATTENTION_DENOISE` | `mean` | `mean`、`first`、`last`；VLM 前缀只有一次 |
-| `ATTENTION_ALPHA` | `0.55` | 叠加透明度，0 到 1 |
+| `ATTENTION_ALPHA` | `0.82` | 颜色覆盖强度，0 到 1，越大颜色越明显 |
 | `ATTENTION_VMAX` | `0` | 0 按当前预测的最大值显示；正值固定颜色上限 |
+| `ATTENTION_FONT_PATH` | 自动查找 | Times New Roman 字体文件路径；缺少字体时立即报错 |
 | `BASE_OUTPUT` | `/root/autodl-tmp/eval/2601-lerobot-attention` | 独立输出根目录 |
 
 例如观察 VLM prompts 与手腕相机：

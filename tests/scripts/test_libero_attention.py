@@ -12,7 +12,10 @@ import torch
 from lerobot.scripts import lerobot_eval
 from lerobot.scripts.libero_attention import install_attention_evaluation, require_saved_attention_videos
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-from tests.policies.pi0_pi05.test_pi05_attention_visualization import make_policy_and_batch
+from tests.policies.pi0_pi05.test_pi05_attention_visualization import (
+    _test_font,  # noqa: F401
+    make_policy_and_batch,
+)
 from tests.policies.pi0_pi05.test_pi05_prompt import (
     _restore_matmul_precision,  # noqa: F401
     _tiny_real_pi05,  # noqa: F401
@@ -109,6 +112,20 @@ def test_actual_eval_saves_success_failure_videos_and_resumable_raw_maps(tmp_pat
         assert meta["camera_feature"] == "observation.images.image"
         assert meta["resolved_layer_zero_based"] == 1
     require_saved_attention_videos(metrics)
+    from lerobot.scripts.replot_libero_attention import replot_video
+
+    original = Path(metrics["video_paths"][0])
+    restyled = tmp_path / "restyled" / original.name
+    assert replot_video(original, restyled) == "5 frames"
+    assert (
+        original.with_suffix(".attention.npz").read_bytes()
+        == restyled.with_suffix(".attention.npz").read_bytes()
+    )
+    with av.open(str(restyled)) as reader:
+        assert len(list(reader.decode(video=0))) == 5
+    assert replot_video(original, restyled) == "already done"
+    with pytest.raises(ValueError, match="Different output"):
+        replot_video(original, restyled, alpha=0.9)
     Path(metrics["video_paths"][0]).with_suffix(".attention.npz").unlink()
     with pytest.raises(RuntimeError, match="Missing saved attention artifact"):
         require_saved_attention_videos(metrics)

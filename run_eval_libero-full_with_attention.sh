@@ -16,8 +16,12 @@ Attention overrides:
   ATTENTION_LAYER=-1           zero-based layer; negative values count from end
   ATTENTION_CAMERA=0           index in policy image order (0=main, 1=wrist normally)
   ATTENTION_DENOISE=mean       mean | first | last (VLM prefix runs only once)
-  ATTENTION_ALPHA=0.55         overlay opacity in [0,1]
+  ATTENTION_ALPHA=0.82         overlay opacity in [0,1]
   ATTENTION_VMAX=0             0=per-prediction relative; >0=fixed probability scale
+  ATTENTION_FONT_PATH=...      optional path to Times New Roman .ttf (auto-detected)
+
+Overlay: blue/purple low attention, bright red/yellow high attention.
+All labels use Times New Roman. Missing fonts cause an explicit error.
 
 All 10 episodes/task are saved, including failures. Each video shows live view,
 the exact policy input frame, and its heatmap. Queued actions hold the source

@@ -11,7 +11,10 @@ from __future__ import annotations
 import copy
 import math
 import os
+import subprocess
 from dataclasses import asdict, dataclass
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -24,8 +27,9 @@ class AttentionVideoConfig:
     layer: int = -1
     camera: int = 0
     denoise: str = "mean"
-    alpha: float = 0.55
+    alpha: float = 0.82
     vmax: float = 0.0  # zero: relative to the maximum in this prediction's map
+    font_path: str | None = None
 
     def __post_init__(self):
         if self.source not in {"action", "vlm_prompt"}:
@@ -46,9 +50,54 @@ class AttentionVideoConfig:
             layer=int(os.environ.get("ATTENTION_LAYER", "-1")),
             camera=int(os.environ.get("ATTENTION_CAMERA", "0")),
             denoise=os.environ.get("ATTENTION_DENOISE", "mean"),
-            alpha=float(os.environ.get("ATTENTION_ALPHA", "0.55")),
+            alpha=float(os.environ.get("ATTENTION_ALPHA", "0.82")),
             vmax=float(os.environ.get("ATTENTION_VMAX", "0")),
+            font_path=os.environ.get("ATTENTION_FONT_PATH") or None,
         )
+
+
+@lru_cache(maxsize=8)
+def load_attention_font(font_path=None, size=14):
+    """Resolve actual Times New Roman; never silently substitute another family."""
+    candidates = [str(Path(font_path).expanduser())] if font_path else []
+    if not font_path:
+        try:
+            matched = subprocess.run(
+                ["fc-match", "-f", "%{file}", "Times New Roman"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            ).stdout.strip()
+            if matched:
+                candidates.append(matched)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        candidates.extend(
+            [
+                "Times New Roman.ttf",
+                "times.ttf",
+                "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+                "/usr/share/fonts/truetype/msttcorefonts/times.ttf",
+                "/usr/local/share/fonts/times.ttf",
+                str(Path.home() / ".local/share/fonts/times.ttf"),
+                "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                "/Library/Fonts/Microsoft/Times New Roman.ttf",
+                str(Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/times.ttf"),
+            ]
+        )
+    for candidate in candidates:
+        try:
+            font = ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+        family = "".join(character.lower() for character in font.getname()[0] if character.isalnum())
+        if family.startswith("timesnewroman"):
+            return font
+    raise ValueError(
+        "Times New Roman was not found. Install it or set ATTENTION_FONT_PATH=/absolute/path/times.ttf "
+        "(replot CLI: --font-path=/absolute/path/times.ttf). Other fonts are not substituted."
+    )
 
 
 @torch.no_grad()
@@ -86,22 +135,30 @@ def _diagnostic_attention(module, query, key, value, attention_mask, **kwargs):
     return module._pi05_attention_original_backend(module, query, key, value, attention_mask, **kwargs)
 
 
-def overlay_attention(rgb, patch_map, alpha=0.55, vmax=0.0):
-    """Red/orange overlay; zero stays transparent and uniform maps stay uniform."""
+def overlay_attention(rgb, patch_map, alpha=0.82, vmax=0.0):
+    """Blue/purple low values, bright red/yellow high values; preserve spatial order."""
     patch_map = np.asarray(patch_map, dtype=np.float32)
     if not np.isfinite(patch_map).all() or (patch_map < 0).any():
         raise ValueError("Attention map must contain finite non-negative probabilities")
     maximum = float(vmax or patch_map.max())
-    if maximum <= 0:
-        return rgb.copy()
-    intensity = np.clip(patch_map / maximum, 0, 1)
+    intensity = np.clip(patch_map / maximum, 0, 1) if maximum > 0 else np.zeros_like(patch_map)
     heat = np.asarray(
         Image.fromarray(intensity).resize((rgb.shape[1], rgb.shape[0]), Image.Resampling.BILINEAR)
     )
-    # A monotone warm palette; opacity also increases with attention.
-    color = np.stack([255 - 90 * heat, 215 * (1 - heat), 120 * (1 - heat)], axis=-1)
-    opacity = (alpha * heat)[..., None]
-    return np.clip(rgb * (1 - opacity) + color * opacity, 0, 255).astype(np.uint8)
+    stops = [0.0, 0.25, 0.50, 0.72, 0.90, 1.0]
+    palette = np.array(
+        [
+            [36, 18, 100],
+            [45, 55, 160],
+            [145, 28, 150],
+            [248, 40, 40],
+            [255, 155, 15],
+            [255, 255, 65],
+        ]
+    )
+    color = np.stack([np.interp(heat, stops, channel) for channel in palette.T], axis=-1)
+    # Uniform opacity makes the blue/purple background visible as well as peaks.
+    return np.clip(rgb * (1 - alpha) + color * alpha, 0, 255).astype(np.uint8)
 
 
 class PI05AttentionRecorder:
@@ -111,6 +168,7 @@ class PI05AttentionRecorder:
         self.eval_policy = policy
         self.policy = policy.get_base_model() if hasattr(policy, "get_base_model") else policy
         self.config = config
+        self.font = None
         self._restore = []
         self.reset_episode()
 
@@ -139,6 +197,7 @@ class PI05AttentionRecorder:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         from transformers.models.gemma.modeling_gemma import eager_attention_forward
 
+        self.font = load_attention_font(self.config.font_path)
         policy = self.policy
         if getattr(policy, "name", None) != "pi05":
             raise ValueError("Attention videos currently support PI0.5 only")
@@ -272,6 +331,9 @@ class PI05AttentionRecorder:
     def metadata(self):
         return {
             **asdict(self.config),
+            "font_family": self.font.getname()[0],
+            "resolved_font_path": str(self.font.path),
+            "colormap": "blue_purple_red_yellow",
             "camera_feature": self.camera_feature,
             "resolved_layer_zero_based": self.layer,
             "query_tokens": "executed action-token prefix"
@@ -292,41 +354,49 @@ class PI05AttentionRecorder:
     def render_frames(self, frames):
         if len(frames) != 1:
             raise ValueError("Attention rendering requires a single environment")
-        side, header = 256, 24
-        canvas = Image.new("RGB", (side * 3, 320), "white")
-        draw = ImageDraw.Draw(canvas)
-        try:
-            font = ImageFont.truetype("DejaVuSans.ttf", 12)
-        except OSError:
-            font = ImageFont.load_default()
-        live = Image.fromarray(frames[0]).resize((side, side), Image.Resampling.BILINEAR)
-        canvas.paste(live, (0, header))
-        for column, title in enumerate(
-            ("Live environment", "Policy input (source frame)", "Attention overlay")
-        ):
-            draw.text((column * side + 8, 5), title, fill="#282828", font=font)
-        if self.latest_map is None:
-            draw.text((side + 12, 130), "Waiting for first prediction", fill="#666666", font=font)
-        else:
-            overlay = overlay_attention(self.image, self.latest_map, self.config.alpha, self.config.vmax)
-            for column, rgb in ((1, self.image), (2, overlay)):
-                canvas.paste(
-                    Image.fromarray(rgb).resize((side, side), Image.Resampling.BILINEAR),
-                    (column * side, header),
-                )
-            mass = float(self.latest_map.sum())
-            maximum = self.config.vmax or float(self.latest_map.max())
-            draw.text(
-                (8, 284),
-                f"{self.config.source} -> image | layer {self.layer} | camera {self.config.camera} | image mass {mass:.3f}",
-                fill="#333333",
-                font=font,
+        return render_attention_frame(
+            frames[0],
+            self.image,
+            self.latest_map,
+            self.config,
+            self.font,
+            self.layer,
+            self.step,
+            self.prediction_step,
+        )[None]
+
+
+def render_attention_frame(live_frame, source_image, patch_map, config, font, layer, step, prediction_step):
+    """Shared layout for online videos and offline restyling of saved recordings."""
+    side, header = 256, 24
+    canvas = Image.new("RGB", (side * 3, 320), "white")
+    draw = ImageDraw.Draw(canvas)
+    live = Image.fromarray(live_frame).resize((side, side), Image.Resampling.BILINEAR)
+    canvas.paste(live, (0, header))
+    for column, title in enumerate(("Live environment", "Policy input (source frame)", "Attention overlay")):
+        draw.text((column * side + 8, 5), title, fill="#282828", font=font)
+    if patch_map is None:
+        draw.text((side + 12, 130), "Waiting for first prediction", fill="#666666", font=font)
+    else:
+        overlay = overlay_attention(source_image, patch_map, config.alpha, config.vmax)
+        for column, rgb in ((1, source_image), (2, overlay)):
+            canvas.paste(
+                Image.fromarray(rgb).resize((side, side), Image.Resampling.BILINEAR),
+                (column * side, header),
             )
-            scale = "fixed" if self.config.vmax else "relative"
-            draw.text(
-                (8, 301),
-                f"Input step {self.prediction_step}; queued-action age {self.step - self.prediction_step} | {scale} color range 0..{maximum:.4g}",
-                fill="#555555",
-                font=font,
-            )
-        return np.asarray(canvas)[None]
+        mass = float(patch_map.sum())
+        maximum = config.vmax or float(patch_map.max())
+        draw.text(
+            (8, 284),
+            f"{config.source} -> image | layer {layer} | camera {config.camera} | image mass {mass:.3f}",
+            fill="#333333",
+            font=font,
+        )
+        scale = "fixed" if config.vmax else "relative"
+        draw.text(
+            (8, 301),
+            f"Input step {prediction_step}; queued-action age {step - prediction_step} | {scale} color range 0..{maximum:.4g}",
+            fill="#555555",
+            font=font,
+        )
+    return np.asarray(canvas)

@@ -5,12 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import ImageFont
 from transformers.models.gemma.modeling_gemma import eager_attention_forward
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.pi05.attention_visualization import (
     AttentionVideoConfig,
     PI05AttentionRecorder,
+    load_attention_font,
     overlay_attention,
     selected_attention,
 )
@@ -21,6 +23,26 @@ from tests.policies.pi0_pi05.test_pi05_prompt import (
     _restore_matmul_precision,  # noqa: F401
     _tiny_real_pi05,  # noqa: F401
 )
+
+
+@pytest.fixture(autouse=True)
+def _test_font(monkeypatch):
+    # Model/video tests do not require a proprietary font in CI. The production
+    # resolver is checked separately and never substitutes this test font.
+    font = ImageFont.truetype("DejaVuSerif.ttf", 14)
+    for module in (
+        "lerobot.policies.pi05.attention_visualization",
+        "lerobot.scripts.libero_attention",
+        "lerobot.scripts.replot_libero_attention",
+    ):
+        monkeypatch.setattr(f"{module}.load_attention_font", lambda *_args, **_kwargs: font)
+
+
+def test_font_resolver_rejects_missing_files_and_other_families():
+    with pytest.raises(ValueError, match="Times New Roman"):
+        load_attention_font("/missing/times.ttf")
+    with pytest.raises(ValueError, match="Times New Roman"):
+        load_attention_font(ImageFont.truetype("DejaVuSerif.ttf", 14).path)
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
@@ -48,9 +70,11 @@ def test_overlay_preserves_patch_orientation_and_does_not_invent_zero_hotspots()
     rgb = np.full((16, 16, 3), 128, dtype=np.uint8)
     patches = np.array([[0, 1], [0, 0]], dtype=np.float32)
     overlay = overlay_attention(rgb, patches, alpha=1)
-    np.testing.assert_array_equal(overlay[0, 0], rgb[0, 0])
-    assert overlay[0, -1, 0] > overlay[0, -1, 1]  # top-right patch stays top-right
-    np.testing.assert_array_equal(overlay_attention(rgb, patches * 0), rgb)
+    assert overlay[0, 0, 2] > overlay[0, 0, 0]  # low values have a blue/purple background
+    assert min(overlay[0, -1, :2]) > 240 and overlay[0, -1, 2] < 100  # peak stays top-right, bright yellow
+    zero = overlay_attention(rgb, patches * 0)
+    np.testing.assert_array_equal(zero[0, 0], zero[-1, -1])
+    assert zero[0, 0, 2] > zero[0, 0, 0]
     uniform = overlay_attention(rgb, np.ones((2, 2)))
     np.testing.assert_array_equal(uniform[0, 0], uniform[-1, -1])
 
