@@ -3,6 +3,7 @@
 `piper` 分支从 `prompt-ablation` 的 `51a94e697ae4a3a59b6996c484c68a3137c6594a`
 创建，保留完整的配置、模型、注意力、处理器和 CABO 实现。根目录
 `deploy_piper_vlaa.py` 使用此版本 PI05 的 flow 推理，支持双 prompt 和 prompt 消融配置。
+`deploy_piper_wyn.py` 是兼容入口，转发到同一实现；两者的参数和源码选择完全一致。
 
 之前的 `lerobot.processor.core` 导入错误和 `num_vlm_prompt_tokens` 缺失说明部署机混用了
 不同版本源码。入口现在优先加载旁边的 `src/`，并核对配置来源及必要字段。不要继续向旧版
@@ -98,6 +99,29 @@ May-pick-and-place/3-move_the_tennis_from_yellow_plate_to_blue_plate/meta/info.j
 离线 tokenizer 必须已在本机缓存。如果 checkpoint 记录的是训练服务器上的绝对路径，
 为下列命令补充 `--tokenizer_path /本机实际存在的/paligemma-tokenizer目录`。
 `HF_HUB_OFFLINE=1` 不会补齐缺失的文件或修复源码版本。
+
+### 脚本在新目录，却仍加载 lerobot-main
+
+如果 traceback 中脚本位于 `lerobot-piper`，但 `configs/policies.py` 来自
+`lerobot-main/src/lerobot/`，说明运行的入口仍加载旧安装路径。
+`num_vlm_prompt_tokens`、`training_stage`、`cabo_*` 等字段因此会被旧配置类拒绝；
+不要从 checkpoint 的 `config.json` 删除这些字段。
+
+若曾把旧脚本复制或重命名为 `deploy_piper_wyn.py`，首次拉取兼容入口前先备份这个
+未跟踪文件，避免 Git 拒绝覆盖。以下命令只移动未被 Git 跟踪的同名文件：
+
+```bash
+cd /home/drx/DJC/lerobot-piper
+if [ -f deploy_piper_wyn.py ] && ! git ls-files --error-unmatch deploy_piper_wyn.py >/dev/null 2>&1; then
+  mv -n deploy_piper_wyn.py "deploy_piper_wyn.py.bak-$(date +%Y%m%d-%H%M%S)"
+fi
+git pull --ff-only origin piper
+python deploy_piper_wyn.py --check_env
+```
+
+应显示 `/home/drx/DJC/lerobot-piper/src/lerobot/policies/pi05/configuration_pi05.py`
+并输出 `ENV_OK`，随后可继续使用原来的 `python deploy_piper_wyn.py ...` 命令。
+该入口会自行选择本仓库源码，无需通过重装依赖来更改导入路径。
 
 ## 4. 不连接硬件的完整推理
 
