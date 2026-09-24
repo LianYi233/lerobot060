@@ -144,3 +144,10 @@ OUTPUT_ROOT=/root/autodl-tmp/chkpt/pi05-real-smoke \
 ```
 
 短测完成后用独立输出目录启动正式配置；短测不代表机器人任务成功率。
+
+## Piper 真机测试
+
+`piper` 分支基于 `prompt-ablation`，提供根目录部署入口 `deploy_piper_vlaa.py`。
+训练后复制完整 `pretrained_model/`、对应任务的 `meta/info.json` 和本机 tokenizer，
+按 [Piper 部署说明](../piper/README.md) 检查环境并运行。部署使用训练时保存的处理器和归一化统计，
+不要把旧版 PI05 模型或配置文件覆盖到该分支。

@@ -27,6 +27,9 @@
 
 ## Quick Start
 
+**`piper` 分支真机部署：** 使用 [Piper 部署说明](examples/piper/README.md) 和根目录的
+`deploy_piper_vlaa.py`。此分支基于 `prompt-ablation`，需要使用本仓库源码和原部署机的自定义 Piper 驱动。
+
 LeRobot can be installed directly from PyPI.
 
 ```bash
