@@ -13,6 +13,13 @@ import threading
 import time
 from copy import deepcopy
 
+from piper_camera_check import (
+    NamedCameraPipeline,
+    PiperCameraError,
+    color_stream_config,
+    validate_camera_serials,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -295,6 +302,7 @@ class GuardedPiperMixin:
             raise RuntimeError("Piper 已连接")
         # Refuse WARNING/PASSIVE/OFF before opening cameras or enabling any motor.
         require_healthy_can(read_can_link(self.config.can_port))
+        validate_camera_serials(self.config.camera_serials)
         import pyrealsense2 as rs
         from piper_sdk import C_PiperInterface_V2
 
@@ -305,14 +313,16 @@ class GuardedPiperMixin:
             self._sdk.ConnectPort(piper_init=False)
             self._guard.wait_ready()
             for name, serial in self.config.camera_serials.items():
-                pipeline = rs.pipeline()
+                pipeline = NamedCameraPipeline(rs.pipeline(), name, serial)
                 self._pipelines[name] = pipeline
-                cfg = rs.config()
-                cfg.enable_device(serial)
-                cfg.enable_stream(
-                    rs.stream.color, self.config.image_width, self.config.image_height, rs.format.bgr8, 30
-                )
+                cfg = color_stream_config(rs, serial, self.config.image_width, self.config.image_height)
                 pipeline.start(cfg)
+            # start() alone does not prove frames arrive. Verify with all streams running,
+            # before this session sends any arm/gripper enable command.
+            for pipeline in self._pipelines.values():
+                pipeline.wait_for_frames()
+                print(f"CAMERA_READY: name={pipeline.name}, serial={pipeline.serial}", flush=True)
+                self._guard.check(require_enabled=False)
             deadline = time.monotonic() + 5.0
             while True:
                 feedback = self._guard.check(require_enabled=False)
@@ -332,7 +342,10 @@ class GuardedPiperMixin:
 
     def get_observation(self):
         self._guard.check()
-        observation = super().get_observation()
+        try:
+            observation = super().get_observation()
+        except PiperCameraError as exc:
+            self._guard.fail(str(exc))
         self._guard.check()
         return observation
 

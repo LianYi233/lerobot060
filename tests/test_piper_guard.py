@@ -275,6 +275,92 @@ class GuardTests(unittest.TestCase):
         sdk.GripperCtrl.assert_not_called()
         self.assertEqual(sdk.transport.frames, [])
 
+    def test_camera_first_frame_failure_never_enables_arm_or_gripper(self):
+        sdk = FakeSDK()
+        for i in range(1, 7):
+            getattr(sdk.messages["motors"], f"motor_{i}").foc_status.driver_enable_status = False
+        robot = robot_for(sdk)
+        robot._guard.uninstall()
+        robot._connected = False
+        pipeline = Mock()
+        pipeline.wait_for_frames.side_effect = RuntimeError("Frame didn't arrive within 5000")
+        rs = Namespace(
+            pipeline=Mock(return_value=pipeline),
+            config=Mock(),
+            stream=Namespace(color=1),
+            format=Namespace(bgr8=2),
+        )
+        with (
+            patch.dict(
+                sys.modules, {"piper_sdk": Namespace(C_PiperInterface_V2=lambda _: sdk), "pyrealsense2": rs}
+            ),
+            self.assertRaisesRegex(guard_module.PiperCameraError, "name=top, serial=123"),
+        ):
+            robot.connect()
+        sdk.EnableArm.assert_not_called()
+        sdk.GripperCtrl.assert_not_called()
+        sdk.DisableArm.assert_not_called()
+        pipeline.stop.assert_called_once()
+        sdk.DisconnectPort.assert_called_once()
+        self.assertFalse(robot._connected)
+
+    def test_camera_runtime_failure_latches_future_actions(self):
+        class OriginalDriver:
+            def get_observation(self):
+                raise guard_module.PiperCameraError("name=cam_wrist, serial=456: timeout")
+
+        class Deployment(GuardedPiperMixin, OriginalDriver):
+            pass
+
+        sdk = FakeSDK()
+        robot = Deployment()
+        robot._guard = PiperGuard(sdk, "can0")
+        with self.assertRaisesRegex(PiperFaultError, "cam_wrist"):
+            robot.get_observation()
+        with self.assertRaisesRegex(PiperFaultError, "cam_wrist"):
+            sdk.transport.SendCanMessage(0x151, bytes(8))
+        self.assertEqual(sdk.transport.frames, [])
+        robot._guard.shutdown()
+
+    def test_enable_waits_for_color_frames_from_both_cameras(self):
+        sdk = FakeSDK()
+        for i in range(1, 7):
+            getattr(sdk.messages["motors"], f"motor_{i}").foc_status.driver_enable_status = False
+        robot = robot_for(sdk)
+        robot._guard.uninstall()
+        robot._connected = False
+        robot.config.camera_serials = {"high": "123", "wrist": "456"}
+        first, second = Mock(), Mock()
+
+        def enable(_):
+            first.wait_for_frames.assert_called_once_with(5000)
+            second.wait_for_frames.assert_called_once_with(5000)
+            for i in range(1, 7):
+                getattr(sdk.messages["motors"], f"motor_{i}").foc_status.driver_enable_status = True
+
+        sdk.EnableArm.side_effect = enable
+        rs = Namespace(
+            pipeline=Mock(side_effect=[first, second]),
+            config=Mock(),
+            stream=Namespace(color=1),
+            format=Namespace(bgr8=2),
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {"piper_sdk": Namespace(C_PiperInterface_V2=lambda _: sdk), "pyrealsense2": rs},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            try:
+                robot.connect()
+                self.assertTrue(robot._connected)
+                sdk.EnableArm.assert_called_once_with(7)
+            finally:
+                robot.disconnect()
+        first.stop.assert_called_once()
+        second.stop.assert_called_once()
+
 
 class ActualSDKTests(unittest.TestCase):
     """Use real SDK serialization, but never construct an SDK or open a CAN bus."""

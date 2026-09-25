@@ -163,7 +163,48 @@ CAN 接线与接头、终端配置、USB-CAN 连接。不得靠忽略故障、�
 计数，需比较时间上相邻的输出；`bus-off=0` 不等于总线正常。内核的 UVC 错误属于
 相机控制请求，单独这一条不能证明 USB-CAN 掉线。
 
-硬件问题排除、只读检查通过且现场已准备好后，才能开始动作测试：
+### 相机取帧超时的独立诊断
+
+`Frame didn't arrive within 5000` 表示 RealSense 在 5000ms 内没有提供帧。
+`pipeline.start()` 成功并不保证能收到图像，`ROBOT_READ_OK` 也不检查相机。
+退出部署、RealSense Viewer、录制及其他使用相机的进程后，在当前环境运行：
+
+```bash
+python piper_camera_check.py --list
+python piper_camera_check.py --mode single
+python piper_camera_check.py --mode together --idle_seconds 10
+```
+
+这些命令只操作 RealSense，不加载模型、不导入 Piper SDK、不打开 CAN。
+`--list` 应显示部署需要的两台相机，包含序列号、固件和 USB 类型。
+不指定 `--camera_serials` 时会检查所有枚举设备；即使检查通过，也不能证明缺失的相机已连接，
+更不能自动确认 `cam_high`/`cam_wrist` 与训练视角对应。要核对部署的精确配置，传入相同的
+`--camera_serials '{"cam_high":"实际序列号","cam_wrist":"实际序列号"}'`。
+默认测试 color BGR8、640×480、30fps，与原驱动默认配置相同；自定义分辨率时传
+`--width`、`--height`。相机 30fps 与动作控制 10Hz 是不同参数。
+
+`single` 每次仅启动一台相机，各读取 60 帧；`together` 同时启动所选相机。
+`--idle_seconds 10` 在每台相机首帧通过后暂停取帧 10 秒，再读取 60 帧，用于模拟等待 Enter。
+相机失败会打印名称、序列号和原始错误，释放全部已打开的相机并返回非零退出码。
+仅在测试通过时打印 `CAMERA_CHECK_OK`；该结果不证明后续长时间运行稳定。
+
+如果单台测试失败，检查对应设备是否被占用、连接线/USB 端口、相机配置及 UVC 日志；
+如果单台都通过而同时测试失败，重点排查共享 USB 控制器、供电及带宽。
+这些只是排查方向，不能仅凭一次超时确定原因。可附上：
+
+```bash
+lsusb -t
+sudo journalctl -k -b --since "10 minutes ago" --no-pager \
+  | rg -i 'uvc|realsense|usb.*(disconnect|reset|error|fail)'
+```
+
+部署适配层现会在所有相机启动后、发送使能命令前验证各自的 color 首帧，打印 `CAMERA_READY`。
+后续取帧失败仍会停止本次部署并锁定动作；不会用旧图或空图继续推理，也不会自动复位相机。
+这项修改用于提前发现并定位错误，不代表已经修复现场 USB 或相机故障。
+若本地只保留完整的 `deploy_piper_wyn.py`，仍可使用原入口，但需同时更新
+`piper_deploy_guard.py` 和新增的 `piper_camera_check.py`。
+
+硬件问题排除、通信和相机检查通过且现场已准备好后，才能开始动作测试：
 
 ```bash
 HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
@@ -175,7 +216,7 @@ HF_HUB_OFFLINE=1 python deploy_piper_vlaa.py \
   --steps_per_episode 1000
 ```
 
-连接时先核对 CAN 和反馈，再启动相机，最后进行初始使能；夹爪以反馈的当前开度使能。
+连接时先核对 CAN 和反馈，再启动相机并验证 color 首帧，最后进行初始使能；夹爪以反馈的当前开度使能。
 每轮按 Enter 开始，轮次间自行重置任务场景。未实现自动回初始位或成功率判定。
 原驱动将 `MOVE J` 速度写死为 100%；部署现在使用 `--motion_speed`（1..100，默认 20）。
 这不是动作 Hz，也不是碰撞保护：降低此值会改变关节跟踪和任务表现，比较成功率时应记录
