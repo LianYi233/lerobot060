@@ -58,6 +58,47 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python eval_piper_offline.py \
 默认先按 episode 内 `frame_index % stride == 0` 选择候选，再按时间顺序均匀选取至多
 `max_samples` 个观测。实际 episode/frame/index 全部写入结果，未自动挑选低误差样本。
 
+## 本地机器一次生成四个任务的对比图
+
+```bash
+cd /home/drx/DJC/lerobot-piper
+git pull --ff-only origin piper
+bash examples/piper/eval_four_tasks.sh
+```
+
+默认按任务 1 → 2 → 3 → 4 顺序评估，每个任务最多评估 256 个观测，均匀选取 6 个观测
+绘图（样本充足时共 24 张）。不会按误差大小筛图。每张图仍表示某个录制观测时刻开始的
+动作预测窗口，不是完整 episode 的闭环轨迹。评估样本不足时，图片数以实际样本数为限。
+
+脚本内置本次提供的路径，任务 3 不添加 `012000` 子目录：
+
+| 项目 | 默认路径 |
+| --- | --- |
+| 数据集父目录 | `/media/drx/a1ea95d8-943f-4c65-b4a3-05f5927573b7/dataset/May-pick-and-place` |
+| 任务 1、2、3 模型父目录 | `/media/drx/a1ea95d8-943f-4c65-b4a3-05f5927573b7/Wu_Yinan/Priming` |
+| 任务 1、2 模型相对路径 | `pi05-may-<任务目录名>-full_reference-seed0/012000/pretrained_model` |
+| 任务 3 模型相对路径 | `pi05-may-3-move_the_tennis_from_yellow_plate_to_blue_plate-full_reference-seed0/pretrained_model` |
+| 任务 4 模型 | `/home/drx/Downloads/wyn/pi05-may-4-pick_the_red_cube_into_the_yellow_plate-full_reference-seed0/012000/pretrained_model` |
+| Tokenizer | `/home/drx/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c` |
+
+输出在仓库的 `outputs/piper-offline/four-tasks-<时间戳>/<任务目录名>/`，包含 PNG、CSV、
+NPZ 和 summary.json；每个任务的运行日志在时间戳目录下的 `<任务目录名>.log`。
+启动前会检查所有选中任务的基础文件路径，详细权重和元数据校验由评估器执行。
+
+```bash
+# 仅打印四个命令；不检查本机文件、不加载模型。
+bash examples/piper/eval_four_tasks.sh --dry_run
+
+# 每个任务 10 张图，共最多 40 张；评估样本数仍为 256。
+PLOTS_PER_TASK=10 bash examples/piper/eval_four_tasks.sh
+
+# 只跑任务 3；输出位置可自行指定（不得已有同名任务结果目录）。
+PIPER_OUTPUT_ROOT=/home/drx/piper-eval-task3 bash examples/piper/eval_four_tasks.sh 3
+```
+
+`PIPER_POLICY_1` 至 `PIPER_POLICY_4` 可分别覆盖模型路径；`PIPER_DATASET_BASE`、
+`PIPER_MODEL_BASE`、`PIPER_TOKENIZER_PATH` 可覆盖基础目录。更多采样参数见脚本 `--help`。
+
 ## 输出及含义
 
 | 文件 | 内容 |
@@ -66,7 +107,10 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python eval_piper_offline.py \
 | `metrics.csv` | 各关节/夹爪的 MAE、RMSE、有符号偏差、95% 绝对误差分位数和最大误差 |
 | `actions.csv` | 每个有效 anchor/offset 对应的预测、标签、保位基线及精确帧编号 |
 | `predictions.npz` | 完整 `[N,H,7]` 预测/标签、有效掩码、基线、任务文本和索引，可自行重画 |
-| `episode_*_frame_*.png` | 选中观测的相机 RGB，以及 7 个动作维度随预测时间的对比曲线 |
+| `episode_*_frame_*.png` | 选中观测的相机 RGB，以及 7 个动作维度的 `teleoperation` / `action from model` 对比曲线 |
+
+图中黑线 `teleoperation` 是数据集记录的 action 标签，蓝线 `action from model` 是模型
+反归一化后的预测。图中只显示这两条曲线；保位基线仍保留在数值结果中。
 
 终端直接打印前 1 步、实际执行的前 8 步和完整 chunk 的关节 MAE（度），
 以及夹爪 MAE（数据集原始单位），并列显示 `hold_current_state` 基线。

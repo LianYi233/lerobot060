@@ -171,7 +171,7 @@ def write_results(output, arrays, names, summary):
     )
 
 
-def plot_sample(output, item, predicted, target, valid, hold, names, cameras, fps):
+def plot_sample(output, item, predicted, target, valid, names, cameras, fps):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -188,14 +188,15 @@ def plot_sample(output, item, predicted, target, valid, hold, names, cameras, fp
     for d, name in enumerate(names):
         ax = fig.add_subplot(grid[d + 1, :])
         scale = 180 / math.pi if name.startswith("joint_") else 1
-        ax.plot(seconds, target[valid, d] * scale, label="Recorded action", color="#252525", linewidth=1.8)
-        ax.plot(seconds, predicted[valid, d] * scale, label="PI05 prediction", color="#1261A0", linewidth=1.5)
-        ax.plot(seconds, hold[valid, d] * scale, label="Hold current state", color="#888888", linestyle=":")
+        ax.plot(seconds, target[valid, d] * scale, label="teleoperation", color="#252525", linewidth=1.8)
+        ax.plot(
+            seconds, predicted[valid, d] * scale, label="action from model", color="#1261A0", linewidth=1.5
+        )
         label = name.replace("joint_", "J").removesuffix(".pos")
         ax.set_ylabel(label + " (deg)" if scale != 1 else "Gripper\n(dataset unit)")
         ax.grid(alpha=0.2)
         if d == 0:
-            ax.legend(loc="best", ncol=3)
+            ax.legend(loc="best", ncol=2)
         if d == 6:
             ax.set_xlabel("Seconds after recorded observation (offset 0 = current action label)")
         else:
@@ -235,7 +236,7 @@ def evaluate(dataset, indices, predict, features, output, *, chunk_size, executi
             values[key].append(int(scalar(item[key])))
         values["task"].append(item["task"])
         if position in plot_positions:
-            plot_sample(output, item, prediction, target, valid, hold, names, cameras, dataset.fps)
+            plot_sample(output, item, prediction, target, valid, names, cameras, dataset.fps)
         if (position + 1) % 10 == 0 or position + 1 == len(indices):
             print(f"Offline samples: {position + 1}/{len(indices)}", flush=True)
     arrays = {key: np.asarray(value) for key, value in values.items()}
