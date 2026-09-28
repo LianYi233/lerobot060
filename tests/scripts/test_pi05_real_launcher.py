@@ -16,6 +16,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples/training/train_pi05_real.sh"
 AUTODL = ROOT / "examples/training/train_piper_autodl.sh"
+FIT = ROOT / "examples/training/train_piper_fit.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -50,6 +51,8 @@ class RealLauncherTest(unittest.TestCase):
             "KEEP_PRETRAIN_CHECKPOINT",
             "BATCH_SIZE",
             "RUN_NAME",
+            "FIT_EPISODES",
+            "COMPILE_MODEL",
         ):
             self.env.pop(name, None)
         for filename in (
@@ -106,7 +109,7 @@ class RealLauncherTest(unittest.TestCase):
             check=False,
         )
 
-    def run_autodl(self, *args, **env):
+    def run_autodl(self, *args, script=AUTODL, **env):
         auto_env = dict(self.env, RUN_GROUP="retrain-test")
         for name in (
             "GPU_IDS",
@@ -120,7 +123,7 @@ class RealLauncherTest(unittest.TestCase):
         ):
             auto_env.pop(name, None)
         return subprocess.run(
-            ["bash", str(AUTODL), *args],
+            ["bash", str(script), *args],
             env=dict(auto_env, **env),
             capture_output=True,
             text=True,
@@ -281,6 +284,64 @@ class RealLauncherTest(unittest.TestCase):
         self.assertNotIn("--multi_gpu", command)
         output = next(arg for arg in command if arg.startswith("--output_dir="))
         self.assertIn(str(self.work / "custom output"), output)
+
+    def test_fit_profiles_preserve_data_and_change_explicit_training_controls(self):
+        for profile, lr, cabo, projections in (
+            ("reference", "0.000025", "true", "false"),
+            ("prompt_lr", "0.0001", "true", "false"),
+            ("no_cabo", "0.0001", "false", "false"),
+            ("projections", "0.0001", "false", "true"),
+        ):
+            with self.subTest(profile=profile):
+                (command,) = self.command_args(self.run_autodl("4", profile, "0", script=FIT))
+                for arg in (
+                    "--steps=2000",
+                    "--save_steps=[2000]",
+                    "--dataset.episodes=[0]",
+                    "--dataset.image_transforms.enable=false",
+                    "--log_freq=50",
+                    "--policy.compile_model=false",
+                    "--policy.chunk_size=50",
+                    "--policy.n_action_steps=8",
+                    "--policy.next_action_pretrain_steps=1000",
+                    "--policy.next_action_bridge_steps=250",
+                    f"--policy.optimizer_lr={lr}",
+                    f"--policy.cabo_enabled={cabo}",
+                    f"--policy.train_action_projections={projections}",
+                ):
+                    self.assertIn(arg, command)
+        self.assertFalse((self.work / "chkpt").exists())
+
+    def test_fit_full_data_schedule_multi_gpu_and_default_profile(self):
+        (command,) = self.command_args(
+            self.run_autodl(
+                "4",
+                script=FIT,
+                FIT_EPISODES="all",
+                FLOW_STEPS="12000",
+                SAVE_STEPS="[6000,9000,12000]",
+                GPU_IDS="0,1",
+                OUTPUT_ROOT=str(self.work / "custom fit output"),
+            )
+        )
+        for arg in (
+            "--steps=12000",
+            "--save_steps=[6000,9000,12000]",
+            "--num_processes=2",
+            "--multi_gpu",
+            "--policy.train_action_projections=true",
+            "--policy.cabo_enabled=false",
+        ):
+            self.assertIn(arg, command)
+        self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+        output = next(arg for arg in command if arg.startswith("--output_dir="))
+        self.assertIn(str(self.work / "custom fit output"), output)
+
+    def test_unknown_fit_profile_fails_before_launch(self):
+        result = self.run_autodl("4", "unknown", script=FIT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown profile", result.stderr)
+        self.assertNotIn("Launching:", result.stdout)
 
     def test_autodl_invalid_settings_fail_before_launch(self):
         for env in (

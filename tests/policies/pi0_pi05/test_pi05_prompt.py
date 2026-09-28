@@ -189,6 +189,70 @@ def test_invalid_prompt_initialization_is_rejected(value):
         _config(prompt_init_std=value)
 
 
+def test_projection_adaptation_rejects_prompt_only_cabo_and_peft():
+    with pytest.raises(ValueError, match="train_action_projections"):
+        _config(train_action_projections=True)
+    with pytest.raises(ValueError, match="train_action_projections"):
+        _config(train_action_projections=True, cabo_enabled=False, use_peft=True)
+    policy = PI05Policy(_config(train_action_projections=True, cabo_enabled=False))
+    with pytest.raises(ValueError, match="full checkpoints"):
+        policy.wrap_with_peft()
+
+
+@pytest.mark.parametrize("phase", ["action_only", "bridge", "flow"])
+def test_projection_adaptation_updates_only_prompts_and_action_maps(phase, monkeypatch, tmp_path):
+    cfg = _config(
+        training_stage="flow" if phase == "flow" else "next_action",
+        next_action_bridge_steps=1,
+        train_action_projections=True,
+        cabo_enabled=False,
+    )
+    policy = PI05Policy(cfg)
+    policy.requires_grad_(True)
+    policy.eval().train()
+    policy.set_training_progress(step=2 if phase == "bridge" else 0, total_steps=3)
+    projection_keys = {
+        f"model.{module}.{suffix}"
+        for module in ("action_in_proj", "action_out_proj")
+        for suffix in ("weight", "bias")
+    }
+    expected = _PROMPT_KEYS | projection_keys
+    assert {name for name, p in policy.named_parameters() if p.requires_grad} == expected
+    before = {name: value.clone() for name, value in policy.state_dict().items()}
+    optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=0.01, weight_decay=0)
+    assert {id(p) for group in optimizer.param_groups for p in group["params"]} == {
+        id(p) for p in policy.parameters() if p.requires_grad
+    }
+    inputs = _inputs()
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _: (inputs["images"], inputs["img_masks"]))
+    batch = {
+        ACTION: _actions(),
+        "action_is_pad": torch.zeros(2, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: inputs["tokens"],
+        OBS_LANGUAGE_ATTENTION_MASK: inputs["masks"],
+    }
+    loss, _ = policy(batch)
+    loss.backward()
+    for name, parameter in policy.named_parameters():
+        if name in projection_keys:
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        elif name not in expected:
+            assert parameter.grad is None, name
+    optimizer.step()
+    after = policy.state_dict()
+    for name in projection_keys:
+        assert not torch.equal(before[name], after[name]), name
+    for name in before.keys() - expected:
+        torch.testing.assert_close(before[name], after[name], rtol=0, atol=0, msg=name)
+    # Full checkpoints preserve the adapted maps exactly, without new tensor keys.
+    assert set(before) == set(after)
+    directory = tmp_path / "checkpoint"
+    _save_checkpoint(directory, policy)
+    reloaded = PI05Policy.from_pretrained(directory, config=cfg, strict=True)
+    for name in projection_keys:
+        torch.testing.assert_close(reloaded.state_dict()[name], after[name], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("num_vlm_prompts", [0, _VLM_PROMPTS])
 @pytest.mark.parametrize("num_prompts", [0, _PROMPTS])
 def test_prompt_and_action_attention_blocks(num_vlm_prompts, num_prompts):

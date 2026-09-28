@@ -50,13 +50,17 @@ class PI05Config(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
     tokenizer_name: str = "google/paligemma-3b-pt-224"
 
-    # Only these two prompt banks train; the complete VLM and action path stay frozen.
+    # By default only these two prompt banks train; both backbones stay frozen.
     # VLM prompts follow the observation/language prefix, using the VLM embedding width.
     num_vlm_prompt_tokens: int = 16
     # Expert prompts precede action tokens, using the action expert embedding width.
     # Either bank can be disabled for an ablation with CABO disabled. Both may be 0 for inference only.
     num_prompt_tokens: int = 16
     prompt_init_std: float = 0.02
+    # Opt-in embodiment adaptation: also train the existing action input/output linear maps.
+    # This changes the prompt-only parameter budget and requires CABO/PEFT to be disabled.
+    # It adds no checkpoint tensors and never unfreezes the VLM or action transformer.
+    train_action_projections: bool = False
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
@@ -132,8 +136,8 @@ class PI05Config(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
-    # Legacy finetuning flags retained for checkpoint/CLI compatibility. PI05 always freezes the
-    # complete VLM, action expert, and projections; only the two prompt banks can train.
+    # Legacy finetuning flags retained for checkpoint/CLI compatibility. Both backbones remain
+    # frozen; train_action_projections is the explicit opt-in for the two action linear maps.
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
 
@@ -183,6 +187,11 @@ class PI05Config(PreTrainedConfig):
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
+        if self.train_action_projections and (self.cabo_enabled or self.use_peft):
+            raise ValueError(
+                "train_action_projections requires cabo_enabled=False and use_peft=False. "
+                "It is an explicit embodiment-adaptation experiment outside prompt-only CABO/PEFT."
+            )
 
         for name in ("num_vlm_prompt_tokens", "num_prompt_tokens"):
             value = getattr(self, name)
@@ -287,7 +296,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def next_action_pretraining_active(self) -> bool:
-        """Whether a flow-training invocation should first run prompt-only Stage 1."""
+        """Whether a flow-training invocation should first run the configured Stage 1."""
         return self.training_stage == "flow" and self.next_action_pretrain_steps > 0
 
     def validate_features(self) -> None:

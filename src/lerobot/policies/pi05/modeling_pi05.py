@@ -797,17 +797,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_vlm(self) -> None:
-        """Compatibility entry point for enforcing prompt-only training after adapter loading."""
+        """Compatibility entry point for enforcing the configured trainable partition."""
         self._freeze_backbones()
 
     def _freeze_backbones(self) -> None:
-        """Freeze every parameter except the active VLM/expert prompt embeddings.
+        """Freeze backbones, preserving active prompts and opt-in action projections.
 
         Preserve PEFT's active modules_to_save selection: its original prompt copies must stay
         frozen. Autograd remains enabled through both backbones to reach the input prompts.
         """
-        prompt_ids = set()
-        for module in (self.vlm_prompt_tokens, self.prompt_tokens):
+        trainable_ids = set()
+        trainable_modules = [self.vlm_prompt_tokens, self.prompt_tokens]
+        if getattr(self.config, "train_action_projections", False):
+            trainable_modules.extend([self.action_in_proj, self.action_out_proj])
+        for module in trainable_modules:
             modules_to_save = getattr(module, "modules_to_save", None)
             if modules_to_save is None:
                 active_modules = [module]
@@ -819,14 +822,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     for name in module.active_adapters
                     if name in modules_to_save and not module.disable_adapters
                 ]
-            prompt_ids.update(
+            trainable_ids.update(
                 id(parameter)
                 for active_module in active_modules
                 for parameter in active_module.parameters()
                 if parameter.requires_grad and parameter.numel() > 0
             )
         for parameter in self.parameters():
-            if id(parameter) not in prompt_ids:
+            if id(parameter) not in trainable_ids:
                 parameter.requires_grad_(False)
                 parameter.grad = None
         self.paligemma_with_expert.paligemma.eval()
@@ -1715,7 +1718,7 @@ class PI05Policy(PreTrainedPolicy):
         if not PI05Policy._is_cabo_active(self):
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
-                raise ValueError("PI05 training requires at least one non-empty trainable prompt bank")
+                raise ValueError("PI05 training requires trainable prompts or explicit action projections")
             return parameters
         vlm_parameters, action_parameters = self._cabo_parameter_groups()
         return [
@@ -2275,6 +2278,8 @@ class PI05Policy(PreTrainedPolicy):
         peft_config.modules_to_save = modules_to_save
 
     def wrap_with_peft(self, peft_config=None, peft_cli_overrides: dict | None = None):
+        if getattr(self.config, "train_action_projections", False):
+            raise ValueError("train_action_projections requires full checkpoints, not prompt-only PEFT saves")
         policy = super().wrap_with_peft(peft_config, peft_cli_overrides)
         # Freeze custom backbone/projection adapters as well; only active prompt copies train.
         self.model._freeze_vlm()

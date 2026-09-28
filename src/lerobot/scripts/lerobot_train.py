@@ -65,6 +65,7 @@ from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.training_diagnostics import TrainingDiagnostics
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -798,7 +799,7 @@ def _train_single_stage(
 
     # TRAINABLE_PARAMETER_REPORT_V1
     if is_main_process:
-        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "other": 0}
+        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "action_projection": 0, "other": 0}
         logging.info("========== Trainable parameter report ==========")
         logging.info("Training stage: %s", getattr(cfg.policy, "training_stage", "unknown"))
         for _name, _parameter in policy.named_parameters():
@@ -809,6 +810,8 @@ def _train_single_stage(
                 _category = "vlm_prompt"
             elif "prompt_tokens" in _name.split("."):
                 _category = "action_prompt"
+            elif any(part in _name.split(".") for part in ("action_in_proj", "action_out_proj")):
+                _category = "action_projection"
             else:
                 _category = "other"
             _parameter_counts[_category] += _count
@@ -957,6 +960,22 @@ def _train_single_stage(
 
     policy.train()
 
+    pi05_diagnostics_enabled = not cfg.is_reward_model_training and active_cfg.type == "pi05"
+    diagnostics = None
+    if is_main_process and pi05_diagnostics_enabled:
+        diagnostics = TrainingDiagnostics(
+            Path(cfg.output_dir) / "training_diagnostics.jsonl",
+            {
+                "training_stage": str(active_cfg.training_stage),
+                "train_action_projections": getattr(active_cfg, "train_action_projections", False),
+                "trainable_parameters": num_learnable_params,
+                "action_names": dataset.meta.features["action"].get("names"),
+                "num_processes": accelerator.num_processes,
+                "policy_metrics_scope": "rank0 per-update values; train.loss uses existing DDP reductions",
+            },
+        )
+        logging.info("Local PI05 diagnostics: %s", diagnostics.path)
+
     ntk_snapshots = getattr(cfg.policy, "ntk_save_stage_snapshots", False)
     _save_pi05_ntk_initial_snapshot(
         cfg, policy, optimizer, lr_scheduler, preprocessor, postprocessor, accelerator, step
@@ -1039,7 +1058,11 @@ def _train_single_stage(
         if is_main_process:
             progbar.update(1)
         train_tracker.step()
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        if diagnostics is not None:
+            diagnostics.update(output_dict)
+        is_log_step = (cfg.log_freq > 0 and step % cfg.log_freq == 0) or (
+            pi05_diagnostics_enabled and step == cfg.steps
+        )
         is_saving_step = cfg.should_save_checkpoint(step)
         if ntk_snapshots and step == pi05_stage1_bridge_start_step:
             # `step` counts completed updates: 750 here is after priming, before bridge update 1.
@@ -1057,6 +1080,8 @@ def _train_single_stage(
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
+                if diagnostics is not None:
+                    diagnostics.write(step, train_tracker.to_dict())
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:

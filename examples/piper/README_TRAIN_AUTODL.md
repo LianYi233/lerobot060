@@ -4,6 +4,9 @@
 `May-pick-and-place` 的 LeRobot v3.0 数据。新增的 `train_piper_autodl.sh` 复用此入口，
 集中设置 AutoDL 路径和本次重训参数。训练只使用离线数据，不连接机械臂或相机。
 
+抓取失败、loss 停滞或需要检查小样本拟合时，见
+[训练诊断与可选动作映射训练](README_TRAIN_DIAGNOSIS.md)。该入口不会改变本文的默认方法。
+
 ## 1. 获取代码和准备环境
 
 在 AutoDL 现有仓库中切换到 `piper`（如有未提交修改，先自行提交或暂存）：
