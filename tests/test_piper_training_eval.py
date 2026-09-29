@@ -80,7 +80,9 @@ class FakeDataset:
         self.image_transforms = object()
         self.meta = SimpleNamespace(
             features={
-                key: {"names": MODULE.PIPER_NAMES, "shape": [7]} for key in ("action", "observation.state")
+                # DatasetInfo converts JSON lists to tuples before evaluation sees them.
+                key: {"names": MODULE.PIPER_NAMES.copy(), "shape": (7,)}
+                for key in ("action", "observation.state")
             },
             episodes={
                 2: {"dataset_from_index": offset + 10, "dataset_to_index": offset + 13},
@@ -167,6 +169,44 @@ class ActionMetricTests(unittest.TestCase):
         features["action"]["names"] = None
         with self.assertRaisesRegex(ValueError, "explicitly named"):
             MODULE.piper_names(features)
+
+    def test_json_and_loaded_shapes_preserve_independent_coordinate_orders(self):
+        action_names = MODULE.PIPER_NAMES[::-1]
+        state_names = MODULE.PIPER_NAMES[2:] + MODULE.PIPER_NAMES[:2]
+        for action_shape in ([7], (7,)):
+            for state_shape in ([7], (7,)):
+                with self.subTest(action_shape=action_shape, state_shape=state_shape):
+                    features = {
+                        "action": {"shape": action_shape, "names": action_names.copy()},
+                        "observation.state": {"shape": state_shape, "names": state_names.copy()},
+                    }
+                    names, states = MODULE.piper_names(features)
+                    self.assertEqual(names, action_names)
+                    self.assertEqual(states, state_names)
+                    self.assertEqual(features["action"]["shape"], action_shape)
+                    self.assertEqual(features["observation.state"]["shape"], state_shape)
+
+    def test_schema_errors_identify_shape_or_names_without_guessing_coordinates(self):
+        for key in ("action", "observation.state"):
+            for shape in (None, 7, "7", [], [6], (8,), (1, 7), (7, 1)):
+                with self.subTest(key=key, shape=shape):
+                    features = FakeDataset().meta.features
+                    features[key]["shape"] = shape
+                    with self.assertRaisesRegex(ValueError, rf"{key}\.shape"):
+                        MODULE.piper_names(features)
+            for names in (
+                None,
+                [],
+                MODULE.PIPER_NAMES[:-1],
+                MODULE.PIPER_NAMES[:-1] + ["joint_1.pos"],
+                MODULE.PIPER_NAMES[:-1] + ["unknown"],
+                MODULE.PIPER_NAMES[:-1] + [None],
+            ):
+                with self.subTest(key=key, names=names):
+                    features = FakeDataset().meta.features
+                    features[key]["names"] = names
+                    with self.assertRaisesRegex(ValueError, rf"{key}\.names"):
+                        MODULE.piper_names(features)
 
     def test_rank_zero_callback_errors_are_not_swallowed(self):
         accelerator = SimpleNamespace(

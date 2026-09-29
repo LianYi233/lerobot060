@@ -25,9 +25,20 @@ def piper_names(features):
     result = {}
     for key in ("action", "observation.state"):
         feature = features[key]
+        shape = feature.get("shape")
+        # Raw info.json uses [7]; DatasetInfo.__post_init__ converts it to (7,).
+        if not isinstance(shape, (list, tuple)) or tuple(shape) != (7,):
+            raise ValueError(f"piper_eval requires {key}.shape to be [7] or (7,), got {shape!r}")
         names = feature.get("names")
-        if feature.get("shape") != [7] or not isinstance(names, list) or sorted(names) != sorted(PIPER_NAMES):
-            raise ValueError(f"piper_eval requires seven explicitly named Piper coordinates in {key}")
+        if (
+            not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+            or sorted(names) != sorted(PIPER_NAMES)
+        ):
+            raise ValueError(
+                f"piper_eval requires seven explicitly named Piper coordinates in {key}.names; "
+                f"expected each of {PIPER_NAMES!r} exactly once, got {names!r}"
+            )
         result[key] = names
     return result["action"], result["observation.state"]
 

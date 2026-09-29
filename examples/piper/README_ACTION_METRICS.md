@@ -31,6 +31,29 @@ WANDB_MODE=offline RUN_GROUP=piper-fit-task4-metrics-offline \
 网络恢复后对日志目录中的 `wandb/offline-run-*` 执行 `wandb sync <目录>`。
 `WANDB_ENABLE=false` 则完全不初始化 W&B，本地 JSONL 指标仍保留。
 
+### 元信息形状报错与双卡重跑
+
+早期评估器把 `action.shape` 硬编码比较为列表 `[7]`，但数据集加载器会将它转换成
+元组 `(7,)`，导致合法数据被误报为 `requires seven explicitly named Piper coordinates`。
+现已兼容两种形状表示，并分别报告形状和名称错误；无需修改数据集 `meta/info.json`。
+名称仍必须包含六个 `joint_N.pos` 和 `gripper.pos`，各一次，保持原有顺序。
+
+`train_piper_fit.sh` 会继承当前 shell 已导出的变量。若此前设置过 12,000 步或输出根目录，
+仅更换 `RUN_GROUP` 不一定会改变实际输出目录。以下在卡 2、3 上明确使用单 episode、
+2,000 步 flow 和新目录；修改路径以适配当前机器：
+
+```bash
+GPU_IDS=2,3 NUM_PROCESSES=2 BATCH_SIZE=4 \
+FIT_EPISODES='[0]' EVAL_SPLIT=0 FLOW_STEPS=2000 SAVE_STEPS='[2000]' \
+RUN_GROUP=piper-fit-task4-projections-gpu23-fix01 \
+OUTPUT_ROOT=/data1/wyn/chkpt/2601-lerobot/piper-fit-task4-projections-gpu23-fix01 \
+LOG_ROOT=/data1/wyn/logs/piper-fit-task4-projections-gpu23-fix01 \
+DRY_RUN=false bash examples/training/train_piper_fit.sh 4 projections 0
+```
+
+沿用已有的 `DATASET_BASE`、`PRETRAINED_PATH` 和 `TOKENIZER_PATH`。
+启动输出应包含 `GPUs=2,3 processes=2`；每卡 batch 为 4，总 batch 为 8。
+
 ## 记录的指标
 
 这里的动作评估做完整的 flow 去噪推理，输入只有当前双相机图像、当前 state 和 task。
