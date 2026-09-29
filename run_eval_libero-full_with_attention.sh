@@ -15,10 +15,13 @@ Attention overrides:
   ATTENTION_SOURCE=action      action | vlm_prompt (requires VLM prompts)
   ATTENTION_LAYER=-1           zero-based layer; negative values count from end
   ATTENTION_CAMERA=0           index in policy image order (0=main, 1=wrist normally)
+  ATTENTION_CAMERAS=0,1        optional two-camera grid; overrides ATTENTION_CAMERA
+  ATTENTION_SNAPSHOT_EVERY=0   with two cameras, save PNGs every N predictions; 0=off
   ATTENTION_DENOISE=mean       mean | first | last (VLM prefix runs only once)
   ATTENTION_ALPHA=0.82         overlay opacity in [0,1]
   ATTENTION_VMAX=0             0=per-prediction relative; >0=fixed probability scale
   ATTENTION_FONT_PATH=...      optional path to Times New Roman .ttf (auto-detected)
+  EPISODES_PER_TASK=10         positive episode count per task; suite name also accepted as MODE
 
 Overlay: blue/purple low attention, bright red/yellow high attention.
 All labels use Times New Roman. Missing fonts cause an explicit error.

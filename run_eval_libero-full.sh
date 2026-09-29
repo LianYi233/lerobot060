@@ -4,7 +4,7 @@ set -e
 # Usage: bash eval_libero_suites_resume.sh VARIANT [all|no10] [SEED]
 # all: four standard LIBERO suites; no10: spatial/object/goal only.
 usage() {
-  echo "Usage: $0 VARIANT [all|no10] [SEED]"
+  echo "Usage: $0 VARIANT [all|no10|libero_spatial|libero_object|libero_goal|libero_10] [SEED]"
   echo "Example: $0 direct_dual no10 0"
   echo "VARIANT: full_reference, no_bridge, direct_dual, dual_prompt_only, vlm_only, action_only, no_cabo"
   echo "Defaults: all suites, seed 0. STEPS remains configured below."
@@ -20,12 +20,17 @@ fi
 VARIANT="$1"
 MODE="${2:-all}"
 SEED="${3:-0}"
+EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}"
 case "$VARIANT" in
   full_reference|no_bridge|direct_dual|dual_prompt_only|vlm_only|action_only|no_cabo) ;;
   *) echo "Unknown model variant: $VARIANT" >&2; usage >&2; exit 2 ;;
 esac
 if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "SEED must be a non-negative integer without leading zeros" >&2
+  exit 2
+fi
+if [[ ! "$EPISODES_PER_TASK" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EPISODES_PER_TASK must be a positive integer" >&2
   exit 2
 fi
 RUN_NAME="pi05-${VARIANT}-seed${SEED}"
@@ -38,13 +43,17 @@ case "$MODE" in
     TASKS="libero_spatial,libero_object,libero_goal"
     SUITE_TAG="libero-no10"
     ;;
+  libero_spatial|libero_object|libero_goal|libero_10)
+    TASKS="$MODE"
+    SUITE_TAG="$MODE"
+    ;;
   -h|--help)
     usage
     echo "all (default): spatial, object, goal, libero_10"
     echo "no10: spatial, object, goal"
     exit 0
     ;;
-  *) echo "Unknown mode: $MODE; use all or no10" >&2; exit 2 ;;
+  *) echo "Unknown mode: $MODE; use all, no10, or a LIBERO suite name" >&2; exit 2 ;;
 esac
 # Activate your existing lerobot environment before running.
 export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
@@ -75,7 +84,7 @@ for STEP in "${STEPS[@]}"; do
     echo "model=$RUN_NAME training_seed=$SEED"
     echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     echo "MUJOCO_GL=$MUJOCO_GL"
-    echo "mode=$MODE suites=$TASKS episodes_per_task=10"
+    echo "mode=$MODE suites=$TASKS episodes_per_task=$EPISODES_PER_TASK"
     echo "policy=$CKPT"
     echo "output_dir=$OUTPUT_DIR"
     echo "log=$LOG"
@@ -97,7 +106,7 @@ for STEP in "${STEPS[@]}"; do
     --env.control_mode=relative \
     --env.max_parallel_tasks=1 \
     --eval.batch_size=1 \
-    --eval.n_episodes=10 \
+    --eval.n_episodes="$EPISODES_PER_TASK" \
     --policy.n_action_steps=10 \
     --policy.use_amp=false \
     --policy.device=cuda \

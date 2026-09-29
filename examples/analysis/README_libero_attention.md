@@ -1,5 +1,67 @@
 # LIBERO 在线评测注意力视频
 
+## VLM prompt → 双相机注意力图（vlm_only 消融）
+
+训练脚本中该消融名称为 `vlm_only`：16 个 VLM prompt、0 个 action prompt，
+无 priming/bridge，CABO 关闭，主训练 3000 steps。无需重新训练。
+
+```bash
+GPU_ID=0 \
+ATTENTION_FONT_PATH=/root/fonts/times.ttf \
+BASE_CKPT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation/pi05-vlm_only-seed0/checkpoints \
+  bash run_eval_libero_vlm_prompt_attention.sh libero_10 0
+```
+
+`BASE_CKPT` 必须指向实际 checkpoint 根目录，其下包含 `003000/pretrained_model`。
+字体路径也须改成实际 Times New Roman 文件；如果已安装并能自动发现，可省略。
+第二个参数是训练 run 的 seed，用于 checkpoint 路径；评测随机种子仍沿用原评测器设置，
+实际 episode seeds 写入 JSON。
+
+默认每 task 只跑 **1 个 episode**，便于先检查热图；这不是用户报告的 100 episodes/suite 性能复测。
+把 `libero_10` 改为 `all` 可查看四个 suite；加 `EPISODES_PER_TASK=10` 恢复每 suite 100 episodes。
+
+图与视频使用 2×2 排列：每行一个相机，左侧为产生当前动作块的输入，右侧为对应热图。
+标准 LIBERO 配置下 `camera 0 / observation.images.image` 是外部视角，
+`camera 1 / observation.images.image2` 是手腕视角；以保存的 `camera_features` 为准。
+两相机在**同一次 VLM 前向**中读取 Q/K，对所有 VLM prompt 查询、所有 head 取均值，
+默认取最后一个 VLM 层，不对不同层混合。可以用 `ATTENTION_LAYER=...` 指定其他层。
+每个相机切片之前，对全部可见 key 做 softmax；图中 camera mass 是其 patch 概率之和。
+
+两张热图**共用一个颜色上限**，默认是当前预测两相机的共同最大值。
+跨时间/不同 checkpoint 比较颜色时设置相同的正值 `ATTENTION_VMAX`；不要根据各自自动缩放的亮度比较。
+沿用蓝紫底色、红黄高亮和 Times New Roman。动作队列执行期间，两张原图和热图保持在同一预测时刻，
+不把旧注意力叠加到新的相机帧上；双相机布局没有实时环境面板。
+
+默认输出根目录 `/root/autodl-tmp/eval/2601-lerobot-vlm-prompt-two-cameras`。
+每个成功/失败 episode 均包含：
+
+- `*_TRUE_attention.mp4` 或 `*_FALSE_attention.mp4`：同步双视角视频。
+- `*.attention.npz`：`camera_maps [预测,C,Hpatch,Wpatch]`、`camera_images [预测,C,H,W,3]`、
+  `camera_indices`、`camera_attention_mass [预测,C]`、`input_steps`。相机图片是模型输入的 uint8 RGB，
+  无损保存，不从压缩视频反推；旧 `maps` 和 `image_attention_mass` 字段仍指第一个所选相机。
+- `*.attention.json`：层号、相机 feature、查询定义与归一化信息。
+- `*_attention_frames/step_000000.png` 等：每 5 次预测一张，加最后一次预测。
+  `ATTENTION_SNAPSHOT_EVERY=1` 保存每次预测，设 0 仅保存视频与 NPZ。
+- `*_attention_frames/camera_attention_mass.csv`：**全部预测**的双相机概率质量及其余 key 的剩余质量。
+
+NPZ 中保留两路 RGB 会增加磁盘占用。静态图抽帧只影响 PNG 数量，不影响原始记录。
+可在 CPU 上从同一记录重新选帧/改颜色，不需要 checkpoint 或重跑环境：
+
+```bash
+PYTHONPATH=src python -m lerobot.scripts.export_libero_prompt_attention \
+  --input /实际路径/eval_episode_0_TRUE_attention.attention.npz \
+  --output-dir /实际路径/selected_figures \
+  --steps 0,50,100 --font-path /root/fonts/times.ttf
+```
+
+`--steps` 必须是 NPZ 的实际 `input_steps`（默认每 10 个控制步预测一次）；不存在时会明确报错。
+也可 `--input` 指定目录、`--every 5` 批量导出；重复导出会更新同名 PNG/CSV。
+每次修改评测设置使用新 `BASE_OUTPUT`；双相机 PNG 使用本工具重绘，后文旧 `replot_libero_attention`
+仅适用于单相机三面板视频。
+
+该图表示单层 attention routing，不等同于梯度归因或 attention rollout，也不能单独证明高成功率的原因。
+后续比较宜固定任务、输入帧、层号及颜色尺度，并结合成功/失败轨迹；不能仅比较各策略不同轨迹的亮点。
+
 在 `prompt-ablation` 分支中，激活现有 LeRobot/LIBERO 环境后，在仓库根目录运行：
 
 ```bash

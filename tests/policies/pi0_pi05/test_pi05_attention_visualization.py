@@ -14,6 +14,7 @@ from lerobot.policies.pi05.attention_visualization import (
     PI05AttentionRecorder,
     load_attention_font,
     overlay_attention,
+    render_camera_attention_frame,
     selected_attention,
 )
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
@@ -34,6 +35,7 @@ def _test_font(monkeypatch):
         "lerobot.policies.pi05.attention_visualization",
         "lerobot.scripts.libero_attention",
         "lerobot.scripts.replot_libero_attention",
+        "lerobot.scripts.export_libero_prompt_attention",
     ):
         monkeypatch.setattr(f"{module}.load_attention_font", lambda *_args, **_kwargs: font)
 
@@ -79,7 +81,21 @@ def test_overlay_preserves_patch_orientation_and_does_not_invent_zero_hotspots()
     np.testing.assert_array_equal(uniform[0, 0], uniform[-1, -1])
 
 
-def make_policy_and_batch():
+def test_two_camera_renderer_uses_shared_probability_scale():
+    frame = render_camera_attention_frame(
+        np.zeros((2, 16, 16, 3), dtype=np.uint8),
+        np.stack([np.ones((2, 2)), np.full((2, 2), 0.01)]),
+        AttentionVideoConfig(source="vlm_prompt", cameras="0,1", alpha=1),
+        ImageFont.truetype("DejaVuSerif.ttf", 14),
+        1,
+        0,
+        0,
+    )
+    assert frame[100, 400, 0] > 240 and frame[100, 400, 1] > 240
+    assert frame[452, 400, 2] > frame[452, 400, 0]  # weaker camera stays blue, not yellow
+
+
+def make_policy_and_batch(**overrides):
     policy = PI05Policy(
         _config(
             num_inference_steps=3,
@@ -88,6 +104,7 @@ def make_policy_and_batch():
                 "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
                 "observation.images.image2": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
             },
+            **overrides,
         )
     ).eval()
     batch = {
@@ -141,6 +158,43 @@ def test_real_pi05_capture_preserves_actions_rng_weights_and_queue_alignment(sou
     assert original_configs == [layer.self_attn.config for decoder in decoders for layer in decoder.layers]
     for key, value in policy.state_dict().items():
         torch.testing.assert_close(value, weights[key], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["sdpa", "eager"])
+def test_two_camera_vlm_only_matches_independent_single_camera_captures(backend):
+    policy, batch = make_policy_and_batch(num_prompt_tokens=0, cabo_enabled=False)
+    policy.model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = backend
+    single_maps = []
+    for camera in (0, 1):
+        policy.reset()
+        torch.manual_seed(83)
+        with PI05AttentionRecorder(
+            policy, AttentionVideoConfig(source="vlm_prompt", camera=camera)
+        ) as recorder:
+            expected_action = policy.select_action(batch)
+            single_maps.append(recorder.latest_map.copy())
+    expected_rng = torch.get_rng_state()
+    policy.reset()
+    torch.manual_seed(83)
+    config = AttentionVideoConfig(source="vlm_prompt", cameras="0,1")
+    with PI05AttentionRecorder(policy, config) as recorder:
+        actual = policy.select_action(batch)
+        torch.testing.assert_close(actual, expected_action, atol=0, rtol=0)
+        assert torch.equal(torch.get_rng_state(), expected_rng)
+        np.testing.assert_array_equal(recorder.camera_maps[0], np.stack(single_maps))
+        assert recorder.counts == [1]
+        assert recorder.metadata()["camera_features"] == list(batch)[:2]
+        for camera, key in enumerate(list(batch)[:2]):
+            expected_image = (batch[key][0].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+            np.testing.assert_array_equal(recorder.camera_images[0][camera], expected_image)
+        held_images = recorder.source_images.copy()
+        policy.select_action(
+            {**batch, "observation.images.image": torch.zeros_like(batch["observation.images.image"])}
+        )
+        assert recorder.steps == [0]  # second action is queued; keep both source frames
+        np.testing.assert_array_equal(recorder.source_images, held_images)
+        assert recorder.render_frames(np.zeros((1, 16, 16, 3), dtype=np.uint8)).shape == (1, 784, 640, 3)
+    assert "embed_prefix" not in policy.model.__dict__
 
 
 def test_missing_camera_and_exception_restore_instrumentation():

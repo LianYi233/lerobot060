@@ -26,6 +26,8 @@ class AttentionVideoConfig:
     source: str = "action"
     layer: int = -1
     camera: int = 0
+    cameras: str = ""  # Optional comma-separated indices; overrides camera.
+    snapshot_every: int = 0  # Every N predictions, plus the last; 0 disables PNGs.
     denoise: str = "mean"
     alpha: float = 0.82
     vmax: float = 0.0  # zero: relative to the maximum in this prediction's map
@@ -38,10 +40,21 @@ class AttentionVideoConfig:
             raise ValueError("ATTENTION_DENOISE must be mean, first, or last")
         if self.camera < 0:
             raise ValueError("ATTENTION_CAMERA must be a non-negative camera index")
+        indices = self.camera_indices
+        if not 1 <= len(indices) <= 2 or len(set(indices)) != len(indices) or min(indices) < 0:
+            raise ValueError("ATTENTION_CAMERAS must contain one or two distinct non-negative indices")
+        if self.snapshot_every < 0 or (self.snapshot_every and len(indices) != 2):
+            raise ValueError("ATTENTION_SNAPSHOT_EVERY requires two cameras and a non-negative integer")
         if not math.isfinite(self.alpha) or not 0 <= self.alpha <= 1:
             raise ValueError("ATTENTION_ALPHA must be in [0, 1]")
         if not math.isfinite(self.vmax) or self.vmax < 0:
             raise ValueError("ATTENTION_VMAX must be finite and non-negative")
+
+    @property
+    def camera_indices(self):
+        return (
+            tuple(int(value.strip()) for value in self.cameras.split(",")) if self.cameras else (self.camera,)
+        )
 
     @classmethod
     def from_env(cls):
@@ -49,6 +62,8 @@ class AttentionVideoConfig:
             source=os.environ.get("ATTENTION_SOURCE", "action"),
             layer=int(os.environ.get("ATTENTION_LAYER", "-1")),
             camera=int(os.environ.get("ATTENTION_CAMERA", "0")),
+            cameras=os.environ.get("ATTENTION_CAMERAS", ""),
+            snapshot_every=int(os.environ.get("ATTENTION_SNAPSHOT_EVERY", "0")),
             denoise=os.environ.get("ATTENTION_DENOISE", "mean"),
             alpha=float(os.environ.get("ATTENTION_ALPHA", "0.82")),
             vmax=float(os.environ.get("ATTENTION_VMAX", "0")),
@@ -243,9 +258,10 @@ class PI05AttentionRecorder:
             self.new_prediction = False
             image_keys = [key for key in policy.config.image_features if key in batch]
             image_keys += [key for key in policy.config.image_features if key not in batch]
-            self.camera_feature = (
-                image_keys[self.config.camera] if self.config.camera < len(image_keys) else None
-            )
+            self.camera_features = [
+                image_keys[i] if i < len(image_keys) else None for i in self.config.camera_indices
+            ]
+            self.camera_feature = self.camera_features[0]
             result = original_select(batch)
             if self.new_prediction:
                 self.finish_prediction()
@@ -265,13 +281,18 @@ class PI05AttentionRecorder:
         self.steps = []
         self.counts = []
         self.rows = []
+        self.latest_camera_maps = None
+        self.source_images = None
+        self.camera_maps = []
+        self.camera_images = []
 
     def begin_prediction(self, images, img_masks, language_mask, prefix_length):
         if images[0].shape[0] != 1:
             raise ValueError("Attention videos require eval.batch_size=1")
-        index = self.config.camera
-        if index >= len(images) or not bool(img_masks[index][0]):
-            raise ValueError(f"Camera {index} is missing/padded; choose a present policy camera")
+        indices = self.config.camera_indices
+        for index in indices:
+            if index >= len(images) or not bool(img_masks[index][0]):
+                raise ValueError(f"Camera {index} is missing/padded; choose a present policy camera")
         sizes = []
         for image in images:
             height, width = image.shape[-2:]
@@ -283,16 +304,21 @@ class PI05AttentionRecorder:
         if prefix_length != expected:
             raise ValueError("Unexpected image-token layout; refusing to misalign attention and pixels")
         self.prefix_length = prefix_length
-        self.grid = sizes[index]
-        self.image_start = sum(lengths[:index])
-        self.image_stop = self.image_start + lengths[index]
+        self.grid = sizes[indices[0]]
+        if any(sizes[i] != self.grid for i in indices):
+            raise ValueError("Selected cameras must have the same policy-input patch grid")
+        self.image_ranges = [(sum(lengths[:i]), sum(lengths[: i + 1])) for i in indices]
         # These are the EXACT oriented/resized/padded pixels passed to SigLIP.
-        self.image = (
-            ((images[index][0].detach().float().cpu().permute(1, 2, 0).numpy() + 1) * 127.5)
-            .clip(0, 255)
-            .round()
-            .astype(np.uint8)
+        self.source_images = np.stack(
+            [
+                ((images[i][0].detach().float().cpu().permute(1, 2, 0).numpy() + 1) * 127.5)
+                .clip(0, 255)
+                .round()
+                .astype(np.uint8)
+                for i in indices
+            ]
         )
+        self.image = self.source_images[0]
         self.prediction_step = self.step
         self.rows = []
         self.new_prediction = True
@@ -311,7 +337,9 @@ class PI05AttentionRecorder:
         probabilities = selected_attention(query, key, mask, scaling, start, stop)
         # Softmax includes language, prompts, other cameras, and action tokens.
         # Do not renormalize on just the chosen camera.
-        self.rows.append(probabilities[0, self.image_start : self.image_stop].cpu().numpy())
+        self.rows.append(
+            np.stack([probabilities[0, start:stop].cpu().numpy() for start, stop in self.image_ranges])
+        )
 
     def finish_prediction(self):
         if not self.rows:
@@ -322,8 +350,12 @@ class PI05AttentionRecorder:
             values = self.rows[-1]
         else:
             values = np.mean(self.rows, axis=0)
-        self.latest_map = values.reshape(self.grid).copy()
+        self.latest_camera_maps = values.reshape(len(self.config.camera_indices), *self.grid).copy()
+        self.latest_map = self.latest_camera_maps[0]
         self.maps.append(self.latest_map)
+        if len(self.config.camera_indices) == 2:
+            self.camera_maps.append(self.latest_camera_maps)
+            self.camera_images.append(self.source_images.copy())
         self.steps.append(self.prediction_step)
         self.counts.append(len(self.rows))
         self.new_prediction = False
@@ -331,10 +363,14 @@ class PI05AttentionRecorder:
     def metadata(self):
         return {
             **asdict(self.config),
+            "camera": self.config.camera_indices[0],
             "font_family": self.font.getname()[0],
             "resolved_font_path": str(self.font.path),
             "colormap": "blue_purple_red_yellow",
             "camera_feature": self.camera_feature,
+            "camera_indices": list(self.config.camera_indices),
+            "camera_features": self.camera_features,
+            "layout": "two_camera_grid" if len(self.config.camera_indices) == 2 else "live_input_overlay",
             "resolved_layer_zero_based": self.layer,
             "query_tokens": "executed action-token prefix"
             if self.config.source == "action"
@@ -345,15 +381,27 @@ class PI05AttentionRecorder:
             if self.config.source == "vlm_prompt"
             else "flow denoising passes",
             "normalization": "softmax over all visible keys before camera selection",
-            "display_scale": "fixed" if self.config.vmax else "relative to prediction maximum",
+            "display_scale": "fixed"
+            if self.config.vmax
+            else "shared maximum over selected cameras per prediction",
             "pixel_alignment": "exact oriented/resized/padded policy input; no additional flip",
-            "time_alignment": "map held on its source image during queued actions; live view is separate",
+            "time_alignment": "maps held on their exact source images during queued actions",
             "interpretation": "qualitative attention routing, not segmentation, causal attribution, or proof of effectiveness",
         }
 
     def render_frames(self, frames):
         if len(frames) != 1:
             raise ValueError("Attention rendering requires a single environment")
+        if len(self.config.camera_indices) == 2:
+            return render_camera_attention_frame(
+                self.source_images,
+                self.latest_camera_maps,
+                self.config,
+                self.font,
+                self.layer,
+                self.step,
+                self.prediction_step,
+            )[None]
         return render_attention_frame(
             frames[0],
             self.image,
@@ -388,7 +436,7 @@ def render_attention_frame(live_frame, source_image, patch_map, config, font, la
         maximum = config.vmax or float(patch_map.max())
         draw.text(
             (8, 284),
-            f"{config.source} -> image | layer {layer} | camera {config.camera} | image mass {mass:.3f}",
+            f"{config.source} -> image | layer {layer} | camera {config.camera_indices[0]} | image mass {mass:.3f}",
             fill="#333333",
             font=font,
         )
@@ -399,4 +447,50 @@ def render_attention_frame(live_frame, source_image, patch_map, config, font, la
             fill="#555555",
             font=font,
         )
+    return np.asarray(canvas)
+
+
+def render_camera_attention_frame(source_images, patch_maps, config, font, layer, step, prediction_step):
+    """Two synchronized camera rows with one shared probability scale; no live-frame misalignment."""
+    side, row_height, footer_height = 320, 352, 80
+    canvas = Image.new("RGB", (2 * side, 2 * row_height + footer_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    for row, camera in enumerate(config.camera_indices):
+        draw.text((8, row * row_height + 5), f"Camera {camera} | policy input", fill="#282828", font=font)
+        draw.text(
+            (side + 8, row * row_height + 5),
+            "Prompt attention" if config.source == "vlm_prompt" else "Action attention",
+            fill="#282828",
+            font=font,
+        )
+    if patch_maps is None:
+        draw.text((12, 150), "Waiting for first prediction", fill="#666666", font=font)
+        return np.asarray(canvas)
+    maximum = config.vmax or float(np.max(patch_maps))
+    for row, (rgb, patch_map) in enumerate(zip(source_images, patch_maps, strict=True)):
+        # If both maps are zero, the overlay uses the uniform low-value color.
+        overlay = overlay_attention(rgb, patch_map, config.alpha, maximum)
+        for col, pixels in enumerate((rgb, overlay)):
+            canvas.paste(
+                Image.fromarray(pixels).resize((side, side), Image.Resampling.BILINEAR),
+                (col * side, row * row_height + 24),
+            )
+    footer = 2 * row_height
+    draw.text(
+        (8, footer + 2),
+        f"{config.source} -> image | layer {layer} | input step {prediction_step} | age {step - prediction_step}",
+        fill="#333333",
+        font=font,
+    )
+    masses = " | ".join(
+        f"camera {i} mass {float(m.sum()):.4f}"
+        for i, m in zip(config.camera_indices, patch_maps, strict=True)
+    )
+    draw.text((8, footer + 20), masses, fill="#333333", font=font)
+    scale = "fixed" if config.vmax else "shared per prediction"
+    draw.text((8, footer + 38), f"Patch probability: 0 to {maximum:.4g} ({scale})", fill="#555555", font=font)
+    bar = overlay_attention(
+        np.zeros((10, 624, 3), dtype=np.uint8), np.linspace(0, 1, 624)[None], alpha=1, vmax=1
+    )
+    canvas.paste(Image.fromarray(bar), (8, footer + 60))
     return np.asarray(canvas)

@@ -55,13 +55,16 @@ class TinyEnv(gym.Env):
         return np.full((16, 16, 3), self.step_index * 30, dtype=np.uint8)
 
 
-def test_actual_eval_saves_success_failure_videos_and_resumable_raw_maps(tmp_path, monkeypatch):
+@pytest.mark.parametrize("two_cameras", [False, True])
+def test_actual_eval_saves_success_failure_videos_and_resumable_raw_maps(tmp_path, monkeypatch, two_cameras):
     original_one, original_rollout = lerobot_eval.run_one, lerobot_eval.rollout
     monkeypatch.setattr(lerobot_eval, "run_one", original_one)
     monkeypatch.setattr(lerobot_eval, "rollout", original_rollout)
-    monkeypatch.setenv("ATTENTION_SOURCE", "action")
+    monkeypatch.setenv("ATTENTION_SOURCE", "vlm_prompt" if two_cameras else "action")
+    monkeypatch.setenv("ATTENTION_CAMERAS", "0,1" if two_cameras else "")
+    monkeypatch.setenv("ATTENTION_SNAPSHOT_EVERY", "2" if two_cameras else "0")
     manifest = install_attention_evaluation(lerobot_eval)
-    assert manifest["attention"]["source"] == "action"
+    assert json.loads(json.dumps(manifest)) == manifest  # resume manifest must round-trip
     policy, _ = make_policy_and_batch()
     env = gym.vector.SyncVectorEnv([TinyEnv])
 
@@ -103,15 +106,32 @@ def test_actual_eval_saves_success_failure_videos_and_resumable_raw_maps(tmp_pat
         with av.open(str(video)) as reader:
             frames = list(reader.decode(video=0))
             assert len(frames) == 5  # preserve existing evaluator's frame count
-            assert (frames[0].width, frames[0].height) == (768, 320)
+            assert (frames[0].width, frames[0].height) == ((640, 784) if two_cameras else (768, 320))
         with np.load(video.with_suffix(".attention.npz")) as data:
             np.testing.assert_array_equal(data["input_steps"], [0, 2, 4])
             assert data["maps"].shape == (3, 2, 2)
             np.testing.assert_allclose(data["image_attention_mass"], data["maps"].sum(axis=(1, 2)))
+            if two_cameras:
+                assert data["camera_maps"].shape == (3, 2, 2, 2)
+                assert data["camera_images"].shape == (3, 2, 16, 16, 3)
+                np.testing.assert_array_equal(data["maps"], data["camera_maps"][:, 0])
+                np.testing.assert_allclose(
+                    data["camera_attention_mass"], data["camera_maps"].sum(axis=(-2, -1))
+                )
         meta = json.loads(video.with_suffix(".attention.json").read_text())
         assert meta["camera_feature"] == "observation.images.image"
         assert meta["resolved_layer_zero_based"] == 1
+        if two_cameras:
+            figures = video.parent / f"{video.stem}_frames"
+            assert sorted(p.name for p in figures.glob("*.png")) == ["step_000000.png", "step_000004.png"]
+            assert len((figures / "camera_attention_mass.csv").read_text().splitlines()) == 4
+            (figures / "step_000000.png").unlink()  # resume restores figures without inference
     require_saved_attention_videos(metrics)
+    if two_cameras:
+        for path in metrics["video_paths"]:
+            video = Path(path)
+            assert (video.parent / f"{video.stem}_frames" / "step_000000.png").is_file()
+        return  # legacy restyling below is specific to the single-camera layout
     from lerobot.scripts.replot_libero_attention import replot_video
 
     original = Path(metrics["video_paths"][0])
