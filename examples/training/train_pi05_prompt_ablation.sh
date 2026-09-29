@@ -21,6 +21,11 @@ and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000)
 Set NTK_SAVE_STAGE_SNAPSHOTS=false to disable extra stage snapshots, or SAVE_FREQ
 to override the flow checkpoint interval. Other variants keep their existing defaults.
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
+Set VLM_PROMPT_TOKENS to a positive integer to change the active VLM prompt bank:
+  VLM_PROMPT_TOKENS=8 bash examples/training/train_pi05_prompt_ablation.sh vlm_only 0
+An explicit token count adds -vlmN to the default run name (even for N=16).
+Without this override, the original 16-token recipe and run name are preserved.
+For sequential 1/2/8/16-token runs, use train_pi05_vlm_token_sweep.sh [SEED].
 EOF
 }
 
@@ -41,7 +46,12 @@ else
 fi
 EXTRA_ARGS=("$@")
 
-VLM_PROMPT_TOKENS=16
+VLM_PROMPT_TOKENS_OVERRIDE="${VLM_PROMPT_TOKENS:-}"
+VLM_PROMPT_TOKENS="${VLM_PROMPT_TOKENS:-16}"
+if [[ ! "${VLM_PROMPT_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "VLM_PROMPT_TOKENS must be a positive integer without leading zeros" >&2
+  exit 2
+fi
 ACTION_PROMPT_TOKENS=16
 CABO_ENABLED=true
 PRETRAIN_STEPS=1000
@@ -111,7 +121,11 @@ VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 COMPILE_MODEL="${COMPILE_MODEL:-true}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 
-RUN_NAME="${RUN_NAME:-pi05-${VARIANT}-seed${SEED}}"
+DEFAULT_RUN_NAME="pi05-${VARIANT}-seed${SEED}"
+if [[ -n "${VLM_PROMPT_TOKENS_OVERRIDE}" && "${VARIANT}" != action_only ]]; then
+  DEFAULT_RUN_NAME="pi05-${VARIANT}-vlm${VLM_PROMPT_TOKENS}-seed${SEED}"
+fi
+RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
 DRY_RUN="${DRY_RUN:-false}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 LOG_FILE="${LOG_ROOT}/${RUN_NAME}.log"
