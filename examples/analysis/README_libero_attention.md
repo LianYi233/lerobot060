@@ -1,5 +1,41 @@
 # LIBERO 在线评测注意力视频
 
+## Action expert 最后一层 → 双相机注意力图（同一 vlm_only 检查点）
+
+直接查看动作预测时读取的图像位置，使用下面的独立入口。仍加载之前的 `vlm_only` 消融模型，
+只把注意力的 query 来源切换到 action expert 最后一个 Transformer 层中的**动作 token**。
+
+```bash
+GPU_ID=0 \
+ATTENTION_FONT_PATH=/root/fonts/times.ttf \
+BASE_CKPT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation/pi05-vlm_only-seed0/checkpoints \
+  bash run_eval_libero_action_attention.sh libero_10 0
+```
+
+路径按实际情况修改。无需重新训练，但需要重新运行推理；已有 VLM prompt 视频/NPZ 没有保存
+action expert 的 Q/K，不能离线转换为 action 注意力。
+默认输出到 `/root/autodl-tmp/eval/2601-lerobot-action-two-cameras`，与 prompt 图分开。
+`libero_10` 可换成 `all` 或其他单个 suite；默认每任务 1 episode，`EPISODES_PER_TASK=10` 可恢复标准评测。
+
+计算定义：最后一个 action-expert 层，取动作块中即将执行的前 `n_action_steps` 个动作 token
+（当前启动器设为 10），对所有 head 求均值，默认再对全部 flow denoising passes 求均值。
+K 来自该层实际使用的视觉/语言前缀缓存及动作侧 token；softmax 包含全部可见 key，随后提取两个相机。
+这里不需要 action prompt；`vlm_only` 虽然没有 action prompt，仍有冻结的 action expert 生成动作。
+
+**最后一层**由 `ATTENTION_LAYER=-1` 指定；**最后一次去噪**由 `ATTENTION_DENOISE=last` 指定，两者独立。
+如果希望检查平均多个去噪步骤是否掩盖了差异，可保留最后一层并只看最后一次去噪：
+
+```bash
+GPU_ID=0 ATTENTION_DENOISE=last \
+BASE_OUTPUT=/root/autodl-tmp/eval/2601-lerobot-action-two-cameras-denoise-last \
+  bash run_eval_libero_action_attention.sh libero_10 0
+```
+
+第二条命令也沿用或显式传入上面的实际 `BASE_CKPT`、`ATTENTION_FONT_PATH`。
+两视角同一次预测、同一色标、2×2 布局，PNG/视频/NPZ/CSV 格式及离线 PNG 导出工具与下文相同。
+注意力分散可能与查询/head/去噪聚合或表示已混合上下文有关；仅凭热图不集中不能认定没有利用图像，
+切到 action 侧也不保证一定出现清晰的物体轮廓。
+
 ## VLM prompt → 双相机注意力图（vlm_only 消融）
 
 训练脚本中该消融名称为 `vlm_only`：16 个 VLM prompt、0 个 action prompt，

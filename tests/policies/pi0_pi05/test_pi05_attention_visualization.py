@@ -161,28 +161,35 @@ def test_real_pi05_capture_preserves_actions_rng_weights_and_queue_alignment(sou
 
 
 @pytest.mark.parametrize("backend", ["sdpa", "eager"])
-def test_two_camera_vlm_only_matches_independent_single_camera_captures(backend):
+@pytest.mark.parametrize("source,denoise", [("vlm_prompt", "mean"), ("action", "mean"), ("action", "last")])
+def test_two_camera_vlm_only_matches_independent_single_camera_captures(backend, source, denoise):
     policy, batch = make_policy_and_batch(num_prompt_tokens=0, cabo_enabled=False)
-    policy.model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = backend
+    composite = policy.model.paligemma_with_expert
+    decoder = composite.gemma_expert.model if source == "action" else composite.paligemma.model.language_model
+    decoder.config._attn_implementation = backend
     single_maps = []
     for camera in (0, 1):
         policy.reset()
         torch.manual_seed(83)
         with PI05AttentionRecorder(
-            policy, AttentionVideoConfig(source="vlm_prompt", camera=camera)
+            policy, AttentionVideoConfig(source=source, camera=camera, denoise=denoise)
         ) as recorder:
             expected_action = policy.select_action(batch)
             single_maps.append(recorder.latest_map.copy())
     expected_rng = torch.get_rng_state()
     policy.reset()
     torch.manual_seed(83)
-    config = AttentionVideoConfig(source="vlm_prompt", cameras="0,1")
+    config = AttentionVideoConfig(source=source, cameras="0,1", denoise=denoise)
     with PI05AttentionRecorder(policy, config) as recorder:
         actual = policy.select_action(batch)
         torch.testing.assert_close(actual, expected_action, atol=0, rtol=0)
         assert torch.equal(torch.get_rng_state(), expected_rng)
         np.testing.assert_array_equal(recorder.camera_maps[0], np.stack(single_maps))
-        assert recorder.counts == [1]
+        assert recorder.counts == ([policy.config.num_inference_steps] if source == "action" else [1])
+        assert recorder.layer == len(decoder.layers) - 1
+        if source == "action":
+            assert recorder.metadata()["query_tokens"] == "executed action-token prefix"
+            assert recorder.metadata()["action_query_count"] == policy.config.n_action_steps
         assert recorder.metadata()["camera_features"] == list(batch)[:2]
         for camera, key in enumerate(list(batch)[:2]):
             expected_image = (batch[key][0].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
