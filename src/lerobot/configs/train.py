@@ -32,6 +32,7 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
+from .piper import PiperEvalConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
@@ -109,6 +110,7 @@ class TrainPipelineConfig(HubMixin):
     eval_steps: int = 0
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
+    piper_eval: PiperEvalConfig = field(default_factory=PiperEvalConfig)
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -222,6 +224,7 @@ class TrainPipelineConfig(HubMixin):
 
     def validate(self) -> None:
         self.validate_checkpoint_schedule()
+        self.piper_eval.validate()
         self._resolve_pretrained_from_cli()
 
         if self.policy is None and self.reward_model is None:
@@ -236,6 +239,16 @@ class TrainPipelineConfig(HubMixin):
                 "`rename_map` requires a pretrained policy checkpoint. "
                 "Fresh initialization derives feature names from the current dataset, so no rename is applied."
             )
+
+        if self.piper_eval.enabled:
+            if self.is_reward_model_training or active_cfg.type != "pi05" or self.dataset.streaming:
+                raise ValueError("piper_eval requires PI05 and a non-streaming Piper dataset")
+            if self.rename_map or active_cfg.use_peft or self.peft is not None:
+                raise ValueError(
+                    "piper_eval currently requires native PI05 without PEFT or observation renames"
+                )
+            if self.piper_eval.execution_steps > active_cfg.chunk_size:
+                raise ValueError("piper_eval.execution_steps must not exceed policy.chunk_size")
 
         if not self.job_name:
             if self.env is None:

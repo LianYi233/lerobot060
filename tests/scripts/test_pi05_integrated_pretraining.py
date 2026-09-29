@@ -84,8 +84,13 @@ def _make_flow_config(tmp_path: Path, **policy_kwargs) -> TrainPipelineConfig:
 
 
 @pytest.mark.parametrize("cabo_enabled", [False, True])
-def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_path, cabo_enabled):
+@pytest.mark.parametrize("wandb_enabled", [False, True])
+def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(
+    tmp_path, cabo_enabled, wandb_enabled
+):
     cfg = _make_flow_config(tmp_path, cabo_enabled=cabo_enabled, cabo_prompt_update_ratio=1.5)
+    cfg.wandb.enable = wandb_enabled
+    cfg.wandb.run_id = "formal-stage-run"
     cfg.validate()
 
     pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
@@ -116,7 +121,9 @@ def test_integrated_pretraining_config_is_isolated_and_uses_fixed_recipe(tmp_pat
     assert pretrain_cfg.save_freq == 1_000
     assert not pretrain_cfg.save_checkpoint_to_hub
     assert not pretrain_cfg.policy.push_to_hub
-    assert not pretrain_cfg.wandb.enable
+    assert pretrain_cfg.wandb.enable == cfg.wandb.enable
+    assert pretrain_cfg.wandb.run_id is None
+    assert cfg.wandb.run_id == "formal-stage-run"
     assert pretrain_cfg.env is None
     assert pretrain_cfg.env_eval_freq == 0
     assert pretrain_cfg.sample_weighting is None

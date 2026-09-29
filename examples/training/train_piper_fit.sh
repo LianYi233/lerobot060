@@ -25,6 +25,8 @@ DRY_RUN=true checks paths/metadata and prints commands, without using a GPU.
 RUN_GROUP defaults to a unique timestamp plus profile; keep separate output groups.
 Do not pass --resume here. Use the base checkpoint for matched comparisons.
 Evaluate the same training episode(s) with eval_piper_offline.py after fitting.
+W&B and periodic recorded-action metrics are enabled as in train_piper_autodl.sh.
+Keep EVAL_SPLIT=0 for a one-episode fit; use a split only with multiple episodes.
 EOF
   exit 0
 fi

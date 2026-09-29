@@ -6,6 +6,9 @@
 
 抓取失败、loss 停滞或需要检查小样本拟合时，见
 [训练诊断与可选动作映射训练](README_TRAIN_DIAGNOSIS.md)。该入口不会改变本文的默认方法。
+训练期间的 W&B、动作预测误差和参数更新量配置见
+[动作指标说明](README_ACTION_METRICS.md)。首次在线运行需执行 `wandb login`，
+离线运行可设置 `WANDB_MODE=offline`。
 
 ## 1. 获取代码和准备环境
 
@@ -111,7 +114,9 @@ COMPILE_MODEL=false NUM_WORKERS=0 \
 | 部署默认执行段 | `N_ACTION_STEPS=8`，每次预测后仅执行前 8 步再读取观测 |
 | 归一化 / 视频 | 数据集自身 `QUANTILES` / `pyav` |
 | compile / gradient checkpointing | `true` / `true` |
-| NTK 额外快照 / W&B | 默认关闭 |
+| NTK 额外快照 | 默认关闭 |
+| W&B | 默认开启，项目 `piper-action-fit`；不上传模型 artifact |
+| 固定观测动作评估 | 每 500 步，每个划分 16 个观测；开始、阶段边界和结束也记录 |
 
 `N_ACTION_STEPS=8` 只控制 checkpoint 的部署默认执行长度，不把训练目标从 50 步改为
 8 步；若需复现原来执行 50 步的配置，可显式设置 `N_ACTION_STEPS=50`。

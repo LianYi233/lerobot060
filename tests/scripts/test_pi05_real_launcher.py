@@ -120,6 +120,13 @@ class RealLauncherTest(unittest.TestCase):
             "NTK_SAVE_STAGE_SNAPSHOTS",
             "WANDB_ENABLE",
             "NUM_WORKERS",
+            "WANDB_PROJECT",
+            "WANDB_MODE",
+            "ACTION_EVAL_FREQ",
+            "ACTION_EVAL_SAMPLES",
+            "ACTION_EVAL_SEED",
+            "ACTION_UPDATE_FREQ",
+            "EVAL_SPLIT",
         ):
             auto_env.pop(name, None)
         return subprocess.run(
@@ -241,7 +248,15 @@ class RealLauncherTest(unittest.TestCase):
                 "--policy.n_action_steps=8",
                 "--policy.next_action_masked_steps=40",
                 "--policy.ntk_save_stage_snapshots=false",
-                "--wandb.enable=false",
+                "--wandb.enable=true",
+                "--wandb.project=piper-action-fit",
+                "--wandb.mode=online",
+                "--wandb.disable_artifact=true",
+                "--piper_eval.freq=500",
+                "--piper_eval.samples=16",
+                "--piper_eval.update_freq=50",
+                "--piper_eval.execution_steps=8",
+                "--dataset.eval_split=0",
                 f"--policy.pretrained_path={self.work / 'models/pi05_libero_base'}",
                 f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}",
                 f"--output_dir={self.work / 'chkpt/2601-lerobot/piper/retrain-test' / f'pi05-may-{folder}-full_reference-seed0'}",
@@ -284,6 +299,36 @@ class RealLauncherTest(unittest.TestCase):
         self.assertNotIn("--multi_gpu", command)
         output = next(arg for arg in command if arg.startswith("--output_dir="))
         self.assertIn(str(self.work / "custom output"), output)
+
+    def test_offline_wandb_and_action_diagnostic_overrides(self):
+        (command,) = self.command_args(
+            self.run_autodl(
+                "4",
+                WANDB_MODE="offline",
+                WANDB_PROJECT="my-piper",
+                ACTION_EVAL_FREQ="100",
+                ACTION_EVAL_SAMPLES="8",
+                ACTION_EVAL_SEED="3",
+                ACTION_UPDATE_FREQ="25",
+                EVAL_SPLIT="0.1",
+            )
+        )
+        for arg in (
+            "--wandb.mode=offline",
+            "--wandb.project=my-piper",
+            "--piper_eval.freq=100",
+            "--piper_eval.samples=8",
+            "--piper_eval.seed=3",
+            "--piper_eval.update_freq=25",
+            "--dataset.eval_split=0.1",
+        ):
+            self.assertIn(arg, command)
+        (command,) = self.command_args(
+            self.run_autodl("4", WANDB_ENABLE="false", ACTION_EVAL_FREQ="0", ACTION_UPDATE_FREQ="0")
+        )
+        self.assertIn("--wandb.enable=false", command)
+        self.assertIn("--piper_eval.freq=0", command)
+        self.assertIn("--piper_eval.update_freq=0", command)
 
     def test_fit_profiles_preserve_data_and_change_explicit_training_controls(self):
         for profile, lr, cabo, projections in (

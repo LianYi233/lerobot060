@@ -65,7 +65,7 @@ from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.training_diagnostics import TrainingDiagnostics
+from lerobot.utils.training_diagnostics import TrainingDiagnostics, diagnostic_means
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -211,6 +211,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    parameter_monitor=None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -228,6 +229,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        parameter_monitor: Optional sampled gradient/actual-update diagnostics on the main rank.
 
     Returns:
         A tuple containing:
@@ -304,6 +306,9 @@ def update_policy(
             output_dict = {}
         output_dict.update(optimizer_step_control.metrics)
 
+    if parameter_monitor is not None:
+        parameter_monitor.before_step()
+
     if not optimizer_step_control.skip_optimizer_step:
         # Optimizer step
         with (
@@ -319,6 +324,10 @@ def update_policy(
         if scaler is not None:
             scaler.update()
 
+    if parameter_monitor is not None:
+        if output_dict is None:
+            output_dict = {}
+        output_dict.update(parameter_monitor.after_step())
     optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
@@ -406,7 +415,7 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     # Formal-flow milestones must not suppress the transfer checkpoint or leak into Stage 1.
     pretrain_cfg.save_steps = [pretrain_steps] if cfg.save_steps is not None else None
     pretrain_cfg.save_checkpoint_to_hub = False
-    pretrain_cfg.wandb = dataclasses.replace(pretrain_cfg.wandb, enable=False, run_id=None)
+    pretrain_cfg.wandb = dataclasses.replace(pretrain_cfg.wandb, run_id=None)
     pretrain_cfg.job = dataclasses.replace(pretrain_cfg.job, target="local")
     pretrain_cfg.use_policy_training_preset = True
     pretrain_cfg.optimizer = pretrain_cfg.policy.get_optimizer_preset()
@@ -584,6 +593,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
+        if cfg.piper_eval.enabled and accelerator.distributed_type not in (
+            DistributedType.NO,
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_CPU,
+        ):
+            raise NotImplementedError("piper_eval supports unsharded single-device/DDP training only")
         if cfg.cabo_active and accelerator.distributed_type == DistributedType.FSDP:
             raise NotImplementedError(
                 "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
@@ -960,6 +975,49 @@ def _train_single_stage(
 
     policy.train()
 
+    parameter_monitor = None
+    action_evaluator = None
+    if cfg.piper_eval.enabled:
+        from lerobot.utils.piper_training_eval import (
+            ActionParameterMonitor,
+            PiperActionEvaluator,
+            on_main_process,
+        )
+
+        if cfg.piper_eval.update_freq > 0 and is_main_process:
+            parameter_monitor = ActionParameterMonitor(accelerator.unwrap_model(policy))
+        if cfg.piper_eval.freq > 0:
+            splits = {"train": dataset}
+            if eval_dataset is not None:
+                splits["val"] = eval_dataset
+            action_evaluator = on_main_process(
+                accelerator,
+                lambda: PiperActionEvaluator(
+                    splits, active_cfg, preprocessor, postprocessor, cfg.piper_eval, cfg.output_dir, device
+                ),
+            )
+
+    def log_action_evaluation(completed_step):
+        # All ranks participate in error propagation/synchronization; only rank 0 predicts.
+        if is_main_process:
+            logging.info(
+                "PIPER_ACTION_EVAL starting step=%d (full denoising on fixed observations)", completed_step
+            )
+        scores = on_main_process(
+            accelerator,
+            lambda: action_evaluator.evaluate(
+                accelerator.unwrap_model(policy), completed_step, accelerator.autocast
+            ),
+        )
+        if is_main_process:
+            key = f"action_train/h{cfg.piper_eval.execution_steps}/joint_mae_deg"
+            logging.info("PIPER_ACTION_EVAL step=%d %s=%.4f", completed_step, key, scores[key])
+            if wandb_logger:
+                wandb_logger.log_dict(scores, step=completed_step, mode="eval")
+
+    if cfg.piper_eval.freq > 0:
+        log_action_evaluation(step)
+
     pi05_diagnostics_enabled = not cfg.is_reward_model_training and active_cfg.type == "pi05"
     diagnostics = None
     if is_main_process and pi05_diagnostics_enabled:
@@ -1050,6 +1108,12 @@ def _train_single_stage(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            parameter_monitor=(
+                parameter_monitor
+                if cfg.piper_eval.update_freq > 0
+                and ((step + 1) % cfg.piper_eval.update_freq == 0 or step + 1 == cfg.steps)
+                else None
+            ),
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -1080,11 +1144,14 @@ def _train_single_stage(
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
+                diagnostic_record = None
                 if diagnostics is not None:
-                    diagnostics.write(step, train_tracker.to_dict())
+                    diagnostic_record = diagnostics.write(step, train_tracker.to_dict())
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
-                    if output_dict:
+                    if diagnostic_record:
+                        wandb_log_dict.update(diagnostic_means(diagnostic_record))
+                    elif output_dict:
                         wandb_log_dict.update(output_dict)
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
@@ -1092,6 +1159,11 @@ def _train_single_stage(
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if cfg.piper_eval.freq > 0 and (
+            step % cfg.piper_eval.freq == 0 or step == cfg.steps or step == pi05_stage1_bridge_start_step
+        ):
+            log_action_evaluation(step)
 
         if is_eval_step:
             policy.eval()
@@ -1239,6 +1311,8 @@ def _train_single_stage(
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
 
+    if wandb_logger:
+        wandb_logger.finish()
     # Accelerator lifecycle is owned by train(): Stage 1 must leave it alive for the fresh flow model.
     accelerator.wait_for_everyone()
 

@@ -1,6 +1,7 @@
 # Piper：抓取失败与训练拟合检查
 
 本文基于 `piper` 分支的代码检查，不是对用户本地权重或训练日志的实测报告。
+新增的训练期间动作误差与 W&B 曲线见 [动作指标说明](README_ACTION_METRICS.md)。
 机械臂曾压到桌面，并报告关节 2 的 `collision_status` 和 `driver_error_status`。
 保护停机符合该现象，但仍需要查清模型输出或执行过程为什么会产生接触。
 保留现有碰撞、反馈及 CAN 检查；先做离线拟合检查。
@@ -46,8 +47,8 @@ PI05 新训练会在每个阶段的输出目录生成 `training_diagnostics.json
 多卡时 `diagnostics_rank0` 是 rank 0 上现有指标的窗口统计；`train.loss` 保留训练器
 原有的分布式归约，不能把所有逐维指标误认为跨卡全局均值。恢复训练会追加行，
 从较早 checkpoint 恢复时可能有重复 step，应按对应运行段分析。
-临时预训练目录仍按原入口规则在任务成功后清理；需要保留它时设置
-`KEEP_PRETRAIN_CHECKPOINT=true`。正式 flow 阶段的诊断文件保留在正式输出目录。
+临时预训练目录中的 `checkpoints/` 在任务成功后清理；需要保留权重时设置
+`KEEP_PRETRAIN_CHECKPOINT=true`。各阶段的诊断文件和 W&B 日志保留在各自输出目录。
 
 ## 四个可比较的配置
 

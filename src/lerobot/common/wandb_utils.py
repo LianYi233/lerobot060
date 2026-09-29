@@ -84,6 +84,7 @@ class WandBLogger:
         self.job_name = cfg.job_name
         self.env_fps = cfg.env.fps if cfg.env else None
         self._group = cfg_to_group(cfg)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # Set up WandB.
         os.environ["WANDB_SILENT"] = "True"
@@ -121,6 +122,10 @@ class WandBLogger:
         logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
         logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
         self._wandb = wandb
+
+    def finish(self):
+        """Flush this stage before another stage creates a new W&B run."""
+        self._wandb.finish()
 
     def log_policy(self, checkpoint_dir: Path):
         """Checkpoints the policy to wandb."""

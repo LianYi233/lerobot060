@@ -71,3 +71,17 @@ class TrainingDiagnostics:
             stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
         self.values.clear()
         self.updates = 0
+        return record
+
+
+def diagnostic_means(record: dict) -> dict[str, float]:
+    """Scalar window means for W&B, including flattened per-action-dimension losses."""
+    metrics = {"diagnostics/window_updates": record["window_updates"]}
+    for name, value in record["diagnostics_rank0"].items():
+        # A policy's rank-local loss must not overwrite the trainer's reduced DDP loss.
+        key = f"policy_rank0/{name}" if name in record["train"] else name
+        if value["mean"] is not None:
+            metrics[key] = value["mean"]
+        if value["nonfinite"]:
+            metrics[f"{key}/nonfinite"] = value["nonfinite"]
+    return metrics

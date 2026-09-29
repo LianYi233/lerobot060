@@ -17,9 +17,16 @@ class DiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "training_diagnostics.jsonl"
             writer = MODULE.TrainingDiagnostics(path, {"training_stage": "flow"})
-            writer.update({"loss_per_dim": [1.0, 3.0], "cabo/action_prompt_scale": 0.2})
+            writer.update({"loss_per_dim": [1.0, 3.0], "cabo/action_prompt_scale": 0.2, "loss": 0.9})
             writer.update({"loss_per_dim": [3.0, float("nan")], "optimizer_step/skipped": 1})
-            writer.write(2, {"loss": 0.3, "grad_norm": float("inf")})
+            record = writer.write(2, {"loss": 0.3, "grad_norm": float("inf")})
+            curves = MODULE.diagnostic_means(record)
+            self.assertEqual(curves["loss_per_dim/0"], 2.0)
+            self.assertEqual(curves["loss_per_dim/1/nonfinite"], 1)
+            self.assertEqual(curves["optimizer_step/skipped"], 0.5)
+            self.assertNotIn("loss", curves)
+            self.assertEqual(curves["policy_rank0/loss"], 0.9)
+            self.assertTrue(all(isinstance(value, (int, float)) for value in curves.values()))
             result = json.loads(path.read_text())
             self.assertEqual(result["step"], 2)
             self.assertEqual(result["window_updates"], 2)

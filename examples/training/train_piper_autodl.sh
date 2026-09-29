@@ -19,6 +19,11 @@ All four tasks train separately, in sequence, from the same base checkpoint.
 Set DATASET_BASE, PRETRAINED_PATH and TOKENIZER_PATH to the actual local paths.
 Set RUN_GROUP to reuse a chosen output group, or leave it unset for a timestamp.
 DRY_RUN=true validates metadata/paths and prints commands without using a GPU.
+W&B is enabled by default (project piper-action-fit); WANDB_MODE=offline records locally.
+WANDB_ENABLE=false disables W&B; local diagnostics still work. Model artifacts are not uploaded.
+ACTION_EVAL_FREQ=500 evaluates 16 fixed observations per split at start, intervals and stage end.
+ACTION_EVAL_SAMPLES=16, ACTION_EVAL_SEED=0, ACTION_UPDATE_FREQ=50 tune diagnostic cost.
+EVAL_SPLIT=0.1 optionally reserves episodes for validation; default 0 keeps all training episodes.
 GPU_IDS=0,1 selects two GPUs; NUM_PROCESSES defaults to the GPU list length.
 FLOW_STEPS=3000 selects a shorter formal flow stage; SAVE_STEPS='[3000]' saves its final model.
 SAVE_STEPS overrides SAVE_FREQ; KEEP_PRETRAIN_CHECKPOINT=true retains Stage-1 weights.
@@ -86,4 +91,13 @@ echo "AutoDL Piper: task=${TASK} variant=${VARIANT} seed=${SEED} run_group=${RUN
 echo "Output root: ${OUTPUT_ROOT}"
 echo "Log root: ${LOG_ROOT}"
 exec bash "${SCRIPT_DIR}/train_pi05_real.sh" "${TASK}" "${VARIANT}" "${SEED}" \
-  "--wandb.enable=${WANDB_ENABLE:-false}" "--num_workers=${NUM_WORKERS:-4}" "$@"
+  "--wandb.enable=${WANDB_ENABLE:-true}" \
+  "--wandb.project=${WANDB_PROJECT:-piper-action-fit}" \
+  "--wandb.mode=${WANDB_MODE:-online}" --wandb.disable_artifact=true \
+  "--piper_eval.freq=${ACTION_EVAL_FREQ:-500}" \
+  "--piper_eval.samples=${ACTION_EVAL_SAMPLES:-16}" \
+  "--piper_eval.seed=${ACTION_EVAL_SEED:-0}" \
+  "--piper_eval.execution_steps=${N_ACTION_STEPS}" \
+  "--piper_eval.update_freq=${ACTION_UPDATE_FREQ:-50}" \
+  "--dataset.eval_split=${EVAL_SPLIT:-0}" \
+  "--num_workers=${NUM_WORKERS:-4}" "$@"
