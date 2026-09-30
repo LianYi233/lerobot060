@@ -1,18 +1,21 @@
 #!/bin/bash
 set -e
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # Usage: bash run_eval_libero-full.sh VARIANT [all|no10|SUITE] [TRAINING_SEED]
 # all: four standard LIBERO suites; no10: spatial/object/goal only.
 usage() {
   echo "Usage: $0 VARIANT [all|no10|libero_spatial|libero_object|libero_goal|libero_10] [SEED]"
   echo "Example: $0 direct_dual no10 0"
-  echo "VARIANT: full_reference, no_bridge, direct_dual, dual_prompt_only, vlm_only, action_only, no_cabo"
+  echo "VARIANT: full_reference, no_bridge, direct_dual, dual_prompt_only, vlm_only, action_only, no_cabo, pi05_libero_base"
   echo "Defaults: all suites, training seed 0, checkpoint 3000, 10 episodes/task."
   echo "VLM_PROMPT_TOKENS=8 bash $0 vlm_only all 0  # token-sweep checkpoint"
   echo "With VLM_PROMPT_TOKENS, use pi05-vlm_only-vlmN-seedS in the prompt-learning/vlm-token-sweep root."
   echo "Overrides: CKPT_ROOT, BASE_CKPT, BASE_OUTPUT, RUN_NAME, CHECKPOINT_STEP, EPISODES_PER_TASK, GPU_ID."
   echo "DRY_RUN=true validates paths/token counts and prints commands without loading a model."
   echo "Evaluate all 1/2/8/16-token models: bash run_eval_libero_vlm_token_sweep.sh all 0"
+  echo "Evaluate the base with BOTH prompt banks disabled: bash run_eval_libero_base.sh all"
+  echo "For pi05_libero_base use BASE_MODEL_PATH (a model directory directly, not checkpoints/003000)."
 }
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
@@ -30,7 +33,7 @@ VLM_PROMPT_TOKENS="${VLM_PROMPT_TOKENS:-}"
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-3000}"
 DRY_RUN="${DRY_RUN:-false}"
 case "$VARIANT" in
-  full_reference|no_bridge|direct_dual|dual_prompt_only|vlm_only|action_only|no_cabo) ;;
+  full_reference|no_bridge|direct_dual|dual_prompt_only|vlm_only|action_only|no_cabo|pi05_libero_base) ;;
   *) echo "Unknown model variant: $VARIANT" >&2; usage >&2; exit 2 ;;
 esac
 if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then
@@ -50,8 +53,22 @@ if [[ "$DRY_RUN" != true && "$DRY_RUN" != false ]]; then
   exit 2
 fi
 DEFAULT_RUN_NAME="pi05-${VARIANT}-seed${SEED}"
+TRAINING_SEED_LABEL="$SEED"
 DEFAULT_CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation
 DEFAULT_BASE_OUTPUT=/root/autodl-tmp/eval/2601-lerobot
+export LEROBOT_EVAL_BASE=0
+if [[ "$VARIANT" == pi05_libero_base ]]; then
+  if [[ -n "${BASE_CKPT:-}" || -n "$VLM_PROMPT_TOKENS" ]]; then
+    echo "Base evaluation uses BASE_MODEL_PATH and zero prompts; unset BASE_CKPT and VLM_PROMPT_TOKENS" >&2
+    exit 2
+  fi
+  DEFAULT_RUN_NAME=pi05_libero_base-no_prompt
+  TRAINING_SEED_LABEL=none
+  DEFAULT_BASE_OUTPUT=/root/autodl-tmp/eval/prompt-learning/pi05-libero-base
+  BASE_MODEL_PATH="${BASE_MODEL_PATH:-${PRETRAINED_PATH:-/root/autodl-tmp/models/pi05_libero_base}}"
+  export LEROBOT_EVAL_BASE=1
+  export PYTHONPATH="$SCRIPT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
 if [[ -n "$VLM_PROMPT_TOKENS" ]]; then
   if [[ "$VARIANT" != vlm_only || ! "$VLM_PROMPT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
     echo "VLM_PROMPT_TOKENS requires vlm_only and a positive integer without leading zeros" >&2
@@ -96,6 +113,9 @@ CKPT_ROOT="${CKPT_ROOT:-${DEFAULT_CKPT_ROOT}}"
 BASE_CKPT="${BASE_CKPT:-${CKPT_ROOT}/${RUN_NAME}/checkpoints}"
 BASE_OUTPUT="${BASE_OUTPUT:-${DEFAULT_BASE_OUTPUT}}"
 STEPS=("$CHECKPOINT_STEP")
+if [[ "$VARIANT" == pi05_libero_base ]]; then
+  STEPS=(base)
+fi
 SUMMARY_LOG="$BASE_OUTPUT/eval_${RUN_NAME}-${SUITE_TAG}-summary.log"
 if [[ "$DRY_RUN" != true ]]; then
   mkdir -p "$BASE_OUTPUT"
@@ -104,8 +124,13 @@ fi
 FINAL_EXIT=0
 
 for STEP in "${STEPS[@]}"; do
-  STEP_PADDED=$(printf "%06d" "$STEP")
-  CKPT="$BASE_CKPT/$STEP_PADDED/pretrained_model"
+  if [[ "$VARIANT" == pi05_libero_base ]]; then
+    STEP_PADDED=base
+    CKPT="$BASE_MODEL_PATH"
+  else
+    STEP_PADDED=$(printf "%06d" "$STEP")
+    CKPT="$BASE_CKPT/$STEP_PADDED/pretrained_model"
+  fi
   OUTPUT_DIR="$BASE_OUTPUT/libero060-all-${RUN_NAME}-${STEP_PADDED}-${SUITE_TAG}-resume"
   LOG="$BASE_OUTPUT/eval_${RUN_NAME}-${STEP_PADDED}-${SUITE_TAG}.log"
 
@@ -113,6 +138,12 @@ for STEP in "${STEPS[@]}"; do
     echo "ERROR: checkpoint not found: $CKPT" >&2
     FINAL_EXIT=1
     continue
+  fi
+  if [[ "$VARIANT" == pi05_libero_base ]]; then
+    if ! python "$SCRIPT_DIR/src/lerobot/scripts/libero_base_eval.py" "$CKPT" "${TOKENIZER_PATH:-}"; then
+      FINAL_EXIT=1
+      continue
+    fi
   fi
   if [[ -n "$VLM_PROMPT_TOKENS" ]]; then
     # Read saved architecture; never resize/override learned prompts at evaluation.
@@ -152,8 +183,23 @@ PY
     --policy.compile_model=false
     --policy.gradient_checkpointing=false
   )
+  if [[ "$VARIANT" == pi05_libero_base ]]; then
+    EVAL_ARGS+=(
+      --policy.num_vlm_prompt_tokens=0
+      --policy.num_prompt_tokens=0
+      --policy.cabo_enabled=false
+      --policy.training_stage=flow
+      --policy.next_action_pretrain_steps=0
+      --policy.next_action_bridge_steps=0
+      --policy.train_action_projections=false
+      --policy.use_peft=false
+    )
+    if [[ -n "${TOKENIZER_PATH:-}" ]]; then
+      EVAL_ARGS+=(--policy.tokenizer_name="$TOKENIZER_PATH")
+    fi
+  fi
   if [[ "$DRY_RUN" == true ]]; then
-    echo "model=$RUN_NAME training_seed=$SEED CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "model=$RUN_NAME training_seed=$TRAINING_SEED_LABEL CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     echo "output_dir=$OUTPUT_DIR"
     echo "log=$LOG"
     printf '%q ' python -u - "${EVAL_ARGS[@]}"
@@ -163,7 +209,7 @@ PY
   touch "$LOG"
   {
     echo "===== evaluating checkpoint $STEP_PADDED at $(date) ====="
-    echo "model=$RUN_NAME training_seed=$SEED"
+    echo "model=$RUN_NAME training_seed=$TRAINING_SEED_LABEL"
     echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     echo "MUJOCO_GL=$MUJOCO_GL"
     echo "mode=$MODE suites=$TASKS episodes_per_task=$EPISODES_PER_TASK"
@@ -211,6 +257,10 @@ if len(entries) != 1:
     raise RuntimeError("Cannot uniquely resolve lerobot-eval in this Python environment")
 entry = entries[0]
 module = importlib.import_module(entry.module)
+base_manifest = {}
+if os.environ.get("LEROBOT_EVAL_BASE") == "1":
+    from lerobot.scripts.libero_base_eval import install_base_evaluation
+    base_manifest = install_base_evaluation(module, os.environ.get("TOKENIZER_PATH"))
 attention_manifest = {}
 if os.environ.get("LEROBOT_EVAL_ATTENTION") == "1":
     from lerobot.scripts.libero_attention import install_attention_evaluation, require_saved_attention_videos
@@ -249,6 +299,7 @@ manifest = {
                     for p in sorted(model.rglob("*")) if p.is_file()],
     "evaluator_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
     **attention_manifest,
+    **base_manifest,
 }
 manifest_file = output / "resume_manifest.json"
 if manifest_file.exists():

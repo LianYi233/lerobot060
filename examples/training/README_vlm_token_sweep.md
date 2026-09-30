@@ -142,3 +142,51 @@ CHECKPOINT_STEP=3000 EPISODES_PER_TASK=10 GPU_ID=0 \
 
 记录各 suite 成功率及 token 数；attention 对比可使用已有 routing 入口，并控制 checkpoint 步数、
 环境 seed、输入和去噪设置。单一训练 seed 的差异先作为探索结果，再对有意义的差异补多 seed 验证。
+
+## 起始模型基线：pi05_libero_base，无新增 prompt
+
+1 token 的绝对成功率需要与未经过本轮 prompt 微调的起始权重比较。
+当前 PI05 配置默认创建 16 个 VLM prompt 和 16 个 action prompt，基础权重缺少这些参数时会
+随机初始化。因此基础模型不能直接套用默认配置；专用入口明确设置两组 prompt 均为 0，
+关闭 CABO、PEFT 和动作投影训练，使用 flow 推理，不执行训练，也不修改 checkpoint。
+
+在仓库根目录、已激活的 lerobot 环境中执行：
+
+```bash
+DRY_RUN=true bash run_eval_libero_base.sh all
+GPU_ID=0 bash run_eval_libero_base.sh all
+```
+
+默认直接读取 `/root/autodl-tmp/models/pi05_libero_base`，没有 `003000` 子目录。
+需要更换位置时指定实际参与这四组训练的同一份起始权重：
+
+```bash
+BASE_MODEL_PATH=/actual/pi05_libero_base \
+TOKENIZER_PATH=/actual/paligemma-3b-pt-224 \
+GPU_ID=0 bash run_eval_libero_base.sh all
+```
+
+`BASE_MODEL_PATH` 未设置时也兼容训练用的 `PRETRAINED_PATH`；tokenizer 默认路径与训练脚本相同。
+会检查模型与配套 pre/postprocessor 文件，通过 safetensors 的 tensor shape 检查拒绝含非空 prompt
+权重的 checkpoint，避免把已经微调的 prompt 模型当作起始模型。不要设置 `BASE_CKPT` 或
+`VLM_PROMPT_TOKENS`；基础模型入口会拒绝这些容易混淆的设置。
+
+评估仍是四个 suite、每任务 10 episodes（共 400）、评估 seed 1000、`n_action_steps=10`、
+关闭 AMP/compile，与 token sweep 一致。也支持 `libero_10` 等单个 suite、`EPISODES_PER_TASK`
+和任务级断点恢复。默认结果目录为：
+
+```text
+/root/autodl-tmp/eval/prompt-learning/pi05-libero-base/
+```
+
+其中 `eval_pi05_libero_base-no_prompt-libero-all4-summary.log` 包含各 suite 与 overall 成功率；
+完整数据在 `libero060-all-pi05_libero_base-no_prompt-base-libero-all4-resume/` 下。
+`BASE_OUTPUT` 可以指定新的结果根目录。
+
+基础模型使用自身保存的预处理、后处理和归一化统计，只在运行时改写 tokenizer 文件位置。
+先将它与 1-token 模型逐 suite 比较；如果两个 checkpoint 的预处理配置或归一化统计不同，
+应进一步控制这项差异，再把成功率变化归因于 prompt 学习。后续可补充“随机初始化但不训练的
+1-token prompt”对照，区分插入 token 本身与训练的影响。
+
+此基线的含义是“本轮 prompt 微调前的起始权重”。`pi05_libero_base` 的名称不能独自证明其
+原始训练数据组成，是否见过 LIBERO 需要核对权重来源。
