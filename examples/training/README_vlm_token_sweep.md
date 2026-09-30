@@ -77,15 +77,68 @@ VLM_PROMPT_TOKENS=8 \
 
 ## 后续评估
 
-评估器会从每组 checkpoint config 读取 token 数。现有评估脚本默认查找旧运行名，
-因此评估新实验时要明确指定 `BASE_CKPT`，并使用独立 `BASE_OUTPUT`，例如 8 tokens：
+训练完成后，一条命令依次评测 1、2、8、16 tokens：
 
 ```bash
-BASE_CKPT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-learning/vlm-token-sweep/pi05-vlm_only-vlm8-seed0/checkpoints \
-BASE_OUTPUT=/root/autodl-tmp/eval/prompt-learning-vlm8-seed0 \
-GPU_ID=0 bash run_eval_libero-full.sh vlm_only all 0
+GPU_ID=0 bash run_eval_libero_vlm_token_sweep.sh all 0
 ```
 
-注意训练使用 `GPU_IDS`，评估使用 `GPU_ID`。其余三组替换路径中的 token 数即可。
+默认读取上述四组的 `003000/pretrained_model`，四套 LIBERO suite 各任务 10 个 episode，
+即每组 400 个 episode，四组共 1600 个。最后的 `0` 选择训练 seed；评估环境/全局 seed
+仍沿用评估器默认 1000。训练使用 `GPU_IDS`，评估使用 `GPU_ID`。
+
+先只检查四组 checkpoint 路径、保存的 prompt 数量和将执行的命令：
+
+```bash
+DRY_RUN=true bash run_eval_libero_vlm_token_sweep.sh all 0
+```
+
+评估器从 checkpoint config 加载实际 token 数，不在推理时改写 prompt 大小。
+所有组开始前会校验 `num_vlm_prompt_tokens` 与组名匹配、`num_prompt_tokens=0`。
+路径缺失或数量不符时整批停止；评测中任一组失败也会停止后续组。
+重新执行相同命令时沿用各组独立的任务级断点记录，已经保存的完整任务会跳过。
+若更换模型、episode 数或评测配置，请使用新的 `BASE_OUTPUT`，避免与旧断点混用。
+
+默认结果根目录：
+
+```text
+/root/autodl-tmp/eval/prompt-learning/vlm-token-sweep/
+```
+
+结果目录、日志和 summary 文件名都含 `pi05-vlm_only-vlmN-seed0`，不会混用四组结果。
+例如 8 tokens：
+
+```text
+libero060-all-pi05-vlm_only-vlm8-seed0-003000-libero-all4-resume/eval_info.json
+libero060-all-pi05-vlm_only-vlm8-seed0-003000-libero-all4-resume/resume_summary.json
+eval_pi05-vlm_only-vlm8-seed0-libero-all4-summary.log
+```
+
+`run_eval_libero-full.sh` 也支持单独选择一组：
+
+```bash
+VLM_PROMPT_TOKENS=8 GPU_ID=0 bash run_eval_libero-full.sh vlm_only all 0
+```
+
+设置 `VLM_PROMPT_TOKENS` 后自动使用 token-sweep 的 checkpoint 根目录和带 token 数的运行名。
+不设置时仍查找原 `prompt-ablation/pi05-vlm_only-seed0`，保持旧实验入口兼容。
+若使用单次训练入口的旧根目录，可设置 `CKPT_ROOT`，或用 `BASE_CKPT` 指定单组的 checkpoints 目录。
+其他含 VLM prompt 的 variant 仍可通过 `BASE_CKPT` 评估，长度选择快捷方式仅用于 `vlm_only`。
+
+只测部分组/一个 suite，或选择其他训练 checkpoint：
+
+```bash
+VLM_PROMPT_TOKEN_COUNTS="8 16" GPU_ID=0 \
+  bash run_eval_libero_vlm_token_sweep.sh libero_10 0
+
+CKPT_ROOT=/actual/training/output/root \
+BASE_OUTPUT=/actual/evaluation/output/root \
+CHECKPOINT_STEP=3000 EPISODES_PER_TASK=10 GPU_ID=0 \
+  bash run_eval_libero_vlm_token_sweep.sh all 0
+```
+
+自定义训练前缀时同步设置 `RUN_PREFIX`。批量入口不要设置仅指向一组的 `BASE_CKPT`、
+`RUN_NAME` 或 `VLM_PROMPT_TOKENS`；分别使用 `CKPT_ROOT`、`RUN_PREFIX` 和 `VLM_PROMPT_TOKEN_COUNTS`。
+
 记录各 suite 成功率及 token 数；attention 对比可使用已有 routing 入口，并控制 checkpoint 步数、
 环境 seed、输入和去噪设置。单一训练 seed 的差异先作为探索结果，再对有意义的差异补多 seed 验证。

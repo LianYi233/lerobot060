@@ -1,13 +1,18 @@
 #!/bin/bash
 set -e
 
-# Usage: bash eval_libero_suites_resume.sh VARIANT [all|no10] [SEED]
+# Usage: bash run_eval_libero-full.sh VARIANT [all|no10|SUITE] [TRAINING_SEED]
 # all: four standard LIBERO suites; no10: spatial/object/goal only.
 usage() {
   echo "Usage: $0 VARIANT [all|no10|libero_spatial|libero_object|libero_goal|libero_10] [SEED]"
   echo "Example: $0 direct_dual no10 0"
   echo "VARIANT: full_reference, no_bridge, direct_dual, dual_prompt_only, vlm_only, action_only, no_cabo"
-  echo "Defaults: all suites, seed 0. STEPS remains configured below."
+  echo "Defaults: all suites, training seed 0, checkpoint 3000, 10 episodes/task."
+  echo "VLM_PROMPT_TOKENS=8 bash $0 vlm_only all 0  # token-sweep checkpoint"
+  echo "With VLM_PROMPT_TOKENS, use pi05-vlm_only-vlmN-seedS in the prompt-learning/vlm-token-sweep root."
+  echo "Overrides: CKPT_ROOT, BASE_CKPT, BASE_OUTPUT, RUN_NAME, CHECKPOINT_STEP, EPISODES_PER_TASK, GPU_ID."
+  echo "DRY_RUN=true validates paths/token counts and prints commands without loading a model."
+  echo "Evaluate all 1/2/8/16-token models: bash run_eval_libero_vlm_token_sweep.sh all 0"
 }
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
@@ -21,6 +26,9 @@ VARIANT="$1"
 MODE="${2:-all}"
 SEED="${3:-0}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}"
+VLM_PROMPT_TOKENS="${VLM_PROMPT_TOKENS:-}"
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-3000}"
+DRY_RUN="${DRY_RUN:-false}"
 case "$VARIANT" in
   full_reference|no_bridge|direct_dual|dual_prompt_only|vlm_only|action_only|no_cabo) ;;
   *) echo "Unknown model variant: $VARIANT" >&2; usage >&2; exit 2 ;;
@@ -33,7 +41,27 @@ if [[ ! "$EPISODES_PER_TASK" =~ ^[1-9][0-9]*$ ]]; then
   echo "EPISODES_PER_TASK must be a positive integer" >&2
   exit 2
 fi
-RUN_NAME="pi05-${VARIANT}-seed${SEED}"
+if [[ ! "$CHECKPOINT_STEP" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CHECKPOINT_STEP must be a positive integer without leading zeros" >&2
+  exit 2
+fi
+if [[ "$DRY_RUN" != true && "$DRY_RUN" != false ]]; then
+  echo "DRY_RUN must be true or false" >&2
+  exit 2
+fi
+DEFAULT_RUN_NAME="pi05-${VARIANT}-seed${SEED}"
+DEFAULT_CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation
+DEFAULT_BASE_OUTPUT=/root/autodl-tmp/eval/2601-lerobot
+if [[ -n "$VLM_PROMPT_TOKENS" ]]; then
+  if [[ "$VARIANT" != vlm_only || ! "$VLM_PROMPT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "VLM_PROMPT_TOKENS requires vlm_only and a positive integer without leading zeros" >&2
+    exit 2
+  fi
+  DEFAULT_RUN_NAME="pi05-vlm_only-vlm${VLM_PROMPT_TOKENS}-seed${SEED}"
+  DEFAULT_CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/prompt-learning/vlm-token-sweep
+  DEFAULT_BASE_OUTPUT=/root/autodl-tmp/eval/prompt-learning/vlm-token-sweep
+fi
+RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
 case "$MODE" in
   all)
     TASKS="libero_spatial,libero_object,libero_goal,libero_10"
@@ -63,14 +91,16 @@ unset MUJOCO_EGL_DEVICE_ID || true
 export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-/home/wyn/.libero}"
 export PYTHONUNBUFFERED=1
 
-CKPT_ROOT="${CKPT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"
+CKPT_ROOT="${CKPT_ROOT:-${DEFAULT_CKPT_ROOT}}"
 # Explicit BASE_CKPT overrides automatic checkpoint discovery only.
 BASE_CKPT="${BASE_CKPT:-${CKPT_ROOT}/${RUN_NAME}/checkpoints}"
-BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-tmp/eval/2601-lerobot}"
-STEPS=(3000)
-mkdir -p "$BASE_OUTPUT"
+BASE_OUTPUT="${BASE_OUTPUT:-${DEFAULT_BASE_OUTPUT}}"
+STEPS=("$CHECKPOINT_STEP")
 SUMMARY_LOG="$BASE_OUTPUT/eval_${RUN_NAME}-${SUITE_TAG}-summary.log"
-touch "$SUMMARY_LOG"
+if [[ "$DRY_RUN" != true ]]; then
+  mkdir -p "$BASE_OUTPUT"
+  touch "$SUMMARY_LOG"
+fi
 FINAL_EXIT=0
 
 for STEP in "${STEPS[@]}"; do
@@ -78,6 +108,58 @@ for STEP in "${STEPS[@]}"; do
   CKPT="$BASE_CKPT/$STEP_PADDED/pretrained_model"
   OUTPUT_DIR="$BASE_OUTPUT/libero060-all-${RUN_NAME}-${STEP_PADDED}-${SUITE_TAG}-resume"
   LOG="$BASE_OUTPUT/eval_${RUN_NAME}-${STEP_PADDED}-${SUITE_TAG}.log"
+
+  if [[ ! -d "$CKPT" ]]; then
+    echo "ERROR: checkpoint not found: $CKPT" >&2
+    FINAL_EXIT=1
+    continue
+  fi
+  if [[ -n "$VLM_PROMPT_TOKENS" ]]; then
+    # Read saved architecture; never resize/override learned prompts at evaluation.
+    if ! python - "$CKPT/config.json" "$VLM_PROMPT_TOKENS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+expected = int(sys.argv[2])
+actual = config.get("num_vlm_prompt_tokens")
+action = config.get("num_prompt_tokens")
+if type(actual) is not int or actual != expected or type(action) is not int or action != 0:
+    raise SystemExit(
+        f"Checkpoint prompt mismatch: {path}: expected VLM={expected}, action=0; "
+        f"found VLM={actual}, action={action}"
+    )
+PY
+    then
+      FINAL_EXIT=1
+      continue
+    fi
+  fi
+  EVAL_ARGS=(
+    --policy.path="$CKPT"
+    --output_dir="$OUTPUT_DIR"
+    --env.type=libero
+    --env.task="$TASKS"
+    --env.control_mode=relative
+    --env.max_parallel_tasks=1
+    --eval.batch_size=1
+    --eval.n_episodes="$EPISODES_PER_TASK"
+    --policy.n_action_steps=10
+    --policy.use_amp=false
+    --policy.device=cuda
+    --policy.compile_model=false
+    --policy.gradient_checkpointing=false
+  )
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "model=$RUN_NAME training_seed=$SEED CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "output_dir=$OUTPUT_DIR"
+    echo "log=$LOG"
+    printf '%q ' python -u - "${EVAL_ARGS[@]}"
+    printf '\n'
+    continue
+  fi
   touch "$LOG"
   {
     echo "===== evaluating checkpoint $STEP_PADDED at $(date) ====="
@@ -90,28 +172,9 @@ for STEP in "${STEPS[@]}"; do
     echo "log=$LOG"
   } | tee -a "$LOG"
 
-  if [[ ! -d "$CKPT" ]]; then
-    echo "ERROR: checkpoint not found: $CKPT" | tee -a "$LOG" "$SUMMARY_LOG"
-    FINAL_EXIT=1
-    continue
-  fi
-
   set +e
   # Pass arguments normally; stdin contains only the progress wrapper.
-  python -u - \
-    --policy.path="$CKPT" \
-    --output_dir="$OUTPUT_DIR" \
-    --env.type=libero \
-    --env.task="$TASKS" \
-    --env.control_mode=relative \
-    --env.max_parallel_tasks=1 \
-    --eval.batch_size=1 \
-    --eval.n_episodes="$EPISODES_PER_TASK" \
-    --policy.n_action_steps=10 \
-    --policy.use_amp=false \
-    --policy.device=cuda \
-    --policy.compile_model=false \
-    --policy.gradient_checkpointing=false \
+  python -u - "${EVAL_ARGS[@]}" \
     <<'PY' 2>&1 | tee -a "$LOG"
 import importlib
 import importlib.metadata
@@ -387,6 +450,9 @@ else:
     print("Overall:", overall)
 PY
 done
+if [[ "$DRY_RUN" == true ]]; then
+  exit "$FINAL_EXIT"
+fi
 echo "================ summary ================"
 cat "$SUMMARY_LOG"
 exit "$FINAL_EXIT"
