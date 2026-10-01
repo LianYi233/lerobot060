@@ -2,6 +2,8 @@
 
 本文基于 `piper` 分支的代码检查，不是对用户本地权重或训练日志的实测报告。
 新增的训练期间动作误差与 W&B 曲线见 [动作指标说明](README_ACTION_METRICS.md)。
+与参考真机代码的逐项对照、Transformers 跨版本特征缩放差异和只读审计命令见
+[参考代码审计](README_REFERENCE_AUDIT.md)。
 机械臂曾压到桌面，并报告关节 2 的 `collision_status` 和 `driver_error_status`。
 保护停机符合该现象，但仍需要查清模型输出或执行过程为什么会产生接触。
 保留现有碰撞、反馈及 CAN 检查；先做离线拟合检查。
