@@ -4,6 +4,59 @@
 为 `b97116a`。未获得这次四个任务的 checkpoint、实际训练日志、录像或关节跟踪记录；
 下文区分代码事实与待验证的解释，不声称已找到唯一根因或改善了抓取成功率。
 
+## 后续实测：苹果模型的数据选择已确认，部署环境应对齐 5.5.4
+
+用户随后在两台机器上运行了审计工具，报告同一个苹果任务 checkpoint 的
+`episodes=null`、`eval_split=0.0`、`configured_flow_steps=3000`、
+`per_process_batch_size=16`。结合用户明确设置 `FIT_EPISODES=all`，本次不再把
+单条示范训练作为该模型的解释。配置中的 3000 是正式 flow 阶段设置，并非根据
+目录名称推断出的 12000；实际保存步数另看报告的 `saved_step`。
+
+两台机器的探针结果为：
+
+| 环境 | Transformers | 图像单位输出 | 文字单位权重输出 | embedding 类 |
+| --- | --- | --- | --- | --- |
+| 真机电脑 | 5.3.0 | 0.25 | 1.0 | Embedding |
+| 训练电脑 | 5.5.4 | 1.0 | 4.0 | GemmaTextScaledWordEmbedding |
+
+这确认了当前环境的计算差异。按用户提供的训练环境信息，应先在真机电脑使用
+5.5.4，保留同一份权重做离线复测，无需立即重训。若训练后升级过训练环境，仍应
+以当时的版本记录为准。对齐版本不能保证消除所有抓取问题，也不会让部署代码
+自动具备任务完成检测。
+
+在真机电脑的 `lerobot` 环境中执行（安装步骤需要能访问包源）：
+
+```bash
+conda activate lerobot
+python -m pip freeze > "piper-env-before-554-$(date +%Y%m%d-%H%M%S).txt"
+python -m pip install "transformers==5.5.4"
+python -m pip check
+python deploy_piper_wyn.py --check_env
+
+python piper_checkpoint_audit.py \
+  --policy_path /absolute/path/to/the/same/pretrained_model \
+  --probe_embeddings \
+  --output piper_robot_audit_554.json
+```
+
+安装时让 pip 解析 Transformers 自身的依赖，不使用 `--no-deps`，也不顺带升级
+PyTorch/CUDA。这里的精确版本来自这批 checkpoint 的训练环境，不是给所有历史
+checkpoint 指定统一版本。探针应变为图像 1.0、文字 4.0；随后在两台机器用同一
+checkpoint、数据集、episode、seed 运行离线动作评估，重点比较 h1/h8 的误差。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python eval_piper_offline.py \
+  --policy_path /absolute/path/to/the/same/pretrained_model \
+  --dataset_root /absolute/path/to/May-pick-and-place/1-put_the_apple_on_the_yellow_plate \
+  --tokenizer_path /absolute/path/to/paligemma-3b-pt-224 \
+  --episodes 0,1,2 --stride 8 --max_samples 64 --execution_steps 8 \
+  --seed 0 --plots 3 --output_dir /absolute/path/to/new/eval-apple-transformers554
+```
+
+若已有完全相同样本、seed、设置的 5.3.0 离线结果，可直接对比升级前后误差和
+动作曲线；不要用不同采样设置的结果归因版本影响。本分支的离线脚本依赖
+`deploy_piper_vlaa.py` 的只读辅助函数，须保留该文件。
+
 ## 最优先：训练与推理的 Transformers 行为是否一致
 
 参考包的 `deploy_piper_wx.py` **额外覆盖**了 `embed_image` 和 `embed_language_tokens`，
@@ -24,7 +77,7 @@ embedding 尺度。因此相同代码、相同权重，跨这两个版本也可�
 prompt、残差和后续非线性使模型行为不能仅凭权重 key 全部匹配来保证一致。
 
 用户此前真机环境报告过 Transformers 5.3.0，当前分支依赖声明是 `>=5.4,<5.6`。
-**尚不知道这次实际训练环境与当前真机环境的版本。** 如果训练也用了 5.3.0，不能仅因
+**初次检查时尚不知道实际训练环境；后续实测见上节。** 对其他历史 checkpoint，如果训练也用了 5.3.0，不能仅因
 新版依赖声明就认定必须升级。先复现训练环境，再比较同一 checkpoint 在固定训练样本上的
 预测；也不能仅凭基础模型目录名认定它的历史依赖版本。
 

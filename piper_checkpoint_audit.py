@@ -42,6 +42,21 @@ def installed_version(name):
         return None
 
 
+def runtime_notices(version):
+    notices = [
+        "Import/key-loading success does not verify training/deployment forward equivalence. "
+        "Match the checkpoint's training environment before comparing offline actions."
+    ]
+    if version == "5.3.0":
+        notices.append(
+            "Transformers 5.3.0 has different PaliGemma image and Gemma text embedding scales "
+            "from 5.5.4. For checkpoints trained with 5.5.4, use transformers==5.5.4 and "
+            "rerun the probe and offline action evaluation. This does not establish the "
+            "training version of an unknown checkpoint."
+        )
+    return notices
+
+
 def transformers_sources():
     """Inspect installed source without importing Transformers or constructing models."""
     try:
@@ -212,6 +227,7 @@ def main(argv=None):
         "transformers_sources": transformers_sources(),
         "checkpoint": checkpoint_report(args.policy_path.expanduser().resolve()),
     }
+    report["runtime_notices"] = runtime_notices(report["versions"]["transformers"])
     if args.dataset_info:
         info = read_json(args.dataset_info.expanduser())
         if info is None:
@@ -233,6 +249,8 @@ def main(argv=None):
         json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
     print("Transformers:", report["versions"]["transformers"])
+    for notice in report["runtime_notices"]:
+        print("RUNTIME_NOTICE:", notice)
     print("Training selection:", json.dumps(report["checkpoint"]["training"], ensure_ascii=False))
     if "embedding_probe" in report:
         print("Embedding probe:", json.dumps(report["embedding_probe"], ensure_ascii=False))
