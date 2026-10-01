@@ -1,17 +1,29 @@
-# VLM prompt 长度消融：1 / 2 / 8 / 16
+# VLM prompt 长度消融：1 / 2 / 4 / 8 / 16 / 32
 
-在 `prompt-learning` 分支上，从相同基础模型分别训练四个 `vlm_only` 模型。
+在 `prompt-learning` 分支上，从相同基础模型分别训练不同长度的 `vlm_only` 模型。
 只改变 VLM prompt 的 token 数，action prompt 为 0，CABO 关闭，无 priming/bridge，
-默认均训练 3000 个 flow updates。四组依次执行，适用于当前单卡 A100 环境。
+默认均训练 3000 个 flow updates。各组依次执行，适用于当前单卡 A100 环境。
 
-## 一次运行四组
+## 补训 4、32 tokens
+
+已完成 1、2、8、16 tokens 后，脚本默认列表改为 `4 32`，先完成 4，再开始 32。
 
 在仓库根目录、已激活的 lerobot 环境中运行：
 
 ```bash
-GPU_IDS=0 BATCH_SIZE=32 \
-  bash examples/training/train_pi05_vlm_token_sweep.sh 0
+VLM_PROMPT_TOKEN_COUNTS="4 32" GPU_IDS=0 BATCH_SIZE=32 \
+  bash examples/training/train_pi05_vlm_token_sweep.sh 0 \
+    --wandb.enable=true \
+    --wandb.project=prompt-learning \
+    --wandb.mode=online \
+    --wandb.disable_artifact=true
 ```
+
+该命令为两组开启在线 W&B 记录，project 为 `prompt-learning`，关闭模型 artifact 上传。
+已有 1、2、8、16 的目录不会被纳入本次训练或输出冲突检查。两组均从基础模型独立开始，
+32-token 模型不会接着 4-token checkpoint 训练。
+以后需要完整六组时显式设置 `VLM_PROMPT_TOKEN_COUNTS="1 2 4 8 16 32"`；
+只运行原四组时设置 `VLM_PROMPT_TOKEN_COUNTS="1 2 8 16"`。已有输出仍需使用新的输出根目录或前缀。
 
 最后的 `0` 是训练 seed。数据集、基础模型与 tokenizer 默认沿用原脚本：
 
@@ -21,8 +33,8 @@ PRETRAINED_PATH=/root/autodl-tmp/models/pi05_libero_base
 TOKENIZER_PATH=/root/autodl-tmp/models/google/paligemma-3b-pt-224
 ```
 
-可先加 `DRY_RUN=true` 检查四条完整命令；它仍会检查输入目录和输出冲突，但不会训练或创建日志。
-`GPU_IDS`（复数）控制训练 GPU。`BATCH_SIZE`、`FLOW_STEPS`、精度、学习率等设置应在四组间保持一致。
+可先加 `DRY_RUN=true` 检查两条完整命令；它仍会检查输入目录和输出冲突，但不会训练或创建日志。
+`GPU_IDS`（复数）控制训练 GPU。`BATCH_SIZE`、`FLOW_STEPS`、精度、学习率等设置应在各组间保持一致。
 默认 FP32、batch size 32 与原始消融脚本一致；不会因 token 数改变而自动增加 batch size。
 需要多卡时继续设置 `GPU_IDS=0,1 NUM_PROCESSES=2`，其中 batch size 是每卡的数值。
 
@@ -38,8 +50,10 @@ TOKENIZER_PATH=/root/autodl-tmp/models/google/paligemma-3b-pt-224
 | --- | --- |
 | 1 | `pi05-vlm_only-vlm1-seed0` |
 | 2 | `pi05-vlm_only-vlm2-seed0` |
+| 4 | `pi05-vlm_only-vlm4-seed0` |
 | 8 | `pi05-vlm_only-vlm8-seed0` |
 | 16 | `pi05-vlm_only-vlm16-seed0` |
+| 32 | `pi05-vlm_only-vlm32-seed0` |
 
 各组最终模型位于 `<运行目录>/checkpoints/003000/pretrained_model/`。
 日志在 `/root/autodl-tmp/logs/prompt-learning/vlm-token-sweep/<运行目录名>.log`。
@@ -50,7 +64,7 @@ TOKENIZER_PATH=/root/autodl-tmp/models/google/paligemma-3b-pt-224
 任一训练失败会停止后续组；确认前面组的结果后可明确选择剩余组：
 
 ```bash
-VLM_PROMPT_TOKEN_COUNTS="8 16" \
+VLM_PROMPT_TOKEN_COUNTS="32" \
   bash examples/training/train_pi05_vlm_token_sweep.sh 0
 ```
 
@@ -71,13 +85,22 @@ VLM_PROMPT_TOKENS=8 \
 不设置此变量时，原命令仍是 16 tokens，默认运行名仍为 `pi05-vlm_only-seed0`。
 `action_only` 仍固定为 0 个 VLM prompt；其余含 VLM prompt 的 variant 也可使用这个变量。
 
-四组都应从同一基础 checkpoint 开始，不把之前训练的 16-token 模型作为 1/2/8-token 的预训练路径。
+各组都应从同一基础 checkpoint 开始，不把之前训练的 prompt 模型作为其他长度模型的预训练路径。
 如果 checkpoint 已含 learned prompt tensor，改变长度会产生 shape mismatch，加载器会报错；
 本次修改不会裁剪、复制或重置已保存的 prompt 权重。
 
 ## 后续评估
 
-训练完成后，一条命令依次评测 1、2、8、16 tokens：
+补训完成后，只评测新增的 4、32 tokens：
+
+```bash
+VLM_PROMPT_TOKEN_COUNTS="4 32" GPU_ID=0 bash run_eval_libero_vlm_token_sweep.sh all 0
+```
+
+完整六组使用 `VLM_PROMPT_TOKEN_COUNTS="1 2 4 8 16 32"`。评测脚本的默认列表仍为原四组，
+因此补充组或完整六组评测时必须显式设置列表。
+
+原四组评测命令仍为：
 
 ```bash
 GPU_ID=0 bash run_eval_libero_vlm_token_sweep.sh all 0

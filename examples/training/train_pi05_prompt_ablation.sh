@@ -25,7 +25,8 @@ Set VLM_PROMPT_TOKENS to a positive integer to change the active VLM prompt bank
   VLM_PROMPT_TOKENS=8 bash examples/training/train_pi05_prompt_ablation.sh vlm_only 0
 An explicit token count adds -vlmN to the default run name (even for N=16).
 Without this override, the original 16-token recipe and run name are preserved.
-For sequential 1/2/8/16-token runs, use train_pi05_vlm_token_sweep.sh [SEED].
+For sequential runs, use train_pi05_vlm_token_sweep.sh [SEED] (defaults: 4 then 32).
+Set VLM_PROMPT_TOKEN_COUNTS="1 2 4 8 16 32" on that sweep script for all six lengths.
 EOF
 }
 

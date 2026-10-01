@@ -43,10 +43,18 @@ class VLMTokenSweepTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return [shlex.split(line) for line in result.stdout.splitlines() if line.startswith("env ")]
 
-    def test_default_sweep_has_four_isolated_matched_recipes(self):
-        commands = self.commands(self.run_script("0", "--wandb.notes=token sweep test"))
-        self.assertEqual(len(commands), 4)
-        for tokens, command in zip((1, 2, 8, 16), commands, strict=True):
+    def test_default_sweep_supplements_completed_runs_with_matched_recipes(self):
+        for count in (1, 2, 8, 16):
+            (self.work / "checkpoints" / f"pi05-vlm_only-vlm{count}-seed0").mkdir(parents=True)
+        wandb_args = (
+            "--wandb.enable=true",
+            "--wandb.project=prompt-learning",
+            "--wandb.mode=online",
+            "--wandb.disable_artifact=true",
+        )
+        commands = self.commands(self.run_script("0", *wandb_args))
+        self.assertEqual(len(commands), 2)
+        for tokens, command in zip((4, 32), commands, strict=True):
             expected = (
                 f"--policy.num_vlm_prompt_tokens={tokens}",
                 "--policy.num_prompt_tokens=0",
@@ -56,20 +64,23 @@ class VLMTokenSweepTest(unittest.TestCase):
                 "--steps=3000",
                 "--seed=0",
                 "--batch_size=32",
-                "--wandb.notes=token sweep test",
+                *wandb_args,
                 f"--policy.pretrained_path={self.env['PRETRAINED_PATH']}",
                 f"--output_dir={self.work / 'checkpoints' / f'pi05-vlm_only-vlm{tokens}-seed0'}",
             )
             for arg in expected:
                 self.assertIn(arg, command)
-        self.assertFalse((self.work / "checkpoints").exists())
+        self.assertEqual(
+            {path.name for path in (self.work / "checkpoints").iterdir()},
+            {f"pi05-vlm_only-vlm{count}-seed0" for count in (1, 2, 8, 16)},
+        )
         self.assertFalse((self.work / "logs").exists())
 
     def test_single_run_preserves_legacy_default_and_labels_explicit_lengths(self):
         (legacy,) = self.commands(self.run_script("vlm_only", "0", script=SINGLE))
         self.assertIn("--policy.num_vlm_prompt_tokens=16", legacy)
         self.assertIn("--job_name=pi05-vlm_only-seed0", legacy)
-        for count in (1, 2, 8, 16):
+        for count in (1, 2, 4, 8, 16, 32):
             with self.subTest(count=count):
                 (command,) = self.commands(
                     self.run_script("vlm_only", "0", script=SINGLE, VLM_PROMPT_TOKENS=str(count))
@@ -89,7 +100,7 @@ class VLMTokenSweepTest(unittest.TestCase):
                 self.assertIn(arg, command)
 
     def test_all_destinations_checked_before_any_training(self):
-        (self.work / "checkpoints/pi05-vlm_only-vlm16-seed0").mkdir(parents=True)
+        (self.work / "checkpoints/pi05-vlm_only-vlm32-seed0").mkdir(parents=True)
         result = self.run_script("0", DRY_RUN="false")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Output already exists", result.stderr)
@@ -137,6 +148,7 @@ class VLMTokenSweepTest(unittest.TestCase):
         )
         result = self.run_script(
             "0",
+            VLM_PROMPT_TOKEN_COUNTS="1 2 8 16",
             DRY_RUN="false",
             PATH=f"{bin_dir}{os.pathsep}{self.env['PATH']}",
             CAPTURE_FILE=str(capture),
