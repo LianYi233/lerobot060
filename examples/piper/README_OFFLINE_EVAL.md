@@ -14,6 +14,20 @@
 `meta/`、`videos/` 和完整 checkpoint；只给视频或 `info.json` 无法获得对齐标签。
 无需安装机械臂驱动。初次建议用默认 256 个观测快速检查，再扩大到全部帧。
 
+模型文件、prompt 和特征顺序检查位于根目录的 `piper_policy_utils.py`。
+离线脚本直接使用该模块，不导入 `deploy_piper_vlaa.py`、`deploy_piper_wyn.py`、
+`piper_deploy_guard.py` 或相机工具；本地保留自定义部署入口不会影响离线导入。
+
+若旧版报 `No module named 'deploy_piper_vlaa'`，且该文件曾被本地删除，
+先恢复这个缺失文件，再更新分支（不覆盖自定义 `deploy_piper_wyn.py`）：
+
+```bash
+git restore --source=HEAD --worktree -- deploy_piper_vlaa.py
+git -c http.version=HTTP/1.1 pull --ff-only origin piper
+```
+
+更新后原评估命令不变。临时不方便联网时，只恢复缺失文件也可解除旧版的导入错误。
+
 ```bash
 cd /root/lerobot060
 git pull --ff-only origin piper

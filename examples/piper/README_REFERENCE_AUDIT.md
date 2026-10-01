@@ -54,8 +54,8 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 python eval_piper_offline.py \
 ```
 
 若已有完全相同样本、seed、设置的 5.3.0 离线结果，可直接对比升级前后误差和
-动作曲线；不要用不同采样设置的结果归因版本影响。本分支的离线脚本依赖
-`deploy_piper_vlaa.py` 的只读辅助函数，须保留该文件。
+动作曲线；不要用不同采样设置的结果归因版本影响。离线脚本直接使用
+`piper_policy_utils.py` 的只读辅助函数，不再导入部署入口或硬件保护模块。
 
 ## 最优先：训练与推理的 Transformers 行为是否一致
 

@@ -19,6 +19,7 @@ SOURCE_FILES = (
     "src/lerobot/processor/normalize_processor.py",
     "deploy_piper_wyn.py",
     "deploy_piper_vlaa.py",
+    "piper_policy_utils.py",
     "piper_deploy_guard.py",
     "src/lerobot/robots/piper/piper.py",
     "src/lerobot/robots/piper/configuration_piper.py",

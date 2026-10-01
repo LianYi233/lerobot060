@@ -329,9 +329,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    # Share the deployment's strict checkpoint/source checks. These helpers never
-    # import Piper SDK or RealSense; this script never constructs a robot.
-    from deploy_piper_vlaa import (
+    # Import read-only helpers directly, independent of local deployment scripts.
+    # No deployment entry point, robot guard or camera module is imported here.
+    from piper_policy_utils import (
         activate_checkout_source,
         check_checkpoint_files,
         check_prompt_weights,

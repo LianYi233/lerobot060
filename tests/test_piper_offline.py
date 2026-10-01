@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import math
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -207,6 +208,41 @@ class OfflineTests(unittest.TestCase):
         ):
             offline.main(["--help"])
         self.assertEqual(caught.exception.code, 0)
+
+    def test_main_reaches_ml_loading_without_any_deployment_or_hardware_files(self):
+        # Reproduce the robot PC where deploy_piper_vlaa.py was locally deleted.
+        # Also omit wyn/guard/camera files: offline validation must not need them.
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            isolated = Path(directory)
+            for filename in ("eval_piper_offline.py", "piper_policy_utils.py"):
+                (isolated / filename).write_bytes((root / filename).read_bytes())
+            package = isolated / "src/lerobot"
+            package.mkdir(parents=True)
+            (package / "__init__.py").touch()
+            code = """
+import importlib.abc
+import sys
+
+class NoHardware(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"deploy_piper_vlaa", "deploy_piper_wyn", "piper_deploy_guard",
+                        "piper_camera_check", "piper_sdk", "pyrealsense2", "can"}:
+            raise AssertionError(f"Offline evaluation imported {fullname}")
+        if fullname == "torch":
+            raise RuntimeError("REACHED_ML_LOADING")
+
+sys.meta_path.insert(0, NoHardware())
+import eval_piper_offline
+try:
+    eval_piper_offline.main(["--policy_path", "model", "--dataset_root", "dataset",
+                             "--output_dir", "output"])
+except RuntimeError as error:
+    assert str(error) == "REACHED_ML_LOADING", str(error)
+else:
+    raise AssertionError("Did not reach the model loading boundary")
+"""
+            subprocess.run([sys.executable, "-c", code], cwd=isolated, check=True, capture_output=True)
 
 
 if __name__ == "__main__":
