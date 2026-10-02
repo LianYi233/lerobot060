@@ -217,7 +217,8 @@ class PiperActionEvaluator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # Evaluation never resets or mutates the training processors.
         with evaluation_rng(device, options.seed):
-            self.preprocessor, self.postprocessor = deepcopy(preprocessor), deepcopy(postprocessor)
+            # One deepcopy memo preserves the relative/absolute steps' shared state reference.
+            self.preprocessor, self.postprocessor = deepcopy((preprocessor, postprocessor))
             self.samples = {name: self._cache(dataset) for name, dataset in datasets.items()}
         manifest = {
             "seed": options.seed,
@@ -233,6 +234,11 @@ class PiperActionEvaluator:
         }
         if getattr(options, "sampling", "uniform") != "uniform":
             manifest["sampling"] = options.sampling
+        if getattr(policy_config, "piper_train_normalization", False):
+            manifest["action_representation"] = (
+                "relative_joints_absolute_gripper" if policy_config.use_relative_actions else "absolute"
+            )
+            manifest["normalization_source"] = "training split; saved processors"
         path = self.output_dir / "action_eval_samples.json"
         if path.exists() and json.loads(path.read_text()) != manifest:
             raise ValueError("Fixed action evaluation samples/settings changed in this output directory")

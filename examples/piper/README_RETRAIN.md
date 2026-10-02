@@ -1,5 +1,8 @@
 # Piper task retraining after recorded-action diagnostics
 
+For the newer **12000 total-update direct-flow absolute/relative comparison**, see
+[README_DIRECT_FLOW.md](README_DIRECT_FLOW.md). This page's staged preset stays unchanged.
+
 This is a capacity experiment for real Piper action fitting, separate from the
 0.05M prompt-only method. It does not change labels, hardware control, collision
 protection, or existing launcher defaults.

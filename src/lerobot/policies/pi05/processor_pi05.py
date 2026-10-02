@@ -38,6 +38,10 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+)
 from lerobot.utils.constants import (
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
@@ -143,10 +147,22 @@ def make_pi05_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    relative_step = None
+    if config.use_relative_actions:
+        if not config.action_feature_names or not config.state_feature_names:
+            raise ValueError("PI05 relative actions require saved state/action feature names")
+        relative_step = RelativeActionsProcessorStep(
+            enabled=True,
+            exclude_joints=["gripper.pos"],
+            action_names=config.action_feature_names,
+            state_names=config.state_feature_names,
+        )
+
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        *([relative_step] if relative_step is not None else []),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -168,6 +184,11 @@ def make_pi05_pre_post_processors(
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
+        *(
+            [AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)]
+            if relative_step is not None
+            else []
+        ),
         DeviceProcessorStep(device="cpu"),
     ]
 
@@ -183,3 +204,31 @@ def make_pi05_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+
+def validate_pi05_action_processors(config, preprocessor, postprocessor):
+    """Fail before inference if checkpoint config and serialized action representation disagree."""
+    relative = [s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled]
+    absolute = [s for s in postprocessor.steps if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled]
+    if not config.use_relative_actions:
+        if relative or absolute:
+            raise ValueError("Absolute PI05 config cannot load relative action processors")
+        return
+    if len(relative) != 1 or len(absolute) != 1:
+        raise ValueError("Relative PI05 checkpoint requires paired relative/absolute action processors")
+    step = relative[0]
+    if (
+        not config.action_feature_names
+        or not config.state_feature_names
+        or step.action_names != config.action_feature_names
+        or step.state_names != config.state_feature_names
+        or step.exclude_joints != ["gripper.pos"]
+        or absolute[0].relative_step is not step
+    ):
+        raise ValueError("Relative PI05 processors do not match saved coordinate order/gripper convention")
+    normalizer = next(s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep))
+    unnormalizer = next(s for s in postprocessor.steps if isinstance(s, UnnormalizerProcessorStep))
+    if preprocessor.steps.index(step) > preprocessor.steps.index(normalizer) or postprocessor.steps.index(
+        absolute[0]
+    ) < postprocessor.steps.index(unnormalizer):
+        raise ValueError("Relative actions must be converted in physical units outside normalization")

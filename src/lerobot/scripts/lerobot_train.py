@@ -20,6 +20,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import copy
 import dataclasses
+import json
 import logging
 import sys
 import time
@@ -671,6 +672,26 @@ def _train_single_stage(
     if not is_main_process:
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    piper_refit = getattr(active_cfg, "piper_train_normalization", False)
+    piper_processor_stats = None
+    if piper_refit and not cfg.resume:
+        from lerobot.utils.piper_action_representation import fit_piper_train_normalization
+
+        # Deterministic numeric-only fitting on each rank's identical training split.
+        # Never fit on eval_dataset or mutate dataset.meta.stats (absolute source metadata).
+        piper_processor_stats, normalization_report = fit_piper_train_normalization(dataset, active_cfg)
+        if is_main_process:
+            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(cfg.output_dir) / "piper_normalization.json").write_text(
+                json.dumps(normalization_report, indent=2) + "\n"
+            )
+            logging.info(
+                "Piper normalization: %s, train_frames=%s, valid_pairs=%s (saved in processors)",
+                normalization_report["representation"],
+                normalization_report["training_frames"],
+                normalization_report["valid_action_pairs"],
+            )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -719,10 +740,16 @@ def _train_single_stage(
     accelerator.wait_for_everyone()
 
     processor_pretrained_path = active_cfg.pretrained_path
+    if piper_refit and not cfg.resume:
+        # Base weights are already loaded above. Build processors for this target representation,
+        # rather than overriding an absolute base pipeline that has no relative action steps.
+        processor_pretrained_path = None
 
     processor_kwargs = {}
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = (
+            piper_processor_stats if piper_processor_stats is not None else dataset.meta.stats
+        )
 
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
@@ -747,7 +774,11 @@ def _train_single_stage(
                 "norm_map": policy.config.normalization_mapping,
             },
         }
-        if getattr(active_cfg, "use_relative_actions", False):
+        if piper_refit:
+            # Resume must use the checkpoint's fitted statistics and coordinate conversion.
+            preprocessor_overrides.pop("normalizer_processor")
+            postprocessor_overrides.pop("unnormalizer_processor")
+        elif getattr(active_cfg, "use_relative_actions", False):
             preprocessor_overrides["relative_actions_processor"] = {
                 "enabled": True,
                 "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),

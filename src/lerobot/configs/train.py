@@ -236,6 +236,10 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if getattr(active_cfg, "piper_train_normalization", False) and (
+            self.dataset.streaming or self.rename_map or self.peft is not None
+        ):
+            raise ValueError("Piper train normalization requires a non-streaming dataset without renames/PEFT")
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

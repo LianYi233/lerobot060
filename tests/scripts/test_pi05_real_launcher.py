@@ -18,6 +18,7 @@ LAUNCHER = ROOT / "examples/training/train_pi05_real.sh"
 AUTODL = ROOT / "examples/training/train_piper_autodl.sh"
 FIT = ROOT / "examples/training/train_piper_fit.sh"
 RETRAIN = ROOT / "examples/training/train_piper_retrain.sh"
+DIRECT = ROOT / "examples/training/train_piper_direct.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -379,6 +380,35 @@ class RealLauncherTest(unittest.TestCase):
             self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
             self.assertIn("lerobot.utils.piper_data_audit", result.stdout)
             self.assertFalse((self.work / "logs").exists())
+
+    def test_direct_absolute_relative_share_12k_budget_and_training_split(self):
+        for profile, relative in (("absolute", "false"), ("relative", "true")):
+            with self.subTest(profile=profile):
+                (command,) = self.command_args(
+                    self.run_autodl(
+                        "1", profile, "0", script=DIRECT, GPU_IDS="2,3", NUM_PROCESSES="2", BATCH_SIZE="16"
+                    )
+                )
+                for arg in (
+                    "--steps=12000",
+                    "--save_steps=[6000,9000,12000]",
+                    "--multi_gpu",
+                    "--num_processes=2",
+                    "CUDA_VISIBLE_DEVICES=2,3",
+                    "--batch_size=16",
+                    "--policy.next_action_pretrain_steps=0",
+                    "--policy.next_action_bridge_steps=0",
+                    "--policy.cabo_enabled=false",
+                    "--policy.train_action_expert_last_n_layers=2",
+                    "--policy.train_action_projections=true",
+                    "--policy.piper_train_normalization=true",
+                    f"--policy.use_relative_actions={relative}",
+                    "--dataset.eval_split=0.1",
+                    "--piper_eval.samples=128",
+                    "--piper_eval.select_best_saved=true",
+                ):
+                    self.assertIn(arg, command)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
 
     def test_fit_full_data_schedule_multi_gpu_and_default_profile(self):
         (command,) = self.command_args(

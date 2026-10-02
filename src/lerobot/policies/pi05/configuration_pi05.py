@@ -66,6 +66,13 @@ class PI05Config(PreTrainedConfig):
     train_action_expert_last_n_layers: int = 0
     action_expert_lr_scale: float = 0.1
 
+    # Opt-in Piper experiment. Refit state/action statistics on the selected training split.
+    # Relative labels use q[t+k] - q[t] for six joints; gripper stays absolute.
+    piper_train_normalization: bool = False
+    use_relative_actions: bool = False
+    action_feature_names: list[str] | None = None
+    state_feature_names: list[str] | None = None
+
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
@@ -186,12 +193,31 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    def set_dataset_feature_metadata(self, features):
+        """Record explicit Piper coordinate orders; reject checkpoint/dataset order changes."""
+        if not self.piper_train_normalization:
+            return
+        from lerobot.utils.piper_training_eval import piper_names
+
+        action_names, state_names = piper_names(features)
+        for attr, names in (("action_feature_names", action_names), ("state_feature_names", state_names)):
+            saved = getattr(self, attr)
+            if saved is not None and saved != names:
+                raise ValueError(
+                    f"Piper checkpoint {attr} differs from the dataset; refusing to reorder labels"
+                )
+            setattr(self, attr, list(names))
+
     def __post_init__(self):
         super().__post_init__()
 
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
+        if self.use_relative_actions and not self.piper_train_normalization:
+            raise ValueError("PI05 relative actions require piper_train_normalization=True")
+        if self.piper_train_normalization and self.use_peft:
+            raise ValueError("Piper action representation experiments require full checkpoints, not PEFT")
         if (
             type(self.train_action_expert_last_n_layers) is not int
             or not 0 <= self.train_action_expert_last_n_layers <= 18

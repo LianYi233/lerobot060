@@ -341,6 +341,10 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, PI05Config):
+            from .pi05.processor_pi05 import validate_pi05_action_processors
+
+            validate_pi05_action_processors(policy_cfg, preprocessor, postprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
@@ -582,7 +586,7 @@ def make_policy(
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
     # Store action feature names for relative_exclude_joints support
-    if ds_meta is not None and hasattr(cfg, "action_feature_names"):
+    if ds_meta is not None and hasattr(cfg, "action_feature_names") and not isinstance(cfg, PI05Config):
         action_names = ds_meta.features.get(ACTION, {}).get("names")
         if action_names is not None:
             cfg.action_feature_names = list(action_names)

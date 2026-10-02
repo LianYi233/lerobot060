@@ -119,6 +119,15 @@ def deployment_features(policy_cfg, dataset_info=None):
                     f"{key}.names 必须对应原 Piper 驱动的关节与夹爪名称，实际为 {names}；不能猜测顺序"
                 )
         result[key] = {"dtype": "float32", "shape": (7,), "names": list(names)}
+        if getattr(policy_cfg, "piper_train_normalization", False):
+            attr = "state_feature_names" if key == "observation.state" else "action_feature_names"
+            saved_names = getattr(policy_cfg, attr, None)
+            if not isinstance(saved_names, list) or sorted(saved_names) != sorted(expected_names):
+                raise ValueError(f"Checkpoint 缺少明确的 {attr}；不能猜测相对动作的关节顺序")
+            if dataset_info is None:
+                result[key]["names"] = list(saved_names)
+            elif names != saved_names:
+                raise ValueError(f"指定数据的 {key}.names 与 checkpoint 保存的顺序不一致")
     for key, feature in policy_cfg.image_features.items():
         if not key.startswith("observation.images.") or len(feature.shape) != 3 or feature.shape[0] != 3:
             raise ValueError(f"不支持的相机特征: {key}={feature.shape}")

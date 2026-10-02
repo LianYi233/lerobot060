@@ -101,7 +101,21 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    # Optional explicit mapping when observation and action coordinates have different orders.
+    state_names: list[str] | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.state_names is not None and (
+            self.action_names is None
+            or len(set(self.state_names)) != len(self.state_names)
+            or len(set(self.action_names)) != len(self.action_names)
+            or set(self.state_names) != set(self.action_names)
+        ):
+            raise ValueError("Relative actions require matching, uniquely named state/action coordinates")
+
+    def reset(self):
+        self._last_state = None
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -126,12 +140,19 @@ class RelativeActionsProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
 
-        # Always cache state for the paired AbsoluteActionsProcessorStep
-        if state is not None:
-            self._last_state = state
-
         if not self.enabled:
             return transition
+
+        # Missing observations must not reuse an earlier inference request's reference.
+        self._last_state = None
+        if state is None:
+            raise ValueError("Relative actions require observation.state in every preprocessing call")
+        if self.state_names is not None:
+            if state.shape[-1] != len(self.state_names):
+                raise ValueError("Relative action state dimension does not match saved coordinate names")
+            state = state[..., [self.state_names.index(name) for name in self.action_names]]
+        # Keep the physical state at this observation time for the ENTIRE predicted chunk.
+        self._last_state = state.detach().clone()
 
         new_transition = transition.copy()
         action = new_transition.get(TransitionKey.ACTION)
@@ -151,6 +172,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "state_names": self.state_names,
         }
 
     def transform_features(
