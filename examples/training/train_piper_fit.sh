@@ -11,11 +11,12 @@ TASK: 1,2,3,4 or all. PROFILE (default projections):
   prompt_lr     Prompt-only LR 1e-4, CABO on
   no_cabo       Same LR 1e-4, CABO off
   projections   Same as no_cabo, also train action_in_proj and action_out_proj
+  expert_last2  Same as projections, also train last 2 action expert blocks at 0.1x LR
 
 All profiles use 750 priming + 250 bridge, 50 predicted / 8 executed actions,
 FP32 and the same data/normalization. Change one factor at each comparison.
 projections has 115,744 trainable parameters for the default model; it is not
-the 49,152-parameter prompt-only method. Neither backbone is unfrozen.
+the 49,152-parameter prompt-only method. Only expert_last2 unfreezes backbone blocks.
 
 Defaults: fit episode [0] for 2000 formal flow steps, save only final checkpoint.
 FIT_EPISODES='[0,1,2]' selects a few episodes; FIT_EPISODES=all selects all data.
@@ -37,6 +38,7 @@ SEED="${3:-0}"
 if (( $# >= 3 )); then shift 3; else shift "$#"; fi
 
 TRAIN_PROJECTIONS=false
+EXPERT_LAYERS=0
 VARIANT=full_reference
 PROMPT_LR=0.0001
 case "${PROFILE}" in
@@ -44,6 +46,7 @@ case "${PROFILE}" in
   prompt_lr) ;;
   no_cabo) VARIANT=no_cabo ;;
   projections) VARIANT=no_cabo; TRAIN_PROJECTIONS=true ;;
+  expert_last2) VARIANT=no_cabo; TRAIN_PROJECTIONS=true; EXPERT_LAYERS=2 ;;
   *) echo "Unknown profile ${PROFILE}; use --help" >&2; exit 2 ;;
 esac
 
@@ -57,6 +60,8 @@ export COMPILE_MODEL="${COMPILE_MODEL:-false}"
 FIT_EPISODES="${FIT_EPISODES:-[0]}"
 FIT_ARGS=(
   "--policy.train_action_projections=${TRAIN_PROJECTIONS}"
+  "--policy.train_action_expert_last_n_layers=${EXPERT_LAYERS}"
+  --policy.action_expert_lr_scale=0.1
   "--policy.optimizer_lr=${PROMPT_LR}"
   --policy.scheduler_decay_lr=0.00001
   --dataset.image_transforms.enable=false

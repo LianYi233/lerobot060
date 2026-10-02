@@ -93,6 +93,9 @@ def action_metrics(predicted, target, valid, hold, names, horizons, moving_thres
         scores["moving_pairs"] = int(moving.sum())
         if moving.any():
             scores["moving_joint_mae_deg"] = float(np.abs(joint_error[moving]).mean())
+            scores["moving_hold_joint_mae_deg"] = float(np.abs(hold_joint[moving]).mean())
+            scores["moving_gripper_mae"] = float(np.abs(error[moving, gripper]).mean())
+            scores["moving_hold_gripper_mae"] = float(np.abs(baseline[moving, gripper]).mean())
         if horizon > 1:
             adjacent = mask[:, 1:] & mask[:, :-1]
             delta_error = (np.diff(predicted[:, :horizon], axis=1) - np.diff(target[:, :horizon], axis=1))[
@@ -106,6 +109,77 @@ def action_metrics(predicted, target, valid, hold, names, horizons, moving_thres
                 scores["gripper_delta_mae_per_step"] = float(np.abs(delta_error[:, gripper]).mean())
         metrics.update({prefix + key: value for key, value in scores.items()})
     return metrics
+
+
+def episode_stratified_indices(episode_ids, samples, seed):
+    """Spread a fixed budget across episodes and their temporal bins, without reading labels."""
+    episode_ids = np.asarray(episode_ids)
+    groups = [np.flatnonzero(episode_ids == ep) for ep in np.unique(episode_ids)]
+    budget = min(samples, len(episode_ids))
+    rng = np.random.default_rng(seed)
+    counts = np.zeros(len(groups), dtype=int)
+    while counts.sum() < budget:
+        for i in rng.permutation(len(groups)):
+            if counts[i] < len(groups[i]):
+                counts[i] += 1
+                if counts.sum() == budget:
+                    break
+    indices = []
+    for group, count in zip(groups, counts, strict=True):
+        if count:
+            for bin_indices in np.array_split(group, count):
+                indices.append(int(rng.choice(bin_indices)))
+    return np.sort(indices)
+
+
+def update_best_saved_checkpoints(output_dir, checkpoint_dir, step, scores, execution_steps):
+    """Choose separately by physical-unit joint / gripper error, only among saved models.
+
+    Prefer held-out episodes. Never mix degrees and gripper units into an arbitrary scalar.
+    Links do not copy weights or delete intermediate checkpoints.
+    """
+    output_dir, checkpoint_dir = Path(output_dir), Path(checkpoint_dir)
+    if not (checkpoint_dir / "pretrained_model/config.json").is_file():
+        raise ValueError("Best-checkpoint selection requires a completed saved checkpoint")
+    split = "val" if f"action_val/h{execution_steps}/joint_mae_deg" in scores else "train"
+    path = output_dir / "best_action_checkpoints.json"
+    result = (
+        json.loads(path.read_text())
+        if path.exists()
+        else {
+            "scope": "best among saved checkpoints only",
+            "split": split,
+            "execution_steps": execution_steps,
+            "checkpoints": {},
+        }
+    )
+    if result["split"] != split or result["execution_steps"] != execution_steps:
+        raise ValueError("Best-checkpoint selection split/horizon changed; use a fresh output directory")
+    for name, suffix in (("best_joint", "joint_mae_deg"), ("best_gripper", "gripper_mae")):
+        metric = f"action_{split}/h{execution_steps}/{suffix}"
+        value = float(scores[metric])
+        if not math.isfinite(value):
+            raise ValueError(f"Cannot select best checkpoint with nonfinite {metric}")
+        previous = result["checkpoints"].get(name)
+        if previous is None or value < previous["value"]:
+            link = checkpoint_dir.parent / name
+            if link.exists() and not link.is_symlink():
+                raise ValueError(f"Refusing to replace non-symlink {link}")
+            temporary = link.with_name(f".{name}.tmp")
+            if temporary.is_symlink():
+                temporary.unlink()
+            temporary.symlink_to(checkpoint_dir.name, target_is_directory=True)
+            temporary.replace(link)
+            result["checkpoints"][name] = {
+                "step": step,
+                "metric": metric,
+                "value": value,
+                "path": str(checkpoint_dir.relative_to(output_dir)),
+            }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
+    return result
 
 
 @contextmanager
@@ -157,6 +231,8 @@ class PiperActionEvaluator:
                 name: [sample["identity"] for sample in samples] for name, samples in self.samples.items()
             },
         }
+        if getattr(options, "sampling", "uniform") != "uniform":
+            manifest["sampling"] = options.sampling
         path = self.output_dir / "action_eval_samples.json"
         if path.exists() and json.loads(path.read_text()) != manifest:
             raise ValueError("Fixed action evaluation samples/settings changed in this output directory")
@@ -171,6 +247,12 @@ class PiperActionEvaluator:
         if len(dataset) == 0:
             raise ValueError("Empty action evaluation split")
         indices = np.linspace(0, len(dataset) - 1, min(self.options.samples, len(dataset)), dtype=int)
+        if getattr(self.options, "sampling", "uniform") == "episode_stratified":
+            indices = episode_stratified_indices(
+                dataset.hf_dataset.data.column("episode_index").to_numpy(),
+                self.options.samples,
+                self.options.seed,
+            )
         original_transforms = dataset.image_transforms
         samples = []
         dataset.clear_image_transforms()
@@ -292,6 +374,13 @@ class ActionParameterMonitor:
             name: list(getattr(policy.model, name).parameters())
             for name in ("vlm_prompt_tokens", "prompt_tokens", "action_in_proj", "action_out_proj")
         }
+        if getattr(getattr(policy, "config", None), "train_action_expert_last_n_layers", 0):
+            self.groups["action_expert_blocks"] = [
+                parameter
+                for block in policy.model.trainable_expert_blocks()
+                for parameter in block.parameters()
+                if parameter.requires_grad
+            ]
 
     def before_step(self):
         import torch

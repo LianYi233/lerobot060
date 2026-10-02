@@ -14,6 +14,9 @@ class PiperEvalConfig:
     moving_threshold_deg: float = 1.0
     # Sample the actual optimizer update every N steps (0 disables this instrumentation).
     update_freq: int = 0
+    sampling: str = "uniform"
+    # Link best_joint / best_gripper among checkpoints that were actually saved.
+    select_best_saved: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -30,3 +33,7 @@ class PiperEvalConfig:
                 raise ValueError(f"piper_eval.{name} must be a positive integer")
         if not math.isfinite(self.moving_threshold_deg) or self.moving_threshold_deg <= 0:
             raise ValueError("piper_eval.moving_threshold_deg must be finite and positive")
+        if self.sampling not in ("uniform", "episode_stratified"):
+            raise ValueError("piper_eval.sampling must be uniform or episode_stratified")
+        if self.select_best_saved and self.freq == 0:
+            raise ValueError("select_best_saved requires piper_eval.freq > 0")

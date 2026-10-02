@@ -801,7 +801,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self._freeze_backbones()
 
     def _freeze_backbones(self) -> None:
-        """Freeze backbones, preserving active prompts and opt-in action projections.
+        """Enforce the explicit prompt / projection / last-expert-block partition.
 
         Preserve PEFT's active modules_to_save selection: its original prompt copies must stay
         frozen. Autograd remains enabled through both backbones to reach the input prompts.
@@ -810,6 +810,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         trainable_modules = [self.vlm_prompt_tokens, self.prompt_tokens]
         if getattr(self.config, "train_action_projections", False):
             trainable_modules.extend([self.action_in_proj, self.action_out_proj])
+        expert_blocks = self.trainable_expert_blocks()
+        trainable_modules.extend(expert_blocks)
         for module in trainable_modules:
             modules_to_save = getattr(module, "modules_to_save", None)
             if modules_to_save is None:
@@ -834,6 +836,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 parameter.grad = None
         self.paligemma_with_expert.paligemma.eval()
         self.paligemma_with_expert.gemma_expert.eval()
+        for block in expert_blocks:
+            block.train(self.training)
+
+    def trainable_expert_blocks(self) -> list[nn.Module]:
+        count = getattr(self.config, "train_action_expert_last_n_layers", 0)
+        if count == 0:
+            return []
+        layers = self.paligemma_with_expert.gemma_expert.model.layers
+        if count > len(layers):
+            raise ValueError(f"Requested {count} trainable expert blocks, but model has {len(layers)}")
+        return list(layers[-count:])
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -1719,6 +1732,20 @@ class PI05Policy(PreTrainedPolicy):
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
                 raise ValueError("PI05 training requires trainable prompts or explicit action projections")
+            if getattr(self.config, "train_action_expert_last_n_layers", 0):
+                expert = _unique_trainable_parameters(self.model.trainable_expert_blocks())
+                expert_ids = {id(parameter) for parameter in expert}
+                return [
+                    {
+                        "params": [p for p in parameters if id(p) not in expert_ids],
+                        "name": "prompts_projections",
+                    },
+                    {
+                        "params": expert,
+                        "name": "action_expert_blocks",
+                        "lr": self.config.optimizer_lr * self.config.action_expert_lr_scale,
+                    },
+                ]
             return parameters
         vlm_parameters, action_parameters = self._cabo_parameter_groups()
         return [

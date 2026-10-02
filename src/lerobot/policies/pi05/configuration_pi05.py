@@ -61,12 +61,17 @@ class PI05Config(PreTrainedConfig):
     # This changes the prompt-only parameter budget and requires CABO/PEFT to be disabled.
     # It adds no checkpoint tensors and never unfreezes the VLM or action transformer.
     train_action_projections: bool = False
+    # Explicit Piper capacity experiment; 0 preserves every existing prompt-only checkpoint.
+    # Unfreeze only the last N action transformer blocks, not the VLM or time/final-norm maps.
+    train_action_expert_last_n_layers: int = 0
+    action_expert_lr_scale: float = 0.1
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
-    # Training stage. Both stages freeze the VLM and action path. ``next_action`` is kept as the public name for
+    # Training stage. By default both stages freeze the VLM and action backbone. Explicit expert
+    # block adaptation applies to all stages. ``next_action`` is kept as the public name for
     # backwards compatibility; its base objective is action-only flow inpainting over the chunk.
     # The integrated trainer may route its final bridge updates through the standard
     # observation-conditioned objective without changing this stage or its optimizer. Action-only
@@ -137,7 +142,7 @@ class PI05Config(PreTrainedConfig):
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Legacy finetuning flags retained for checkpoint/CLI compatibility. Both backbones remain
-    # frozen; train_action_projections is the explicit opt-in for the two action linear maps.
+    # frozen unless an explicit projection / last-expert-block adaptation setting is used.
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
 
@@ -187,6 +192,20 @@ class PI05Config(PreTrainedConfig):
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
+        if (
+            type(self.train_action_expert_last_n_layers) is not int
+            or not 0 <= self.train_action_expert_last_n_layers <= 18
+        ):
+            raise ValueError("train_action_expert_last_n_layers must be an integer between 0 and 18")
+        if not math.isfinite(self.action_expert_lr_scale) or not 0 < self.action_expert_lr_scale <= 1:
+            raise ValueError("action_expert_lr_scale must be finite and in (0, 1]")
+        if self.train_action_expert_last_n_layers and (
+            self.cabo_enabled or self.use_peft or not self.train_action_projections
+        ):
+            raise ValueError(
+                "Action expert adaptation requires train_action_projections=True, "
+                "cabo_enabled=False and use_peft=False; save full checkpoints."
+            )
         if self.train_action_projections and (self.cabo_enabled or self.use_peft):
             raise ValueError(
                 "train_action_projections requires cabo_enabled=False and use_peft=False. "

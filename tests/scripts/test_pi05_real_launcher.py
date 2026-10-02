@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples/training/train_pi05_real.sh"
 AUTODL = ROOT / "examples/training/train_piper_autodl.sh"
 FIT = ROOT / "examples/training/train_piper_fit.sh"
+RETRAIN = ROOT / "examples/training/train_piper_retrain.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -356,6 +357,28 @@ class RealLauncherTest(unittest.TestCase):
                 ):
                     self.assertIn(arg, command)
         self.assertFalse((self.work / "chkpt").exists())
+
+    def test_retrain_profiles_use_same_data_audit_validation_and_schedule(self):
+        for profile, count in (("expert_last2", 2), ("projections", 0)):
+            result = self.run_autodl("1", profile, "0", script=RETRAIN, GPU_IDS="2,3", BATCH_SIZE="16")
+            (command,) = self.command_args(result)
+            for arg in (
+                "--steps=3000",
+                "--save_steps=[1000,2000,3000]",
+                "--dataset.eval_split=0.1",
+                "--piper_eval.samples=128",
+                "--piper_eval.sampling=episode_stratified",
+                "--piper_eval.select_best_saved=true",
+                "--multi_gpu",
+                "--num_processes=2",
+                "--batch_size=16",
+                "--policy.train_action_projections=true",
+                f"--policy.train_action_expert_last_n_layers={count}",
+            ):
+                self.assertIn(arg, command)
+            self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+            self.assertIn("lerobot.utils.piper_data_audit", result.stdout)
+            self.assertFalse((self.work / "logs").exists())
 
     def test_fit_full_data_schedule_multi_gpu_and_default_profile(self):
         (command,) = self.command_args(

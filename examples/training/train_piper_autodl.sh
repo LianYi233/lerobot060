@@ -99,5 +99,7 @@ exec bash "${SCRIPT_DIR}/train_pi05_real.sh" "${TASK}" "${VARIANT}" "${SEED}" \
   "--piper_eval.seed=${ACTION_EVAL_SEED:-0}" \
   "--piper_eval.execution_steps=${N_ACTION_STEPS}" \
   "--piper_eval.update_freq=${ACTION_UPDATE_FREQ:-50}" \
+  "--piper_eval.sampling=${ACTION_EVAL_SAMPLING:-uniform}" \
+  "--piper_eval.select_best_saved=${ACTION_SELECT_BEST_SAVED:-false}" \
   "--dataset.eval_split=${EVAL_SPLIT:-0}" \
   "--num_workers=${NUM_WORKERS:-4}" "$@"

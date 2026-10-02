@@ -308,6 +308,10 @@ def update_policy(
 
     if parameter_monitor is not None:
         parameter_monitor.before_step()
+        if output_dict is None:
+            output_dict = {}
+        for index, group in enumerate(optimizer.param_groups):
+            output_dict[f"action_update/lr/{group.get('name', str(index))}"] = group["lr"]
 
     if not optimizer_step_control.skip_optimizer_step:
         # Optimizer step
@@ -814,7 +818,13 @@ def _train_single_stage(
 
     # TRAINABLE_PARAMETER_REPORT_V1
     if is_main_process:
-        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "action_projection": 0, "other": 0}
+        _parameter_counts = {
+            "vlm_prompt": 0,
+            "action_prompt": 0,
+            "action_projection": 0,
+            "action_expert_blocks": 0,
+            "other": 0,
+        }
         logging.info("========== Trainable parameter report ==========")
         logging.info("Training stage: %s", getattr(cfg.policy, "training_stage", "unknown"))
         for _name, _parameter in policy.named_parameters():
@@ -827,6 +837,8 @@ def _train_single_stage(
                 _category = "action_prompt"
             elif any(part in _name.split(".") for part in ("action_in_proj", "action_out_proj")):
                 _category = "action_projection"
+            elif "gemma_expert.model.layers." in _name:
+                _category = "action_expert_blocks"
             else:
                 _category = "other"
             _parameter_counts[_category] += _count
@@ -982,6 +994,7 @@ def _train_single_stage(
             ActionParameterMonitor,
             PiperActionEvaluator,
             on_main_process,
+            update_best_saved_checkpoints,
         )
 
         if cfg.piper_eval.update_freq > 0 and is_main_process:
@@ -1014,9 +1027,11 @@ def _train_single_stage(
             logging.info("PIPER_ACTION_EVAL step=%d %s=%.4f", completed_step, key, scores[key])
             if wandb_logger:
                 wandb_logger.log_dict(scores, step=completed_step, mode="eval")
+        return scores
 
+    last_action_scores = None
     if cfg.piper_eval.freq > 0:
-        log_action_evaluation(step)
+        last_action_scores = log_action_evaluation(step)
 
     pi05_diagnostics_enabled = not cfg.is_reward_model_training and active_cfg.type == "pi05"
     diagnostics = None
@@ -1026,6 +1041,10 @@ def _train_single_stage(
             {
                 "training_stage": str(active_cfg.training_stage),
                 "train_action_projections": getattr(active_cfg, "train_action_projections", False),
+                "train_action_expert_last_n_layers": getattr(
+                    active_cfg, "train_action_expert_last_n_layers", 0
+                ),
+                "action_expert_lr_scale": getattr(active_cfg, "action_expert_lr_scale", None),
                 "trainable_parameters": num_learnable_params,
                 "action_names": dataset.meta.features["action"].get("names"),
                 "num_processes": accelerator.num_processes,
@@ -1161,9 +1180,12 @@ def _train_single_stage(
             train_tracker.reset_averages()
 
         if cfg.piper_eval.freq > 0 and (
-            step % cfg.piper_eval.freq == 0 or step == cfg.steps or step == pi05_stage1_bridge_start_step
+            step % cfg.piper_eval.freq == 0
+            or step == cfg.steps
+            or step == pi05_stage1_bridge_start_step
+            or (cfg.piper_eval.select_best_saved and cfg.save_checkpoint and is_saving_step)
         ):
-            log_action_evaluation(step)
+            last_action_scores = log_action_evaluation(step)
 
         if is_eval_step:
             policy.eval()
@@ -1239,6 +1261,17 @@ def _train_single_stage(
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
+            if cfg.piper_eval.select_best_saved:
+                on_main_process(
+                    accelerator,
+                    lambda completed_step=step, scores=last_action_scores: update_best_saved_checkpoints(
+                        cfg.output_dir,
+                        get_step_checkpoint_dir(cfg.output_dir, cfg.steps, completed_step),
+                        completed_step,
+                        scores,
+                        cfg.piper_eval.execution_steps,
+                    ),
+                )
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:

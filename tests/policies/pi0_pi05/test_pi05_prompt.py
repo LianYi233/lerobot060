@@ -24,6 +24,7 @@ from safetensors.torch import load_file, save_file
 
 pytest.importorskip("transformers")
 
+from lerobot.configs.policies import PreTrainedConfig  # noqa: E402
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.optim.cabo import temporary_optimizer_group_lr_scales  # noqa: E402
 from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05  # noqa: E402
@@ -197,6 +198,87 @@ def test_projection_adaptation_rejects_prompt_only_cabo_and_peft():
     policy = PI05Policy(_config(train_action_projections=True, cabo_enabled=False))
     with pytest.raises(ValueError, match="full checkpoints"):
         policy.wrap_with_peft()
+
+
+@pytest.mark.parametrize("phase", ["action_only", "bridge", "flow"])
+def test_last_expert_block_adaptation_updates_and_reloads(phase, monkeypatch, tmp_path):
+    cfg = _config(
+        training_stage="flow" if phase == "flow" else "next_action",
+        next_action_bridge_steps=1,
+        cabo_enabled=False,
+        train_action_projections=True,
+        train_action_expert_last_n_layers=1,
+        optimizer_lr=1e-3,
+        action_expert_lr_scale=0.1,
+    )
+    policy = PI05Policy(cfg)
+    policy.requires_grad_(True)
+    policy.eval().train()
+    policy.set_training_progress(step=2 if phase == "bridge" else 0, total_steps=3)
+    expert_prefix = "model.paligemma_with_expert.gemma_expert.model.layers.1."
+    for name, parameter in policy.named_parameters():
+        allowed = name in _PROMPT_KEYS or name.startswith(
+            (
+                "model.action_in_proj.",
+                "model.action_out_proj.",
+                expert_prefix,
+            )
+        )
+        assert parameter.requires_grad == allowed, name
+    before = {name: value.clone() for name, value in policy.state_dict().items()}
+    optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=cfg.optimizer_lr, weight_decay=0)
+    scheduler = cfg.get_scheduler_preset().build(optimizer, 3000)
+    assert len(optimizer.param_groups) == 2
+    assert optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    grouped = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    assert len(grouped) == len(set(grouped))
+    assert set(grouped) == {id(p) for p in policy.parameters() if p.requires_grad}
+    inputs = _inputs()
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _: (inputs["images"], inputs["img_masks"]))
+    batch = {
+        ACTION: _actions(),
+        "action_is_pad": torch.zeros(2, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: inputs["tokens"],
+        OBS_LANGUAGE_ATTENTION_MASK: inputs["masks"],
+    }
+    loss, _ = policy(batch)
+    loss.backward()
+    expert_gradients = [p.grad for name, p in policy.named_parameters() if name.startswith(expert_prefix)]
+    assert any(g is not None and g.abs().sum() > 0 for g in expert_gradients)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    after = policy.state_dict()
+    assert any(not torch.equal(before[name], after[name]) for name in after if name.startswith(expert_prefix))
+    for name, parameter in policy.named_parameters():
+        if not parameter.requires_grad:
+            assert parameter.grad is None
+            torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+    directory = tmp_path / "checkpoint"
+    _save_checkpoint(directory, policy)
+    cfg.save_pretrained(directory)
+    loaded_cfg = PreTrainedConfig.from_pretrained(directory, local_files_only=True)
+    assert loaded_cfg.train_action_expert_last_n_layers == 1
+    reloaded = PI05Policy.from_pretrained(directory, config=loaded_cfg, strict=True)
+    for name in after:
+        torch.testing.assert_close(reloaded.state_dict()[name], after[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"train_action_expert_last_n_layers": -1},
+        {"train_action_expert_last_n_layers": True},
+        {"train_action_expert_last_n_layers": 19},
+        {"train_action_expert_last_n_layers": 1},
+        {"train_action_expert_last_n_layers": 1, "cabo_enabled": False},
+        {"action_expert_lr_scale": 0},
+        {"action_expert_lr_scale": float("nan")},
+    ],
+)
+def test_expert_adaptation_rejects_invalid_partition_or_lr(options):
+    with pytest.raises(ValueError):
+        _config(**options)
 
 
 @pytest.mark.parametrize("phase", ["action_only", "bridge", "flow"])

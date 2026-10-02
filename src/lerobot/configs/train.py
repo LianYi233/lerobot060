@@ -225,6 +225,8 @@ class TrainPipelineConfig(HubMixin):
     def validate(self) -> None:
         self.validate_checkpoint_schedule()
         self.piper_eval.validate()
+        if self.piper_eval.select_best_saved and not self.save_checkpoint:
+            raise ValueError("piper_eval.select_best_saved requires save_checkpoint=True")
         self._resolve_pretrained_from_cli()
 
         if self.policy is None and self.reward_model is None:
@@ -239,6 +241,11 @@ class TrainPipelineConfig(HubMixin):
                 "`rename_map` requires a pretrained policy checkpoint. "
                 "Fresh initialization derives feature names from the current dataset, so no rename is applied."
             )
+        if (
+            getattr(active_cfg, "train_action_expert_last_n_layers", 0)
+            and not self.use_policy_training_preset
+        ):
+            raise ValueError("Action expert LR groups require use_policy_training_preset=True")
 
         if self.piper_eval.enabled:
             if self.is_reward_model_training or active_cfg.type != "pi05" or self.dataset.streaming:

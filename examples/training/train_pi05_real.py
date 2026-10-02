@@ -208,6 +208,9 @@ def main() -> int:
     env.setdefault("SAVE_FREQ", "500")
     env.setdefault("DRY_RUN", "false")
     env.setdefault("KEEP_PRETRAIN_CHECKPOINT", "true")
+    env.setdefault("DATA_AUDIT", "false")
+    if env["DATA_AUDIT"] not in ("true", "false"):
+        raise ValueError("DATA_AUDIT must be true or false")
     if env["DRY_RUN"] not in ("true", "false"):
         raise ValueError("DRY_RUN must be true or false")
     if env["KEEP_PRETRAIN_CHECKPOINT"] not in ("true", "false"):
@@ -283,6 +286,23 @@ def main() -> int:
         ]
         commands.append((command, task_env))
     # All task folders/output paths have been checked before launching the first long run.
+    if env["DATA_AUDIT"] == "true":
+        for _, task_env in commands:
+            audit_output = Path(env["LOG_ROOT"]) / f"{task_env['RUN_NAME']}-data-audit.json"
+            audit_command = [
+                sys.executable,
+                "-m",
+                "lerobot.utils.piper_data_audit",
+                "--dataset_root",
+                task_env["DATASET_ROOT"],
+                "--output",
+                str(audit_output),
+            ]
+            print(f"Data audit: {shlex.join(audit_command)}", flush=True)
+            if env["DRY_RUN"] != "true":
+                subprocess.run(audit_command, env=task_env, cwd=REPO_ROOT, check=True)
+            else:
+                print("DRY_RUN: raw parquet audit is printed only; no rows or videos were read.", flush=True)
     if env["DRY_RUN"] != "true":
         check_cuda(env, num_processes)
     for command, task_env in commands:

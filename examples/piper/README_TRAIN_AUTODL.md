@@ -10,6 +10,9 @@
 [动作指标说明](README_ACTION_METRICS.md)。首次在线运行需执行 `wandb login`，
 离线运行可设置 `WANDB_MODE=offline`。
 
+针对 task1 动作拟合不足的新训练入口（原始数据审计、验证集、扩大动作评估、
+可选解冻动作专家末两层），见 [重训说明](README_RETRAIN.md)。本文原有默认配置保持不变。
+
 ## 1. 获取代码和准备环境
 
 在 AutoDL 现有仓库中切换到 `piper`（如有未提交修改，先自行提交或暂存）：
