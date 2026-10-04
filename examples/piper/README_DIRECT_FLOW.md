@@ -106,6 +106,33 @@ W&B 默认开启，project 为 `piper-action-fit`。模型文件不上传 W&B；
 relative；保存的处理器会自动恢复绝对动作。配置与处理器模式或关节顺序不符时会报错。
 先离线评估；硬件控制和碰撞保护没有改动。
 
+## 打包两组结果用于分析
+
+使用标准库脚本，不需要 GPU 或额外依赖：
+
+```bash
+python examples/piper/pack_training_results.py \
+  --search_root /data1/wyn/chkpt/2601-lerobot \
+  --log_root /data1/wyn/logs \
+  --task 1
+```
+
+脚本查找本文命名规则下的两组训练目录，生成 `outputs/piper-analysis-时间/absolute.zip`
+和 `relative.zip`。包含五个分析 JSON/JSONL、12000 步 `train_config.json`、可用的
+`config.json` 和完整训练 `.log`，并写入来源与缺文件清单。不会递归打包权重、优化器或视频。
+缺少分析文件时显示 `PACK_PARTIAL`，仍可上传已有文件；完整时显示 `PACK_OK`。
+
+若目录改过名字，或同一组跑过多次，明确指定任务目录（也接受 RUN_GROUP 父目录）：
+
+```bash
+python examples/piper/pack_training_results.py \
+  --absolute_dir /实际路径/absolute训练目录 \
+  --relative_dir /实际路径/relative训练目录
+```
+
+`--step 9000` 可改选配置文件的 checkpoint；默认 12000。不会覆盖已有 ZIP，
+需要时用 `--output_dir` 指定新的打包目录。
+
 ## 后续单因素实验
 
 要严格检验 priming 是否有影响，需要在相同清理后数据、训练统计和 12000 总预算上重跑
