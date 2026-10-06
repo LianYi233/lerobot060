@@ -19,6 +19,7 @@ AUTODL = ROOT / "examples/training/train_piper_autodl.sh"
 FIT = ROOT / "examples/training/train_piper_fit.sh"
 RETRAIN = ROOT / "examples/training/train_piper_retrain.sh"
 DIRECT = ROOT / "examples/training/train_piper_direct.sh"
+BASE = ROOT / "examples/training/train_piper_base.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -55,6 +56,8 @@ class RealLauncherTest(unittest.TestCase):
             "RUN_NAME",
             "FIT_EPISODES",
             "COMPILE_MODEL",
+            "PI05_BASE_PATH",
+            "EXPERT_LAST_N_LAYERS",
         ):
             self.env.pop(name, None)
         for filename in (
@@ -64,6 +67,7 @@ class RealLauncherTest(unittest.TestCase):
             "policy_postprocessor.json",
         ):
             self.touch(self.work / "models/pi05_libero_base" / filename)
+            self.touch(self.work / "models/pi05_base" / filename)
         for filename in ("tokenizer_config.json", "tokenizer.json"):
             self.touch(self.work / "models/google/paligemma-3b-pt-224" / filename)
         for folder in MODULE.TASKS.values():
@@ -434,6 +438,90 @@ class RealLauncherTest(unittest.TestCase):
         self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
         output = next(arg for arg in command if arg.startswith("--output_dir="))
         self.assertIn(str(self.work / "custom fit output"), output)
+
+    def test_generic_base_profiles_only_change_expert_capacity(self):
+        commands = []
+        for profile, count in (("last2", 2), ("last4", 4)):
+            with self.subTest(profile=profile):
+                result = self.run_autodl(
+                    "1",
+                    profile,
+                    "0",
+                    script=BASE,
+                    GPU_IDS="2,3",
+                    BATCH_SIZE="16",
+                    # A previous terminal export must not select the old initialization.
+                    PRETRAINED_PATH=str(self.work / "models/pi05_libero_base"),
+                    EXPERT_LAST_N_LAYERS="0",
+                )
+                (command,) = self.command_args(result)
+                for arg in (
+                    f"--policy.pretrained_path={self.work / 'models/pi05_base'}",
+                    f"--policy.train_action_expert_last_n_layers={count}",
+                    "--policy.train_action_projections=true",
+                    "--policy.use_relative_actions=false",
+                    "--policy.piper_train_normalization=true",
+                    "--policy.chunk_size=16",
+                    "--policy.n_action_steps=8",
+                    "--piper_eval.execution_steps=8",
+                    "--policy.next_action_masked_steps=12",
+                    "--policy.next_action_pretrain_steps=0",
+                    "--policy.next_action_bridge_steps=0",
+                    "--policy.cabo_enabled=false",
+                    "--policy.optimizer_lr=0.0001",
+                    "--policy.action_expert_lr_scale=0.1",
+                    "--steps=12000",
+                    "--save_steps=[6000,9000,12000]",
+                    "--dataset.eval_split=0.1",
+                    "--policy.compile_model=false",
+                    "--policy.dtype=float32",
+                    "CUDA_VISIBLE_DEVICES=2,3",
+                    "--num_processes=2",
+                    "--multi_gpu",
+                    "--batch_size=16",
+                ):
+                    self.assertIn(arg, command)
+                self.assertIn("replacing PRETRAINED_PATH", result.stdout)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+                expert_args = [
+                    arg for arg in command if arg.startswith("--policy.train_action_expert_last_n_layers=")
+                ]
+                self.assertEqual(len(expert_args), 1)
+                commands.append([arg for arg in command if arg not in expert_args])
+        self.assertEqual(*commands)
+
+    def test_generic_base_default_profile_custom_path_and_sequential_tasks(self):
+        custom = self.work / "downloaded generic base"
+        (self.work / "models/pi05_base").rename(custom)
+        result = self.run_autodl("all", script=BASE, PI05_BASE_PATH=str(custom))
+        commands = self.command_args(result)
+        self.assertEqual(len(commands), 4)
+        outputs = []
+        for command, folder in zip(commands, MODULE.TASKS.values(), strict=True):
+            self.assertIn(f"--policy.pretrained_path={custom}", command)
+            self.assertIn("--policy.train_action_expert_last_n_layers=2", command)
+            self.assertIn(f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}", command)
+            outputs.extend(arg for arg in command if arg.startswith("--output_dir="))
+        self.assertEqual(len(set(outputs)), 4)
+
+    def test_generic_base_missing_download_never_falls_back_to_libero(self):
+        (self.work / "models/pi05_base/model.safetensors").unlink()
+        result = self.run_autodl("1", script=BASE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pi05_base", result.stderr)
+        self.assertIn("model.safetensors", result.stderr)
+        self.assertNotIn("Launching:", result.stdout)
+
+    def test_invalid_base_profile_and_direct_expert_count_fail_before_launch(self):
+        result = self.run_autodl("1", "unknown", script=BASE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown base profile", result.stderr)
+        for count in ("-1", "19", "2.5", "02"):
+            with self.subTest(count=count):
+                result = self.run_autodl("1", script=DIRECT, EXPERT_LAST_N_LAYERS=count)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("EXPERT_LAST_N_LAYERS", result.stderr)
+                self.assertNotIn("Launching:", result.stdout)
 
     def test_unknown_fit_profile_fails_before_launch(self):
         result = self.run_autodl("4", "unknown", script=FIT)

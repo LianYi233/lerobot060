@@ -3,6 +3,9 @@
 这是排查 Piper 短期动作拟合不足的实验，不能预先保证抓取成功。旧训练入口、
 旧 checkpoint 和 prompt-only 方法的默认行为不变。
 
+换通用 `pi05_base`、absolute horizon 16，并比较 expert 末 2/4 层的入口，见
+[基座对照说明](README_BASE_MODEL.md)。本页保留最初 absolute/relative horizon 50 的实验配方。
+
 ## 配置和预算
 
 新增入口 `examples/training/train_piper_direct.sh TASK PROFILE SEED`：

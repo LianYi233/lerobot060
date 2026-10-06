@@ -6,7 +6,8 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
 Usage: bash examples/training/train_piper_direct.sh TASK [absolute|relative] [SEED] [extra args...]
 
 12000 TOTAL updates, all observation-conditioned flow; priming=0, bridge=0, CABO off.
-Both profiles train prompts, action projections and last two expert blocks (47,313,952 params).
+Both profiles train prompts, action projections and last two expert blocks by default (47,313,952 params).
+EXPERT_LAST_N_LAYERS=0..18 changes the number of trainable final expert blocks.
 absolute: predict absolute joint positions and gripper (control).
 relative: predict joint offsets from the current observation; gripper stays absolute.
 Both refit state/action normalization on the training split, never the held-out episodes.
@@ -45,14 +46,20 @@ export ACTION_EVAL_SAMPLES="${ACTION_EVAL_SAMPLES:-128}"
 export ACTION_EVAL_FREQ="${ACTION_EVAL_FREQ:-500}"
 export ACTION_EVAL_SAMPLING="${ACTION_EVAL_SAMPLING:-episode_stratified}"
 export ACTION_SELECT_BEST_SAVED="${ACTION_SELECT_BEST_SAVED:-true}"
+export EXPERT_LAST_N_LAYERS="${EXPERT_LAST_N_LAYERS:-2}"
+if [[ ! "${EXPERT_LAST_N_LAYERS}" =~ ^([0-9]|1[0-8])$ ]]; then
+  echo "EXPERT_LAST_N_LAYERS must be an integer from 0 to 18" >&2
+  exit 2
+fi
 FIT_ARGS=()
 if [[ "${FIT_EPISODES:-all}" != all ]]; then
   FIT_ARGS+=("--dataset.episodes=${FIT_EPISODES}")
 fi
 echo "Piper direct: profile=${PROFILE}, total flow updates=${FLOW_STEPS}, priming=0, bridge=0"
+echo "Trainable: both prompt banks, action projections, last ${EXPERT_LAST_N_LAYERS} expert blocks"
 exec bash "${SCRIPT_DIR}/train_piper_autodl.sh" "${TASK}" dual_prompt_only "${SEED}" \
   --policy.train_action_projections=true \
-  --policy.train_action_expert_last_n_layers=2 \
+  "--policy.train_action_expert_last_n_layers=${EXPERT_LAST_N_LAYERS}" \
   --policy.action_expert_lr_scale=0.1 \
   --policy.optimizer_lr=0.0001 \
   --policy.scheduler_decay_lr=0.00001 \
