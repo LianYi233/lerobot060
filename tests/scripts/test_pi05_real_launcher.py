@@ -20,6 +20,7 @@ FIT = ROOT / "examples/training/train_piper_fit.sh"
 RETRAIN = ROOT / "examples/training/train_piper_retrain.sh"
 DIRECT = ROOT / "examples/training/train_piper_direct.sh"
 BASE = ROOT / "examples/training/train_piper_base.sh"
+DROID = ROOT / "examples/training/train_piper_droid.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -57,6 +58,7 @@ class RealLauncherTest(unittest.TestCase):
             "FIT_EPISODES",
             "COMPILE_MODEL",
             "PI05_BASE_PATH",
+            "PI05_DROID_PATH",
             "EXPERT_LAST_N_LAYERS",
         ):
             self.env.pop(name, None)
@@ -68,6 +70,7 @@ class RealLauncherTest(unittest.TestCase):
         ):
             self.touch(self.work / "models/pi05_libero_base" / filename)
             self.touch(self.work / "models/pi05_base" / filename)
+            self.touch(self.work / "models/pi05_droid" / filename)
         for filename in ("tokenizer_config.json", "tokenizer.json"):
             self.touch(self.work / "models/google/paligemma-3b-pt-224" / filename)
         for folder in MODULE.TASKS.values():
@@ -509,6 +512,48 @@ class RealLauncherTest(unittest.TestCase):
         result = self.run_autodl("1", script=BASE)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pi05_base", result.stderr)
+        self.assertIn("model.safetensors", result.stderr)
+        self.assertNotIn("Launching:", result.stdout)
+
+    def test_droid_profiles_preserve_generic_recipe_and_replace_stale_base_paths(self):
+        for profile in ("last2", "last4"):
+            with self.subTest(profile=profile):
+                kwargs = {"GPU_IDS": "2,3", "NUM_PROCESSES": "2", "BATCH_SIZE": "16"}
+                (generic,) = self.command_args(self.run_autodl("1", profile, "0", script=BASE, **kwargs))
+                result = self.run_autodl(
+                    "1",
+                    profile,
+                    "0",
+                    script=DROID,
+                    PI05_BASE_PATH=str(self.work / "models/pi05_base"),
+                    PRETRAINED_PATH=str(self.work / "models/pi05_libero_base"),
+                    **kwargs,
+                )
+                (droid,) = self.command_args(result)
+                self.assertIn(f"--policy.pretrained_path={self.work / 'models/pi05_droid'}", droid)
+                self.assertIn("replacing PI05_BASE_PATH", result.stdout)
+                self.assertEqual(
+                    [arg for arg in generic if not arg.startswith("--policy.pretrained_path=")],
+                    [arg for arg in droid if not arg.startswith("--policy.pretrained_path=")],
+                )
+
+    def test_droid_default_task_profile_and_custom_checkpoint(self):
+        custom = self.work / "DROID download with spaces"
+        (self.work / "models/pi05_droid").rename(custom)
+        (command,) = self.command_args(
+            self.run_autodl(script=DROID, PI05_DROID_PATH=str(custom), RUN_GROUP="")
+        )
+        self.assertIn(f"--policy.pretrained_path={custom}", command)
+        self.assertIn(f"--dataset.repo_id=may-pick-and-place/{MODULE.TASKS['1']}", command)
+        self.assertIn("--policy.train_action_expert_last_n_layers=2", command)
+        output = next(arg for arg in command if arg.startswith("--output_dir="))
+        self.assertIn("piper-task1-pi05-droid-last2-h16-", output)
+
+    def test_missing_droid_weights_fail_without_falling_back_to_generic(self):
+        (self.work / "models/pi05_droid/model.safetensors").unlink()
+        result = self.run_autodl(script=DROID)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pi05_droid", result.stderr)
         self.assertIn("model.safetensors", result.stderr)
         self.assertNotIn("Launching:", result.stdout)
 

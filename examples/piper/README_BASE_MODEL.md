@@ -4,6 +4,9 @@
 先在 task 1 跑 `last2`，与已有 absolute / horizon 16 的 LIBERO 基座结果比较；
 再单独跑 `last4` 检验扩大动作专家训练范围的收益。这是新的实验，不保证抓取成功。
 
+使用 LeRobot 已转换的 `lerobot/pi05_droid` 做 Franka/DROID 基座对照，见
+[DROID 下载与训练说明](README_DROID_BASE.md) 和 `train_piper_droid.sh`。
+
 ## 基座和训练范围
 
 官方区分通用预训练基座和进一步适配任务/机器人后的权重：
