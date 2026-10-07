@@ -1,5 +1,7 @@
 # Piper task 1：改用 PI05 DROID / Franka 初始化
 
+GPU 0、1 低学习率／GPU 2、3 原学习率的并行对照，见 [学习率实验说明](README_DROID_LR.md)。
+
 `lerobot/pi05_droid` 是 LeRobot 提供的 PI05 DROID 权重，适合作为新的微调初始化。
 DROID 平台采用 Franka Panda 7-DoF 机械臂；这是在 DROID 真机数据上适配的权重，
 不是另一种模型架构，也不是 Piper 的专用控制器。真机抓取偏差是否改善仍需实验验证。

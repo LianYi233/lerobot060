@@ -21,6 +21,8 @@ and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000)
 Set NTK_SAVE_STAGE_SNAPSHOTS=false to disable extra stage snapshots, or SAVE_FREQ
 to override the flow checkpoint interval. Other variants keep their existing defaults.
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
+MAIN_PROCESS_PORT selects a distributed port; use different ports for concurrent GPU groups.
+JOB_NAME optionally overrides the W&B display name without changing checkpoint filenames.
 EOF
 }
 
@@ -112,9 +114,16 @@ COMPILE_MODEL="${COMPILE_MODEL:-true}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 
 RUN_NAME="${RUN_NAME:-pi05-${VARIANT}-seed${SEED}}"
+JOB_NAME="${JOB_NAME:-${RUN_NAME}}"
 DRY_RUN="${DRY_RUN:-false}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 LOG_FILE="${LOG_ROOT}/${RUN_NAME}.log"
+if [[ -n "${MAIN_PROCESS_PORT:-}" ]]; then
+  if [[ ! "${MAIN_PROCESS_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || (( MAIN_PROCESS_PORT > 65535 )); then
+    echo "MAIN_PROCESS_PORT must be an integer from 1 to 65535" >&2
+    exit 2
+  fi
+fi
 
 if [[ ! -d "${DATASET_ROOT}" ]]; then
   echo "Dataset root does not exist: ${DATASET_ROOT}" >&2
@@ -167,7 +176,7 @@ TRAIN_ARGS=(
   --policy.cabo_prompt_update_ratio="${CABO_RATIO}"
   --policy.push_to_hub=false
   --output_dir="${OUTPUT_DIR}"
-  --job_name="${RUN_NAME}"
+  --job_name="${JOB_NAME}"
   --steps="${FLOW_STEPS}"
   --batch_size="${BATCH_SIZE}"
   --seed="${SEED}"
@@ -186,8 +195,12 @@ LAUNCH_ARGS=(
 if (( NUM_PROCESSES > 1 )); then
   LAUNCH_ARGS+=(--multi_gpu)
 fi
+if [[ -n "${MAIN_PROCESS_PORT:-}" ]]; then
+  LAUNCH_ARGS+=(--main_process_port="${MAIN_PROCESS_PORT}")
+fi
 
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
+echo "job=${JOB_NAME} distributed_port=${MAIN_PROCESS_PORT:-accelerate-default}"
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
 echo "output=${OUTPUT_DIR}"
 if [[ -n "${SAVE_STEPS:-}" ]]; then

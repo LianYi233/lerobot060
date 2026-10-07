@@ -15,6 +15,8 @@ Labels on disk are untouched. Inference restores absolute actions using saved pr
 
 Default: all episodes, 10% episode holdout, chunk 50 / execute 8, FP32, no compile.
 Peak LR: prompts/maps 1e-4; expert blocks 1e-5. W&B and action diagnostics enabled.
+Override OPTIMIZER_LR, SCHEDULER_DECAY_LR and ACTION_EXPERT_LR_SCALE (defaults 1e-4,1e-5,0.1).
+Both parameter groups follow the same warmup/cosine multiplier; the expert ratio stays fixed.
 Evaluate 128 fixed samples per split every 500 steps. Save only 6000,9000,12000;
 best_joint / best_gripper are links to the best SAVED checkpoints, not extra copies.
 
@@ -47,6 +49,24 @@ export ACTION_EVAL_FREQ="${ACTION_EVAL_FREQ:-500}"
 export ACTION_EVAL_SAMPLING="${ACTION_EVAL_SAMPLING:-episode_stratified}"
 export ACTION_SELECT_BEST_SAVED="${ACTION_SELECT_BEST_SAVED:-true}"
 export EXPERT_LAST_N_LAYERS="${EXPERT_LAST_N_LAYERS:-2}"
+export OPTIMIZER_LR="${OPTIMIZER_LR:-0.0001}"
+export SCHEDULER_DECAY_LR="${SCHEDULER_DECAY_LR:-0.00001}"
+export ACTION_EXPERT_LR_SCALE="${ACTION_EXPERT_LR_SCALE:-0.1}"
+"${PYTHON:-python}" - <<'PY'
+import math
+import os
+
+try:
+    peak, floor, scale = (float(os.environ[key]) for key in (
+        "OPTIMIZER_LR", "SCHEDULER_DECAY_LR", "ACTION_EXPERT_LR_SCALE"
+    ))
+    if not all(math.isfinite(x) and x > 0 for x in (peak, floor, scale)) or floor > peak:
+        raise ValueError("require finite positive values and SCHEDULER_DECAY_LR <= OPTIMIZER_LR")
+except ValueError as exc:
+    raise SystemExit(f"Invalid Piper learning rates: {exc}") from exc
+print(f"Piper LR: prompts/maps peak={peak:g}, final={floor:g}; "
+      f"expert peak={peak * scale:g}, final={floor * scale:g}; warmup + cosine")
+PY
 if [[ ! "${EXPERT_LAST_N_LAYERS}" =~ ^([0-9]|1[0-8])$ ]]; then
   echo "EXPERT_LAST_N_LAYERS must be an integer from 0 to 18" >&2
   exit 2
@@ -60,9 +80,9 @@ echo "Trainable: both prompt banks, action projections, last ${EXPERT_LAST_N_LAY
 exec bash "${SCRIPT_DIR}/train_piper_autodl.sh" "${TASK}" dual_prompt_only "${SEED}" \
   --policy.train_action_projections=true \
   "--policy.train_action_expert_last_n_layers=${EXPERT_LAST_N_LAYERS}" \
-  --policy.action_expert_lr_scale=0.1 \
-  --policy.optimizer_lr=0.0001 \
-  --policy.scheduler_decay_lr=0.00001 \
+  "--policy.action_expert_lr_scale=${ACTION_EXPERT_LR_SCALE}" \
+  "--policy.optimizer_lr=${OPTIMIZER_LR}" \
+  "--policy.scheduler_decay_lr=${SCHEDULER_DECAY_LR}" \
   --policy.piper_train_normalization=true \
   "--policy.use_relative_actions=${RELATIVE}" \
   --dataset.image_transforms.enable=false --log_freq=50 "${FIT_ARGS[@]}" "$@"

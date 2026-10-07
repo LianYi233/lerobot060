@@ -21,6 +21,7 @@ RETRAIN = ROOT / "examples/training/train_piper_retrain.sh"
 DIRECT = ROOT / "examples/training/train_piper_direct.sh"
 BASE = ROOT / "examples/training/train_piper_base.sh"
 DROID = ROOT / "examples/training/train_piper_droid.sh"
+DROID_LR = ROOT / "examples/training/train_piper_droid_lr.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -60,6 +61,15 @@ class RealLauncherTest(unittest.TestCase):
             "PI05_BASE_PATH",
             "PI05_DROID_PATH",
             "EXPERT_LAST_N_LAYERS",
+            "OPTIMIZER_LR",
+            "SCHEDULER_DECAY_LR",
+            "ACTION_EXPERT_LR_SCALE",
+            "MAIN_PROCESS_PORT",
+            "JOB_NAME",
+            "LR_LOW_GPU_IDS",
+            "LR_REFERENCE_GPU_IDS",
+            "LR_LOW_PORT",
+            "LR_REFERENCE_PORT",
         ):
             self.env.pop(name, None)
         for filename in (
@@ -556,6 +566,103 @@ class RealLauncherTest(unittest.TestCase):
         self.assertIn("pi05_droid", result.stderr)
         self.assertIn("model.safetensors", result.stderr)
         self.assertNotIn("Launching:", result.stdout)
+
+    def test_droid_lr_pair_matches_recipe_and_isolates_concurrent_runs(self):
+        commands = []
+        for profile, gpus, port, peak, floor in (
+            ("low", "0,1", "29501", "0.00005", "0.000005"),
+            ("reference", "2,3", "29502", "0.0001", "0.00001"),
+        ):
+            with self.subTest(profile=profile):
+                (command,) = self.command_args(self.run_autodl(
+                    "1", profile, "0", script=DROID_LR,
+                    # Old terminal settings must not launch both jobs on the same GPUs/port.
+                    GPU_IDS="6,7", NUM_PROCESSES="4", MAIN_PROCESS_PORT="29500",
+                    OPTIMIZER_LR="1", SCHEDULER_DECAY_LR="1", ACTION_EXPERT_LR_SCALE="1",
+                    JOB_NAME="old-run", WANDB_RUN_ID="old-id", WANDB_RESUME="must",
+                    OUTPUT_ROOT=str(self.work / "shared output"), LOG_ROOT=str(self.work / "shared logs"),
+                ))
+                for arg in (
+                    f"CUDA_VISIBLE_DEVICES={gpus}", f"--main_process_port={port}",
+                    "--multi_gpu", "--num_processes=2", "--batch_size=16",
+                    f"--policy.optimizer_lr={peak}", f"--policy.scheduler_decay_lr={floor}",
+                    "--policy.action_expert_lr_scale=0.1", "--steps=12000",
+                    "--policy.train_action_expert_last_n_layers=2", "--policy.chunk_size=16",
+                    "--policy.n_action_steps=8", "--policy.use_relative_actions=false",
+                    "--dataset.eval_split=0.1", "--piper_eval.samples=128",
+                    "--piper_eval.seed=0", "--save_steps=[6000,9000,12000]",
+                    "--wandb.enable=true", "--policy.compile_model=false",
+                    f"--job_name=retrain-test-lr-{profile}-task1-seed0",
+                    f"--policy.pretrained_path={self.work / 'models/pi05_droid'}",
+                ):
+                    self.assertIn(arg, command)
+                output = next(arg for arg in command if arg.startswith("--output_dir="))
+                self.assertIn(f"shared output/lr-{profile}/pi05-may-", output)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+                # Each option is sent once; draccus cannot silently select a conflicting duplicate.
+                flags = [arg.split("=", 1)[0] for arg in command if arg.startswith("--")]
+                self.assertEqual(len(flags), len(set(flags)))
+                commands.append(command)
+        differing = (
+            "CUDA_VISIBLE_DEVICES=", "--main_process_port=", "--output_dir=", "--job_name=",
+            "--policy.optimizer_lr=", "--policy.scheduler_decay_lr=",
+        )
+        self.assertEqual(*[[arg for arg in command if not arg.startswith(differing)] for command in commands])
+        # The reference keeps the old DROID training command, including both LR values.
+        (original,) = self.command_args(self.run_autodl("1", "last2", "0", script=DROID,
+                                                      GPU_IDS="2,3", NUM_PROCESSES="2", BATCH_SIZE="16"))
+        infrastructure = ("--main_process_port=", "--output_dir=", "--job_name=")
+        self.assertEqual([arg for arg in original if not arg.startswith(infrastructure)],
+                         [arg for arg in commands[1] if not arg.startswith(infrastructure)])
+        self.assertFalse((self.work / "shared output").exists())
+        self.assertFalse((self.work / "shared logs").exists())
+
+    def test_lr_custom_port_and_job_name_reach_real_accelerate_command(self):
+        (command,) = self.command_args(self.run_autodl(
+            "3", "low", "7", script=DROID_LR, LR_LOW_GPU_IDS="4,5", LR_LOW_PORT="29611",
+            BATCH_SIZE="12", FLOW_STEPS="3000", SAVE_STEPS="[3000]",
+        ))
+        for arg in ("CUDA_VISIBLE_DEVICES=4,5", "--main_process_port=29611", "--batch_size=12",
+                    "--steps=3000", "--save_steps=[3000]", "--seed=7",
+                    "--job_name=retrain-test-lr-low-task3-seed7"):
+            self.assertIn(arg, command)
+        self.assertLess(command.index("--main_process_port=29611"), command.index("lerobot-train"))
+
+    def test_lr_profile_refuses_existing_checkpoints_and_invalid_arguments(self):
+        folder = MODULE.TASKS["1"]
+        output = self.work / f"chkpt/2601-lerobot/piper/retrain-test/lr-low/pi05-may-{folder}-dual_prompt_only-seed0"
+        output.mkdir(parents=True)
+        result = self.run_autodl("1", "low", script=DROID_LR)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Output already exists", result.stderr)
+        for args in (("1", "other"), ("all", "low"), ("1", "low", "0", "--policy.optimizer_lr=1")):
+            result = self.run_autodl(*args, script=DROID_LR)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Launching:", result.stdout)
+
+    def test_direct_lr_overrides_and_invalid_rates_fail_before_training(self):
+        (command,) = self.command_args(self.run_autodl(
+            "1", script=DIRECT, OPTIMIZER_LR="0.00003", SCHEDULER_DECAY_LR="0.000003",
+            ACTION_EXPERT_LR_SCALE="0.2",
+        ))
+        for arg in ("--policy.optimizer_lr=0.00003", "--policy.scheduler_decay_lr=0.000003",
+                    "--policy.action_expert_lr_scale=0.2"):
+            self.assertIn(arg, command)
+        for env in ({"OPTIMIZER_LR": "nan"}, {"OPTIMIZER_LR": "0"},
+                    {"OPTIMIZER_LR": "1e-6"}, {"SCHEDULER_DECAY_LR": "inf"},
+                    {"ACTION_EXPERT_LR_SCALE": "-1"}):
+            result = self.run_autodl("1", script=DIRECT, **env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid Piper learning rates", result.stderr)
+            self.assertNotIn("Launching:", result.stdout)
+
+    def test_invalid_distributed_ports_are_rejected_without_starting_accelerate(self):
+        for port in ("0", "65536", "01", "-1", "nan"):
+            with self.subTest(port=port):
+                result = self.run_autodl("1", "low", script=DROID_LR, LR_LOW_PORT=port)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("MAIN_PROCESS_PORT must", result.stderr)
+                self.assertFalse(any(line.startswith("env ") for line in result.stdout.splitlines()))
 
     def test_invalid_base_profile_and_direct_expert_count_fail_before_launch(self):
         result = self.run_autodl("1", "unknown", script=BASE)
