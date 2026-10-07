@@ -91,6 +91,28 @@ DRY_RUN=false bash examples/training/train_piper_droid_lr.sh 1 reference 0
 `lr-reference`；其他训练入口的目录规则没有改变。其他 env 覆盖仍有效，两边务必设置一致。
 网络无法连接 W&B 时，两边都设 `WANDB_MODE=offline`，本地 JSONL 继续记录。
 
+### 启动时报 output directory already exists
+
+`lr-low` 和 `lr-reference` 本来就是两个目录，不会因为同时训练而共用输出目录。
+旧版训练入口缺少「所有 rank 完成配置验证后再创建输出目录」的同步点，较快 rank 的
+W&B 初始化可能先创建目录，使较慢 rank 的配置验证误报目录已存在。当前版本已在创建
+Accelerator 后添加 barrier；仍保留对已有目录的覆盖保护。
+
+若失败的 reference 已退出，low 仍正常运行，只在 reference 终端执行以下命令重试。
+更新代码后为失败组同时更换 RUN_GROUP、OUTPUT_ROOT 和 LOG_ROOT；旧目录保留用于排查。
+仅修改 RUN_GROUP 不会覆盖已经 export 的 OUTPUT_ROOT / LOG_ROOT。
+
+```bash
+git pull --ff-only origin piper
+export RUN_GROUP="piper-task1-droid-lr-reference-retry-$(date +%Y%m%d-%H%M%S)"
+export OUTPUT_ROOT="/data1/wyn/chkpt/2601-lerobot/${RUN_GROUP}"
+export LOG_ROOT="/data1/wyn/logs/${RUN_GROUP}"
+DRY_RUN=false bash examples/training/train_piper_droid_lr.sh 1 reference 0
+```
+
+其他路径、batch、seed 和训练配置继续使用上面的相同设置。若是已有正常运行的 reference，
+不要重复启动；若确实需要从已保存 checkpoint 续训，应另行指定完整训练状态恢复配置。
+
 ## 模型、日志和比较指标
 
 在以上路径设置下，两组模型分别保存在：

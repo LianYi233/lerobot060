@@ -598,6 +598,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
+        # All ranks must finish validate() before W&B or a training stage creates output_dir.
+        # Constructing Accelerator alone is not a barrier: a fast rank can otherwise create
+        # the directory while a slower rank is still checking that a fresh run won't overwrite it.
+        accelerator.wait_for_everyone()
         if cfg.piper_eval.enabled and accelerator.distributed_type not in (
             DistributedType.NO,
             DistributedType.MULTI_GPU,
