@@ -22,6 +22,7 @@ DIRECT = ROOT / "examples/training/train_piper_direct.sh"
 BASE = ROOT / "examples/training/train_piper_base.sh"
 DROID = ROOT / "examples/training/train_piper_droid.sh"
 DROID_LR = ROOT / "examples/training/train_piper_droid_lr.sh"
+CAPACITY = ROOT / "examples/training/train_piper_capacity.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -502,6 +503,107 @@ class RealLauncherTest(unittest.TestCase):
                 self.assertEqual(len(expert_args), 1)
                 commands.append([arg for arg in command if arg not in expert_args])
         self.assertEqual(*commands)
+
+    def test_capacity_profiles_share_weights_data_lr_and_isolate_outputs(self):
+        commands = []
+        outputs, jobs, ports = set(), set(), set()
+        for count in (2, 4, 8, 18):
+            with self.subTest(count=count):
+                result = self.run_autodl(
+                    "1", f"last{count}", "0", script=CAPACITY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_droid"),
+                    OUTPUT_ROOT=str(self.work / "capacity output"),
+                    LOG_ROOT=str(self.work / "capacity logs"),
+                    GPU_IDS="2,3", NUM_PROCESSES="1", BATCH_SIZE="16",
+                    # Deliberately contaminate the old terminal environment.
+                    EXPERT_LAST_N_LAYERS="0", FIT_EPISODES="[0]", EVAL_SPLIT="0",
+                    CHUNK_SIZE="50", N_ACTION_STEPS="50", OPTIMIZER_LR="0.00005",
+                    SCHEDULER_DECAY_LR="0.000005", ACTION_EXPERT_LR_SCALE="0.5",
+                    COMPILE_MODEL="true", ACTION_EVAL_FREQ="0", ACTION_UPDATE_FREQ="0",
+                    PI05_BASE_PATH="/must-not-replace-selected-base",
+                )
+                (command,) = self.command_args(result)
+                for arg in (
+                    f"--policy.pretrained_path={self.work / 'models/pi05_droid'}",
+                    f"--policy.train_action_expert_last_n_layers={count}",
+                    "--policy.train_action_projections=true", "--policy.use_relative_actions=false",
+                    "--policy.piper_train_normalization=true", "--policy.chunk_size=16",
+                    "--policy.n_action_steps=8", "--policy.num_vlm_prompt_tokens=16",
+                    "--policy.num_prompt_tokens=16", "--policy.cabo_enabled=false",
+                    "--policy.next_action_pretrain_steps=0", "--policy.next_action_bridge_steps=0",
+                    "--policy.optimizer_lr=0.0001", "--policy.scheduler_decay_lr=0.00001",
+                    "--policy.action_expert_lr_scale=0.1", "--dataset.eval_split=0.1",
+                    "--piper_eval.freq=500", "--piper_eval.samples=128", "--piper_eval.update_freq=50",
+                    "--piper_eval.select_best_saved=true", "--piper_eval.sampling=episode_stratified",
+                    "--steps=12000", "--save_steps=[6000,9000,12000]", "--batch_size=16",
+                    "--multi_gpu", "--num_processes=2", "CUDA_VISIBLE_DEVICES=2,3",
+                    "--policy.dtype=float32", "--policy.compile_model=false",
+                    "--policy.gradient_checkpointing=true",
+                ):
+                    self.assertIn(arg, command)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+                output = next(arg for arg in command if arg.startswith("--output_dir="))
+                self.assertIn(str(self.work / f"capacity output/capacity-last{count}"), output)
+                self.assertIn(str(self.work / f"capacity logs/capacity-last{count}"), result.stdout)
+                job = next(arg for arg in command if arg.startswith("--job_name="))
+                self.assertIn(f"capacity-last{count}", job)
+                port = next(arg for arg in command if arg.startswith("--main_process_port="))
+                self.assertEqual(port, f"--main_process_port={29500 + count}")
+                self.assertLess(command.index(port), command.index("lerobot-train"))
+                outputs.add(output)
+                jobs.add(job)
+                ports.add(port)
+                option_keys = [arg.split("=", 1)[0] for arg in command if arg.startswith("--")]
+                self.assertEqual(len(option_keys), len(set(option_keys)))
+                commands.append([
+                    arg for arg in command if arg not in (output, job, port)
+                    and not arg.startswith("--policy.train_action_expert_last_n_layers=")
+                ])
+        for command in commands[1:]:
+            self.assertEqual(commands[0], command)
+        self.assertEqual((len(outputs), len(jobs), len(ports)), (4, 4, 4))
+        self.assertFalse((self.work / "capacity output").exists())
+        self.assertFalse((self.work / "capacity logs").exists())
+
+    def test_capacity_default_and_custom_budget(self):
+        (command,) = self.command_args(self.run_autodl(
+            script=CAPACITY, PRETRAINED_PATH=str(self.work / "models/pi05_libero_base"),
+            FLOW_STEPS="3000", SAVE_STEPS="[3000]", MAIN_PROCESS_PORT="29888",
+        ))
+        for arg in (
+            "--policy.train_action_expert_last_n_layers=8", "--steps=3000",
+            "--save_steps=[3000]", "--main_process_port=29888", "--batch_size=16",
+            "CUDA_VISIBLE_DEVICES=0,1", "--num_processes=2",
+        ):
+            self.assertIn(arg, command)
+
+    def test_capacity_requires_explicit_existing_base_and_known_profile(self):
+        for args, env, expected in (
+            ((), {}, "Set PRETRAINED_PATH explicitly"),
+            (("1", "full_model"), {}, "Unknown capacity profile"),
+            (("5",), {}, "Use TASK"),
+            (("1", "last8", "0", "--policy.chunk_size=50"), {}, "no extra CLI"),
+            ((), {"PRETRAINED_PATH": str(self.work / "missing-base")}, "Missing pretrained"),
+        ):
+            with self.subTest(args=args, env=env):
+                result = self.run_autodl(*args, script=CAPACITY, **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Launching:", result.stdout)
+
+    def test_capacity_existing_output_is_not_overwritten(self):
+        output = self.work / "comparison/capacity-last8"
+        run = output / f"pi05-may-{MODULE.TASKS['1']}-dual_prompt_only-seed0"
+        marker = run / "keep.txt"
+        self.touch(marker)
+        marker.write_text("existing result")
+        result = self.run_autodl(
+            "1", "last8", "0", script=CAPACITY,
+            PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+            OUTPUT_ROOT=str(self.work / "comparison"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(marker.read_text(), "existing result")
 
     def test_generic_base_default_profile_custom_path_and_sequential_tasks(self):
         custom = self.work / "downloaded generic base"

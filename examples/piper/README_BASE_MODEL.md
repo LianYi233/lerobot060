@@ -7,6 +7,9 @@
 使用 LeRobot 已转换的 `lerobot/pi05_droid` 做 Franka/DROID 基座对照，见
 [DROID 下载与训练说明](README_DROID_BASE.md) 和 `train_piper_droid.sh`。
 
+已有基座上扩大到最后 8 层或全部 18 个专家层，见
+[容量对照入口](README_CAPACITY.md)；该入口要求显式指定同一个初始 `PRETRAINED_PATH`。
+
 ## 基座和训练范围
 
 官方区分通用预训练基座和进一步适配任务/机器人后的权重：

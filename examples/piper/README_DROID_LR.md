@@ -1,5 +1,8 @@
 # Task 1：两组 GPU 并行比较学习率
 
+学习率对照之后，如需固定 LR 扩大专家训练范围，使用
+[capacity 入口](README_CAPACITY.md)，支持 last2 / last4 / last8 / last18。
+
 入口：`bash examples/training/train_piper_droid_lr.sh 1 low 0` 或 `1 reference 0`。
 两组都从同一个 `PI05_DROID_PATH` 初始化，重新训练 12000 步，不续训旧 Piper checkpoint。
 比较的是「全程降低学习率」是否改善拟合；不是单独测试「第 4000 步突然降学习率」。
