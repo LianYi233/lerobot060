@@ -23,6 +23,7 @@ BASE = ROOT / "examples/training/train_piper_base.sh"
 DROID = ROOT / "examples/training/train_piper_droid.sh"
 DROID_LR = ROOT / "examples/training/train_piper_droid_lr.sh"
 CAPACITY = ROOT / "examples/training/train_piper_capacity.sh"
+PROMPT_ONLY = ROOT / "examples/training/train_piper_prompt_only.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -65,6 +66,10 @@ class RealLauncherTest(unittest.TestCase):
             "OPTIMIZER_LR",
             "SCHEDULER_DECAY_LR",
             "ACTION_EXPERT_LR_SCALE",
+            "VLM_PROMPT_TOKENS",
+            "ACTION_PROMPT_TOKENS",
+            "PROMPT_LR",
+            "PROMPT_FINAL_LR",
             "MAIN_PROCESS_PORT",
             "JOB_NAME",
             "LR_LOW_GPU_IDS",
@@ -710,6 +715,150 @@ class RealLauncherTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("BATCH_SIZE must be a positive integer", result.stderr)
                 self.assertNotIn("Launching:", result.stdout)
+
+    def test_prompt_only_token_sweep_freezes_expert_and_projections(self):
+        commands = []
+        outputs, jobs, ports = set(), set(), set()
+        for tokens, gpu_ids in ((32, "0,1"), (64, "2,3")):
+            with self.subTest(tokens=tokens):
+                result = self.run_autodl(
+                    "1", str(tokens), "0", script=PROMPT_ONLY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"), GPU_IDS=gpu_ids,
+                    OUTPUT_ROOT=str(self.work / "prompt output"), LOG_ROOT=str(self.work / "prompt log"),
+                    EXPERT_LAST_N_LAYERS="18", VLM_PROMPT_TOKENS="1", ACTION_PROMPT_TOKENS="0",
+                    OPTIMIZER_LR="0.5", SCHEDULER_DECAY_LR="0.1", FIT_EPISODES="[0]",
+                    EVAL_SPLIT="0", CHUNK_SIZE="50", NUM_PROCESSES="1", COMPILE_MODEL="true",
+                )
+                (command,) = self.command_args(result)
+                for arg in (
+                    f"--policy.num_vlm_prompt_tokens={tokens}", f"--policy.num_prompt_tokens={tokens}",
+                    "--policy.train_action_projections=false", "--policy.train_action_expert_last_n_layers=0",
+                    "--policy.use_peft=false", "--policy.cabo_enabled=false",
+                    "--policy.next_action_pretrain_steps=0", "--policy.next_action_bridge_steps=0",
+                    "--policy.optimizer_lr=0.00005", "--policy.scheduler_decay_lr=0.000005",
+                    "--policy.piper_train_normalization=true", "--policy.use_relative_actions=false",
+                    "--policy.chunk_size=16", "--policy.n_action_steps=8", "--dataset.eval_split=0.1",
+                    "--policy.dtype=float32", "--policy.compile_model=false",
+                    "--steps=12000", "--save_steps=[6000,9000,12000]", "--batch_size=64",
+                    "--multi_gpu", "--num_processes=2", "--piper_eval.freq=500", "--piper_eval.samples=128",
+                    "--piper_eval.update_freq=50", "--piper_eval.select_best_saved=true",
+                    f"CUDA_VISIBLE_DEVICES={gpu_ids}",
+                ):
+                    self.assertIn(arg, command)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+                self.assertIn(f"expected trainable={tokens * 3072}", result.stdout)
+                self.assertIn(f"prompts={tokens}+{tokens}", result.stdout)
+                self.assertIn("per_GPU=64, processes=2, global=128", result.stdout)
+                output = next(arg for arg in command if arg.startswith("--output_dir="))
+                job = next(arg for arg in command if arg.startswith("--job_name="))
+                port = next(arg for arg in command if arg.startswith("--main_process_port="))
+                self.assertIn(str(self.work / f"prompt output/prompt-only-t{tokens}-b64"), output)
+                self.assertIn(str(self.work / f"prompt log/prompt-only-t{tokens}-b64"), result.stdout)
+                self.assertIn(f"prompt-only-t{tokens}-b64", job)
+                self.assertEqual(port, f"--main_process_port={30000 + tokens}")
+                outputs.add(output)
+                jobs.add(job)
+                ports.add(port)
+                keys = [arg.split("=", 1)[0] for arg in command if arg.startswith("--")]
+                self.assertEqual(len(keys), len(set(keys)))
+                varying = (
+                    "--policy.num_vlm_prompt_tokens=", "--policy.num_prompt_tokens=",
+                    "CUDA_VISIBLE_DEVICES=", "--main_process_port=", "--job_name=", "--output_dir=",
+                )
+                commands.append([arg for arg in command if not arg.startswith(varying)])
+        self.assertEqual(*commands)
+        self.assertEqual((len(outputs), len(jobs), len(ports)), (2, 2, 2))
+        self.assertFalse((self.work / "prompt output").exists())
+        self.assertFalse((self.work / "prompt log").exists())
+
+    def test_prompt_only_control_batch_lr_and_budget_overrides(self):
+        outputs = []
+        for batch in (64, 128):
+            result = self.run_autodl(
+                "3", "16", "2", script=PROMPT_ONLY,
+                PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                BATCH_SIZE=str(batch), PROMPT_LR="0.0001", PROMPT_FINAL_LR="0.00001",
+                FLOW_STEPS="3000", SAVE_STEPS="[3000]", MAIN_PROCESS_PORT="30116",
+            )
+            (command,) = self.command_args(result)
+            for arg in (
+                "--policy.num_vlm_prompt_tokens=16", "--policy.num_prompt_tokens=16",
+                f"--batch_size={batch}", "--steps=3000", "--save_steps=[3000]", "--seed=2",
+                "--policy.optimizer_lr=0.0001", "--policy.scheduler_decay_lr=0.00001",
+                "--main_process_port=30116", "--piper_eval.seed=2",
+            ):
+                self.assertIn(arg, command)
+            self.assertIn("expected trainable=49152", result.stdout)
+            self.assertIn(f"global={batch * 2}", result.stdout)
+            outputs.append(next(arg for arg in command if arg.startswith("--output_dir=")))
+        self.assertNotEqual(*outputs)
+
+    def test_prompt_only_defaults_and_sequential_tasks(self):
+        result = self.run_autodl(
+            "all", script=PROMPT_ONLY, PRETRAINED_PATH=str(self.work / "models/pi05_base")
+        )
+        commands = self.command_args(result)
+        self.assertEqual(len(commands), 4)
+        for command, folder in zip(commands, MODULE.TASKS.values(), strict=True):
+            self.assertIn("--policy.num_vlm_prompt_tokens=32", command)
+            self.assertIn("--policy.num_prompt_tokens=32", command)
+            self.assertIn(f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}", command)
+
+    def test_prompt_only_invalid_options_fail_before_launch(self):
+        for args, env, expected in (
+            ((), {}, "Set PRETRAINED_PATH explicitly"),
+            (("1", "0"), {}, "TOKENS must be"),
+            (("1", "48"), {}, "TOKENS must be"),
+            (("5", "32"), {}, "Use TASK"),
+            (("1", "32", "0", "--policy.train_action_projections=true"), {}, "no extra CLI"),
+            ((), {"BATCH_SIZE": "0"}, "BATCH_SIZE must be"),
+            ((), {"PROMPT_LR": "nan"}, "Invalid prompt learning rates"),
+            ((), {"PROMPT_FINAL_LR": "1"}, "Invalid prompt learning rates"),
+        ):
+            with self.subTest(args=args, env=env):
+                if env:
+                    env = dict(PRETRAINED_PATH=str(self.work / "models/pi05_base"), **env)
+                result = self.run_autodl(*args, script=PROMPT_ONLY, **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Launching:", result.stdout)
+
+    def test_prompt_only_existing_output_is_preserved(self):
+        root = self.work / "prompt output"
+        run = root / "prompt-only-t32-b64" / f"pi05-may-{MODULE.TASKS['1']}-dual_prompt_only-seed0"
+        marker = run / "keep.txt"
+        self.touch(marker)
+        marker.write_text("keep existing model")
+        result = self.run_autodl(
+            "1", "32", "0", script=PROMPT_ONLY,
+            PRETRAINED_PATH=str(self.work / "models/pi05_base"), OUTPUT_ROOT=str(root),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Output already exists", result.stderr)
+        self.assertEqual(marker.read_text(), "keep existing model")
+
+    def test_generic_token_overrides_respect_ablation_and_legacy_piper_budgets(self):
+        token_env = {"VLM_PROMPT_TOKENS": "32", "ACTION_PROMPT_TOKENS": "64"}
+        for variant, vlm, action in (("dual_prompt_only", 32, 64), ("vlm_only", 32, 0), ("action_only", 0, 64)):
+            (command,) = self.command_args(self.run_launcher("1", variant, "0", **token_env))
+            self.assertIn(f"--policy.num_vlm_prompt_tokens={vlm}", command)
+            self.assertIn(f"--policy.num_prompt_tokens={action}", command)
+        for script, profile in ((DIRECT, "absolute"), (FIT, "projections"), (CAPACITY, "last4")):
+            (command,) = self.command_args(self.run_autodl(
+                "1", profile, "0", script=script,
+                PRETRAINED_PATH=str(self.work / "models/pi05_base"), **token_env,
+            ))
+            self.assertIn("--policy.num_vlm_prompt_tokens=16", command)
+            self.assertIn("--policy.num_prompt_tokens=16", command)
+
+    def test_generic_prompt_counts_reject_invalid_active_banks(self):
+        for env in (
+            {"VLM_PROMPT_TOKENS": "-1"}, {"ACTION_PROMPT_TOKENS": "1.5"},
+            {"VLM_PROMPT_TOKENS": "0", "ACTION_PROMPT_TOKENS": "0"},
+        ):
+            result = self.run_launcher("1", "dual_prompt_only", "0", **env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("env CUDA_VISIBLE_DEVICES", result.stdout)
 
     def test_generic_base_default_profile_custom_path_and_sequential_tasks(self):
         custom = self.work / "downloaded generic base"

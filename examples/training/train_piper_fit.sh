@@ -55,6 +55,8 @@ export RUN_GROUP="${RUN_GROUP:-piper-fit-${PROFILE}-$(date +%Y%m%d-%H%M%S)}"
 export FLOW_STEPS="${FLOW_STEPS:-2000}"
 export SAVE_STEPS="${SAVE_STEPS:-[${FLOW_STEPS}]}"
 export BATCH_SIZE="${BATCH_SIZE:-8}"
+# Preserve this entry point's original prompt budget despite token-sweep exports.
+export VLM_PROMPT_TOKENS=16 ACTION_PROMPT_TOKENS=16
 # Avoid lengthy recompilation for the first fitting diagnosis; can be explicitly enabled.
 export COMPILE_MODEL="${COMPILE_MODEL:-false}"
 FIT_EPISODES="${FIT_EPISODES:-[0]}"

@@ -52,6 +52,8 @@ export EXPERT_LAST_N_LAYERS="${EXPERT_LAST_N_LAYERS:-2}"
 export OPTIMIZER_LR="${OPTIMIZER_LR:-0.0001}"
 export SCHEDULER_DECAY_LR="${SCHEDULER_DECAY_LR:-0.00001}"
 export ACTION_EXPERT_LR_SCALE="${ACTION_EXPERT_LR_SCALE:-0.1}"
+# Keep the established capacity/base/LR comparisons at 16+16 prompts.
+export VLM_PROMPT_TOKENS=16 ACTION_PROMPT_TOKENS=16
 "${PYTHON:-python}" - <<'PY'
 import math
 import os

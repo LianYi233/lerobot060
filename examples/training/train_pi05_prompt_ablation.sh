@@ -23,6 +23,8 @@ to override the flow checkpoint interval. Other variants keep their existing def
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
 MAIN_PROCESS_PORT selects a distributed port; use different ports for concurrent GPU groups.
 JOB_NAME optionally overrides the W&B display name without changing checkpoint filenames.
+VLM_PROMPT_TOKENS / ACTION_PROMPT_TOKENS override the active bank sizes (default 16 each).
+vlm_only / action_only always disable the other bank, regardless of its environment override.
 EOF
 }
 
@@ -43,8 +45,8 @@ else
 fi
 EXTRA_ARGS=("$@")
 
-VLM_PROMPT_TOKENS=16
-ACTION_PROMPT_TOKENS=16
+VLM_PROMPT_TOKENS="${VLM_PROMPT_TOKENS:-16}"
+ACTION_PROMPT_TOKENS="${ACTION_PROMPT_TOKENS:-16}"
 CABO_ENABLED=true
 PRETRAIN_STEPS=1000
 BRIDGE_STEPS=250
@@ -91,6 +93,17 @@ case "${VARIANT}" in
     exit 2
     ;;
 esac
+
+for PROMPT_COUNT_NAME in VLM_PROMPT_TOKENS ACTION_PROMPT_TOKENS; do
+  if [[ ! "${!PROMPT_COUNT_NAME}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "${PROMPT_COUNT_NAME} must be a non-negative integer" >&2
+    exit 2
+  fi
+done
+if [[ "${VLM_PROMPT_TOKENS}" == 0 && "${ACTION_PROMPT_TOKENS}" == 0 ]]; then
+  echo "At least one prompt bank must be non-empty for prompt-ablation training" >&2
+  exit 2
+fi
 
 FLOW_STEPS="${FLOW_STEPS_OVERRIDE:-${FLOW_STEPS_DEFAULT}}"
 
