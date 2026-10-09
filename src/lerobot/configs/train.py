@@ -119,6 +119,9 @@ class TrainPipelineConfig(HubMixin):
     # [] saves only the final checkpoint; None keeps the save_freq behavior.
     save_steps: list[int] | None = None
     use_policy_training_preset: bool = True
+    # Opt in when comparing against an already fine-tuned policy: retain its saved
+    # normalization features, modes and statistics instead of replacing them with dataset stats.
+    preserve_pretrained_normalization: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
@@ -234,6 +237,10 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.preserve_pretrained_normalization and (
+            self.is_reward_model_training or not active_cfg.pretrained_path
+        ):
+            raise ValueError("preserve_pretrained_normalization requires a pretrained policy checkpoint.")
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

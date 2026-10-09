@@ -11,7 +11,7 @@ usage() {
   echo "Defaults: all suites, training seed 0, checkpoint 3000, 10 episodes/task."
   echo "VLM_PROMPT_TOKENS=8 bash $0 vlm_only all 0  # token-sweep checkpoint"
   echo "With VLM_PROMPT_TOKENS, use pi05-vlm_only-vlmN-seedS in the prompt-learning/vlm-token-sweep root."
-  echo "Overrides: CKPT_ROOT, BASE_CKPT, BASE_OUTPUT, RUN_NAME, CHECKPOINT_STEP, EPISODES_PER_TASK, GPU_ID."
+  echo "Overrides: CKPT_ROOT, BASE_CKPT, BASE_OUTPUT, RUN_NAME, CHECKPOINT_STEP (0 allowed), EPISODES_PER_TASK, GPU_ID, EVAL_SEED."
   echo "DRY_RUN=true validates paths/token counts and prints commands without loading a model."
   echo "Evaluate all 1/2/8/16-token models: bash run_eval_libero_vlm_token_sweep.sh all 0"
   echo "Evaluate the base with BOTH prompt banks disabled: bash run_eval_libero_base.sh all"
@@ -44,8 +44,13 @@ if [[ ! "$EPISODES_PER_TASK" =~ ^[1-9][0-9]*$ ]]; then
   echo "EPISODES_PER_TASK must be a positive integer" >&2
   exit 2
 fi
-if [[ ! "$CHECKPOINT_STEP" =~ ^[1-9][0-9]*$ ]]; then
-  echo "CHECKPOINT_STEP must be a positive integer without leading zeros" >&2
+if [[ ! "$CHECKPOINT_STEP" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "CHECKPOINT_STEP must be a non-negative integer without leading zeros" >&2
+  exit 2
+fi
+EVAL_SEED="${EVAL_SEED:-}"
+if [[ -n "$EVAL_SEED" && ! "$EVAL_SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "EVAL_SEED must be a non-negative integer without leading zeros" >&2
   exit 2
 fi
 if [[ "$DRY_RUN" != true && "$DRY_RUN" != false ]]; then
@@ -183,6 +188,9 @@ PY
     --policy.compile_model=false
     --policy.gradient_checkpointing=false
   )
+  if [[ -n "$EVAL_SEED" ]]; then
+    EVAL_ARGS+=(--seed="$EVAL_SEED")
+  fi
   if [[ "$VARIANT" == pi05_libero_base ]]; then
     EVAL_ARGS+=(
       --policy.num_vlm_prompt_tokens=0
@@ -261,6 +269,9 @@ base_manifest = {}
 if os.environ.get("LEROBOT_EVAL_BASE") == "1":
     from lerobot.scripts.libero_base_eval import install_base_evaluation
     base_manifest = install_base_evaluation(module, os.environ.get("TOKENIZER_PATH"))
+elif os.environ.get("LEROBOT_EVAL_FINETUNED_PROMPT") == "1":
+    from lerobot.scripts.libero_finetuned_prompt import install_finetuned_evaluation
+    base_manifest = install_finetuned_evaluation(module, os.environ.get("TOKENIZER_PATH"))
 attention_manifest = {}
 if os.environ.get("LEROBOT_EVAL_ATTENTION") == "1":
     from lerobot.scripts.libero_attention import install_attention_evaluation, require_saved_attention_videos

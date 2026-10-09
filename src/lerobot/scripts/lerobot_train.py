@@ -753,6 +753,11 @@ def _train_single_stage(
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+    if cfg.preserve_pretrained_normalization:
+        from lerobot.scripts.pretrained_normalization import preserve_pretrained_normalization
+
+        processor_kwargs = preserve_pretrained_normalization(processor_kwargs, processor_pretrained_path)
+
     if cfg.is_reward_model_training:
         preprocessor, postprocessor = make_reward_pre_post_processors(
             cfg.reward_model,
