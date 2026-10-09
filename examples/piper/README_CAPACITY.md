@@ -1,8 +1,12 @@
 # Piper：扩大动作专家的训练范围
 
-入口：`bash examples/training/train_piper_capacity.sh TASK PROFILE SEED`。
-默认 task 1、`last8`、seed 0。复用现有 last-N 实现，不改网络结构、loss 定义或部署驱动，
+入口：`bash examples/training/train_piper_capacity.sh TASK PROFILE SEED [RECIPE]`。
+默认 task 1、`last8`、seed 0、`reference`。省略第四项时保留原来的 LR、batch 默认值与输出目录。
+复用现有 last-N 实现，不改网络结构、loss 定义或部署驱动，
 不添加新的 checkpoint 配置字段。旧训练入口和旧 checkpoint 的行为不变。
+
+较少解冻层数、较低学习率和较大 batch 的下一轮命令，见
+[低学习率 / 大 batch 对照](README_CAPACITY_LR_BATCH.md)。
 
 这组实验检验“动作专家的适配容量是否限制了 Piper 拟合”，不能保证成功抓取。
 仿真和真机不需要遵守同一个可训练参数预算，但应按迁移难度、数据量及验证结果决定，
@@ -34,8 +38,10 @@ max_action_dim=32：prompt 49,152 + 投影 66,592 + N × 23,599,104。
   或 DROID 的 LeRobot 权重目录。不自动换基座，不将成品 Piper checkpoint 单独用于一组。
 - 全部有效示范的末尾 10% episode 留作验证，其余训练；absolute 动作，预测 16 / 执行 8。
 - 默认 12000 次 flow 更新，保存 6000、9000、12000；priming、bridge 为 0，CABO 关闭。
-- prompt/投影峰值 LR 1e-4、最终 1e-5；专家层峰值 1e-5、最终 1e-6，warmup + cosine。
-- FP32、compile 关闭、gradient checkpointing 开启；默认每卡 batch 16。
+- `reference`：prompt/投影峰值 LR 1e-4、最终 1e-5；专家层峰值 1e-5、最终 1e-6。
+- `low_lr`：两个参数组的 LR 全程减半；`big_batch`：仅将默认每卡 batch 从 16 增至 32；
+  `low_lr_big_batch`：同时应用两项。各组保留 warmup + cosine，增大 batch 不自动提高 LR。
+- FP32、compile 关闭、gradient checkpointing 开启；`BATCH_SIZE` 可覆盖配方的默认值。
 - 从训练 split 重算统计；固定样本每 500 步测动作误差，每 50 步记录参数更新。
 
 入口主动替换终端遗留的层数、LR、FIT_EPISODES、EVAL_SPLIT、horizon、精度和评估频率，
@@ -74,9 +80,10 @@ GPU_IDS=2,3 DRY_RUN=false bash examples/training/train_piper_capacity.sh 1 last2
 ```
 
 last2 / last8 默认端口 29502 / 29508。OUTPUT_ROOT、LOG_ROOT 在此入口是**父目录**，
-各自追加 `capacity-PROFILE`，不同 profile 的输出隔离。重跑同一 profile 仍拒绝覆盖，
-需使用新 RUN_GROUP、OUTPUT_ROOT、LOG_ROOT。同一 profile 同时训练不同任务或 seed
-时要另设不同 `MAIN_PROCESS_PORT`。若显存不足，降低 batch；严格比较时两组同步调整。
+`reference` 各自追加 `capacity-PROFILE`；其他配方追加 `capacity-PROFILE-RECIPE`。
+不同配方的默认端口也分开。重跑同一 profile/recipe 仍拒绝覆盖，需使用新 RUN_GROUP、
+OUTPUT_ROOT、LOG_ROOT。同一 profile/recipe 同时训练不同任务或 seed 时要另设不同
+`MAIN_PROCESS_PORT`。若显存不足，降低 batch；严格比较解冻范围时两组同步调整。
 本地未实测 GPU 峰值显存，不保证某个 batch 必然可用。
 
 ## 保存和评估

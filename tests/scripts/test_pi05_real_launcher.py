@@ -577,12 +577,104 @@ class RealLauncherTest(unittest.TestCase):
         ):
             self.assertIn(arg, command)
 
+    def test_capacity_recipes_only_change_lr_batch_and_run_identity(self):
+        commands = []
+        outputs, jobs, ports = set(), set(), set()
+        for recipe, peak, floor, batch, port in (
+            ("reference", "0.0001", "0.00001", 16, 29504),
+            ("low_lr", "0.00005", "0.000005", 16, 29604),
+            ("big_batch", "0.0001", "0.00001", 32, 29704),
+            ("low_lr_big_batch", "0.00005", "0.000005", 32, 29804),
+        ):
+            with self.subTest(recipe=recipe):
+                result = self.run_autodl(
+                    "1", "last4", "0", recipe, script=CAPACITY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    OUTPUT_ROOT=str(self.work / "recipe outputs"),
+                    LOG_ROOT=str(self.work / "recipe logs"),
+                    GPU_IDS="0,1", OPTIMIZER_LR="9", SCHEDULER_DECAY_LR="8",
+                    ACTION_EXPERT_LR_SCALE="0.9", JOB_NAME="old-name",
+                )
+                (command,) = self.command_args(result)
+                tag = "capacity-last4" + (f"-{recipe}" if recipe != "reference" else "")
+                output = next(arg for arg in command if arg.startswith("--output_dir="))
+                job = next(arg for arg in command if arg.startswith("--job_name="))
+                port_arg = f"--main_process_port={port}"
+                for arg in (
+                    f"--policy.optimizer_lr={peak}", f"--policy.scheduler_decay_lr={floor}",
+                    "--policy.action_expert_lr_scale=0.1", f"--batch_size={batch}", port_arg,
+                    "--policy.train_action_expert_last_n_layers=4", "--steps=12000",
+                    "--save_steps=[6000,9000,12000]", "--dataset.eval_split=0.1",
+                    "--piper_eval.freq=500", "--piper_eval.samples=128",
+                ):
+                    self.assertIn(arg, command)
+                self.assertIn(str(self.work / "recipe outputs" / tag), output)
+                self.assertIn(str(self.work / "recipe logs" / tag), result.stdout)
+                self.assertIn(tag, job)
+                self.assertIn(f"per_GPU={batch}, processes=2, global={batch * 2}", result.stdout)
+                self.assertLess(command.index(port_arg), command.index("lerobot-train"))
+                outputs.add(output)
+                jobs.add(job)
+                ports.add(port)
+                keys = [arg.split("=", 1)[0] for arg in command if arg.startswith("--")]
+                self.assertEqual(len(keys), len(set(keys)))
+                varying = (
+                    "--policy.optimizer_lr=", "--policy.scheduler_decay_lr=", "--batch_size=",
+                    "--main_process_port=", "--job_name=", "--output_dir=",
+                )
+                commands.append([arg for arg in command if not arg.startswith(varying)])
+        self.assertEqual((len(outputs), len(jobs), len(ports)), (4, 4, 4))
+        for command in commands[1:]:
+            self.assertEqual(commands[0], command)
+        self.assertFalse((self.work / "recipe outputs").exists())
+        self.assertFalse((self.work / "recipe logs").exists())
+
+    def test_capacity_reference_recipe_preserves_existing_three_argument_command(self):
+        kwargs = {"script": CAPACITY, "PRETRAINED_PATH": str(self.work / "models/pi05_base")}
+        (old,) = self.command_args(self.run_autodl("1", "last8", "0", **kwargs))
+        (explicit,) = self.command_args(self.run_autodl("1", "last8", "0", "reference", **kwargs))
+        self.assertEqual(old, explicit)
+
+    def test_capacity_low_lr_big_batch_smaller_layer_pairs(self):
+        commands = []
+        for count, gpu_ids in ((4, "0,1"), (8, "2,3")):
+            (command,) = self.command_args(self.run_autodl(
+                "1", f"last{count}", "0", "low_lr_big_batch", script=CAPACITY,
+                PRETRAINED_PATH=str(self.work / "models/pi05_base"), GPU_IDS=gpu_ids,
+            ))
+            for arg in (
+                f"CUDA_VISIBLE_DEVICES={gpu_ids}", f"--main_process_port={29800 + count}",
+                f"--policy.train_action_expert_last_n_layers={count}", "--batch_size=32",
+                "--num_processes=2", "--multi_gpu", "--policy.optimizer_lr=0.00005",
+            ):
+                self.assertIn(arg, command)
+            varying = (
+                "CUDA_VISIBLE_DEVICES=", "--main_process_port=", "--job_name=", "--output_dir=",
+                "--policy.train_action_expert_last_n_layers=",
+            )
+            commands.append([arg for arg in command if not arg.startswith(varying)])
+        self.assertEqual(*commands)
+
+    def test_capacity_recipe_batch_override_and_custom_port_are_reported(self):
+        for batch in (16, 64):
+            with self.subTest(batch=batch):
+                result = self.run_autodl(
+                    "1", "last4", "0", "low_lr_big_batch", script=CAPACITY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    BATCH_SIZE=str(batch), MAIN_PROCESS_PORT="29999", GPU_IDS="2,3",
+                )
+                (command,) = self.command_args(result)
+                self.assertIn(f"--batch_size={batch}", command)
+                self.assertIn("--main_process_port=29999", command)
+                self.assertIn(f"global={batch * 2}; recipe default per_GPU=32", result.stdout)
+
     def test_capacity_requires_explicit_existing_base_and_known_profile(self):
         for args, env, expected in (
             ((), {}, "Set PRETRAINED_PATH explicitly"),
             (("1", "full_model"), {}, "Unknown capacity profile"),
             (("5",), {}, "Use TASK"),
-            (("1", "last8", "0", "--policy.chunk_size=50"), {}, "no extra CLI"),
+            (("1", "last8", "0", "--policy.chunk_size=50"), {}, "Unknown capacity recipe"),
+            (("1", "last8", "0", "low_lr_big_batch", "extra"), {}, "no extra CLI"),
             ((), {"PRETRAINED_PATH": str(self.work / "missing-base")}, "Missing pretrained"),
         ):
             with self.subTest(args=args, env=env):
@@ -592,18 +684,32 @@ class RealLauncherTest(unittest.TestCase):
                 self.assertNotIn("Launching:", result.stdout)
 
     def test_capacity_existing_output_is_not_overwritten(self):
-        output = self.work / "comparison/capacity-last8"
-        run = output / f"pi05-may-{MODULE.TASKS['1']}-dual_prompt_only-seed0"
-        marker = run / "keep.txt"
-        self.touch(marker)
-        marker.write_text("existing result")
-        result = self.run_autodl(
-            "1", "last8", "0", script=CAPACITY,
-            PRETRAINED_PATH=str(self.work / "models/pi05_base"),
-            OUTPUT_ROOT=str(self.work / "comparison"),
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(marker.read_text(), "existing result")
+        for recipe in ("reference", "low_lr_big_batch"):
+            with self.subTest(recipe=recipe):
+                tag = "capacity-last8" + (f"-{recipe}" if recipe != "reference" else "")
+                output = self.work / "comparison" / tag
+                run = output / f"pi05-may-{MODULE.TASKS['1']}-dual_prompt_only-seed0"
+                marker = run / "keep.txt"
+                self.touch(marker)
+                marker.write_text("existing result")
+                result = self.run_autodl(
+                    "1", "last8", "0", recipe, script=CAPACITY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    OUTPUT_ROOT=str(self.work / "comparison"),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(marker.read_text(), "existing result")
+
+    def test_capacity_recipe_rejects_invalid_batch_before_launch(self):
+        for batch in ("0", "-1", "1.5", "32*2"):
+            with self.subTest(batch=batch):
+                result = self.run_autodl(
+                    "1", "last4", "0", "low_lr_big_batch", script=CAPACITY,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"), BATCH_SIZE=batch,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("BATCH_SIZE must be a positive integer", result.stderr)
+                self.assertNotIn("Launching:", result.stdout)
 
     def test_generic_base_default_profile_custom_path_and_sequential_tasks(self):
         custom = self.work / "downloaded generic base"
