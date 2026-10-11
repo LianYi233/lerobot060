@@ -4,7 +4,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
   cat <<'EOF'
 Usage: bash run_eval_libero_vlm_only.sh [base|finetuned|both] [baseline|initial|trained|all] [SUITES] [SEED]
-Defaults: both all all 0. All conditions require the exact saved step-0 checkpoint.
+Defaults: both all all 0. baseline/initial/all require the exact saved step-0 checkpoint.
+trained also supports SAVE_ONLY_FINAL runs without step-0, validating against their source instead.
 baseline: original source weights + step-0 config/processors + zero prompts.
 initial: actual random VLM prompt before any update; trained: CHECKPOINT_STEP (3000).
 Default: 10 episodes/task, EVAL_SEED=1000, n_action_steps=10, all four suites.
@@ -58,7 +59,16 @@ select_source() {
 # Validate every selected source and checkpoint before creating baselines or running GPU jobs.
 for kind in "${SOURCES[@]}"; do
   select_source "$kind"
-  CHECK_ARGS=("$SOURCE_PATH" --kind "$KIND" --tokens "$TOKENS" --initial "$INITIAL")
+  CHECK_ARGS=("$SOURCE_PATH" --kind "$KIND" --tokens "$TOKENS")
+  if [[ -e "$INITIAL" || -L "$INITIAL" ]]; then
+    CHECK_ARGS+=(--initial "$INITIAL")
+  elif [[ "$CONDITION" != trained ]]; then
+    echo "Condition '$CONDITION' requires the saved step-0 checkpoint: $INITIAL" >&2
+    echo "For SAVE_ONLY_FINAL runs, select 'trained' to evaluate the final checkpoint." >&2
+    exit 1
+  else
+    echo "No step-0 checkpoint; validating trained prompt, processors and source provenance directly."
+  fi
   if [[ "$CONDITION" == all || "$CONDITION" == trained ]]; then CHECK_ARGS+=(--checkpoint "$TRAINED"); fi
   if [[ "$CONDITION" == all || "$CONDITION" == baseline ]]; then CHECK_ARGS+=(--baseline-output "$BASELINE" --dry-run); fi
   python -m lerobot.scripts.libero_vlm_only "${CHECK_ARGS[@]}"

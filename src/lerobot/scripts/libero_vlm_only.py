@@ -269,9 +269,12 @@ def main():
         if args.initial:
             validate_checkpoint(args.initial, args.tokens, source=args.source, kind=args.kind)
         if args.checkpoint:
-            if not args.initial:
-                raise ValueError("--checkpoint requires --initial for a matched comparison")
-            validate_checkpoint(args.checkpoint, args.tokens, reference=args.initial)
+            # Final-only runs have no initialized model on disk. Still validate
+            # source provenance, prompt shapes/recipe and all saved processors;
+            # v044 must preserve its source's normalization exactly after loading.
+            validate_checkpoint(
+                args.checkpoint, args.tokens, reference=args.initial, source=args.source, kind=args.kind
+            )
         if args.baseline_output:
             if not args.initial:
                 raise ValueError("--baseline-output requires --initial")

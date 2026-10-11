@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,7 @@ class VLMOnlyTest(unittest.TestCase):
                 "--policy.train_action_projections=false",
                 "--policy.next_action_pretrain_steps=0",
                 "--policy.next_action_bridge_steps=0",
+                "--policy.ntk_save_stage_snapshots=true",
                 "--steps=3000",
                 "--policy.dtype=bfloat16",
                 "--policy.optimizer_lr=2.5e-5",
@@ -181,6 +183,35 @@ class VLMOnlyTest(unittest.TestCase):
             ):
                 self.assertIn(arg, command)
 
+    def test_final_only_saves_3000_without_initial_or_periodic_checkpoints(self):
+        from lerobot.configs.default import DatasetConfig
+        from lerobot.configs.train import TrainPipelineConfig
+
+        result = self.run_script(
+            TRAIN, "finetuned", "0", SAVE_ONLY_FINAL="true", GPU_IDS="0,1", BATCH_SIZE="32", SAVE_FREQ="1"
+        )
+        (command,) = self.commands(result)
+        for arg in (
+            "--num_processes=2",
+            "--multi_gpu",
+            "--batch_size=32",
+            "--policy.ntk_save_stage_snapshots=false",
+            "--save_steps=[]",
+            "--save_freq=3000",
+        ):
+            self.assertIn(arg, command)
+        self.assertIn(f"--policy.path={self.source('finetuned')}", command)
+        self.assertIn("final only=3000", result.stdout)
+        args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
+        cfg = TrainPipelineConfig(
+            dataset=DatasetConfig(repo_id="test/data"),
+            steps=int(args["steps"]),
+            save_steps=json.loads(args["save_steps"]),
+            save_freq=int(args["save_freq"]),
+        )
+        cfg.validate_checkpoint_schedule()
+        self.assertEqual([step for step in range(3001) if cfg.should_save_checkpoint(step)], [3000])
+
     def test_invalid_or_conflicting_settings_fail_before_launch(self):
         for env in (
             {"GPU_IDS": "0,0"},
@@ -189,6 +220,7 @@ class VLMOnlyTest(unittest.TestCase):
             {"NUM_PROCESSES": "2"},
             {"PRETRAINED_PATH": "wrong"},
             {"DRY_RUN": "yes"},
+            {"SAVE_ONLY_FINAL": "yes"},
         ):
             self.assertNotEqual(self.run_script(PAIR, "0", **env).returncode, 0)
         for arg in (
@@ -325,6 +357,45 @@ class VLMOnlyTest(unittest.TestCase):
         self.assertIn("matched_baseline/pretrained_model", result.stdout)
         self.assertFalse(list((self.work / "checkpoints").glob("*/matched_baseline")))
         self.assertFalse((self.work / "eval").exists())
+
+    def test_trained_evaluation_without_initial_and_clear_error_for_initial_controls(self):
+        for kind in ("base", "finetuned"):
+            shutil.rmtree(self.model(kind, 0).parent)
+            result = self.run_script(EVAL, kind, "trained", "all", "0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("No step-0 checkpoint", result.stdout)
+            self.assertIn("/003000/pretrained_model", result.stdout)
+            command = next(
+                shlex.split(line) for line in result.stdout.splitlines() if line.startswith("python -u")
+            )
+            self.assertIn("--env.task=libero_spatial,libero_object,libero_goal,libero_10", command)
+            for condition in ("baseline", "initial", "all"):
+                result = self.run_script(EVAL, kind, condition, "all", "0")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires the saved step-0", result.stderr)
+                self.assertNotIn("Evaluating source=", result.stdout)
+        self.assertFalse((self.work / "eval").exists())
+
+    def test_final_only_eval_still_rejects_statistics_drift_and_wrong_source(self):
+        shutil.rmtree(self.model("finetuned", 0).parent)
+        state = self.model("finetuned", 3000) / "normalizer_processor.safetensors"
+        original = state.read_bytes()
+        tensors = load_file(state)
+        tensors["action.mean"][0] += 1
+        save_file(tensors, state)
+        result = self.run_script(EVAL, "finetuned", "trained", "all", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("statistics differ", result.stderr)
+        self.assertIn("action.mean", result.stderr)
+        self.assertNotIn("Evaluating source=", result.stdout)
+        state.write_bytes(original)
+        (state.parent / "train_config.json").write_text(
+            json.dumps({"policy": {"pretrained_path": str(self.source("base"))}})
+        )
+        result = self.run_script(EVAL, "finetuned", "trained", "all", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("different source path", result.stderr)
+        self.assertNotIn("Evaluating source=", result.stdout)
 
     def test_real_parallel_dispatch_waits_for_both_and_propagates_failure(self):
         bin_dir = self.work / "bin"

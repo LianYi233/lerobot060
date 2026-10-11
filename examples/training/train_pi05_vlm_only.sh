@@ -8,6 +8,7 @@ Usage: bash examples/training/train_pi05_vlm_only.sh base|finetuned [SEED] [extr
 PI05 + one VLM prompt bank; default 1 token, action prompts=0, all other weights frozen.
 Ordinary flow only: no CABO, priming, bridge, LoRA or action projection training.
 Defaults: 3000 steps, batch 32 PER GPU, bf16, W&B online/project prompt-learning.
+SAVE_ONLY_FINAL=true saves only the final checkpoint (003000 by default), including no step-0 snapshot.
 base uses dataset QUANTILES (as in the earlier ablation); finetuned keeps v044's saved MEAN_STD.
 The evaluator builds a zero-prompt baseline using each run's exact initial processors.
 
@@ -15,7 +16,7 @@ GPU_IDS=0,1 BATCH_SIZE=16 bash examples/training/train_pi05_vlm_only.sh base 0
 For two independent runs: bash examples/training/train_pi05_vlm_only_pair.sh 0
 
 Environment: VLM_PROMPT_TOKENS, GPU_IDS (process count inferred), NUM_PROCESSES,
-MAIN_PROCESS_PORT, BATCH_SIZE, FLOW_STEPS, SAVE_FREQ, DTYPE (bfloat16|float32),
+MAIN_PROCESS_PORT, BATCH_SIZE, FLOW_STEPS, SAVE_FREQ, SAVE_ONLY_FINAL, DTYPE (bfloat16|float32),
 PRETRAINED_PATH, BASE_PRETRAINED_PATH, FINETUNED_PRETRAINED_PATH, DATASET_ROOT,
 DATASET_REPO_ID, TOKENIZER_PATH, OUTPUT_ROOT, LOG_ROOT, RUN_NAME, DRY_RUN.
 Extra args (use --key=value): --wandb.*, --policy.optimizer_*, --policy.scheduler_*,
@@ -36,6 +37,12 @@ for arg in "${EXTRA_ARGS[@]}"; do
 done
 VLM_PROMPT_TOKENS="${VLM_PROMPT_TOKENS:-1}"
 FLOW_STEPS="${FLOW_STEPS:-3000}"; SAVE_FREQ="${SAVE_FREQ:-1000}"; BATCH_SIZE="${BATCH_SIZE:-32}"
+SAVE_ONLY_FINAL="${SAVE_ONLY_FINAL:-false}"
+case "$SAVE_ONLY_FINAL" in
+  true) SAVE_FREQ="$FLOW_STEPS"; SAVE_INITIAL=false ;;
+  false) SAVE_INITIAL=true ;;
+  *) echo "SAVE_ONLY_FINAL must be true or false" >&2; exit 2 ;;
+esac
 GPU_IDS="${GPU_IDS:-0}"
 if [[ ! "$GPU_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "GPU_IDS must be comma-separated GPU indices" >&2; exit 2; fi
 IFS=',' read -r -a GPUS <<< "$GPU_IDS"
@@ -89,7 +96,7 @@ TRAIN_ARGS=(
   --policy.cabo_enabled=false --policy.train_action_projections=false --policy.use_peft=false
   --policy.freeze_vision_encoder=true --policy.train_expert_only=true
   --policy.normalization_mapping="$NORM" --preserve_pretrained_normalization="$PRESERVE"
-  --policy.ntk_save_stage_snapshots=true --policy.push_to_hub=false
+  --policy.ntk_save_stage_snapshots="$SAVE_INITIAL" --policy.push_to_hub=false
   --policy.optimizer_lr=2.5e-5 --policy.optimizer_grad_clip_norm=0.0
   --policy.scheduler_warmup_steps=1000 --policy.scheduler_decay_steps=30000 --policy.scheduler_decay_lr=1e-5
   --dataset.repo_id="${DATASET_REPO_ID:-libero}" --dataset.root="$DATASET_ROOT" --dataset.video_backend=pyav
@@ -97,12 +104,17 @@ TRAIN_ARGS=(
   --seed="$SEED" --env_eval_freq=0 --save_checkpoint=true --save_freq="$SAVE_FREQ"
   --wandb.enable=true --wandb.project=prompt-learning --wandb.mode=online --wandb.disable_artifact=true
 )
+if [[ "$SAVE_ONLY_FINAL" == true ]]; then TRAIN_ARGS+=(--save_steps='[]'); fi
 LAUNCH_ARGS=(launch --num_machines=1 --num_processes="$NUM_PROCESSES" --mixed_precision="$PRECISION"
   --main_process_port="$MAIN_PROCESS_PORT" --dynamo_backend=no)
 if (( NUM_PROCESSES > 1 )); then LAUNCH_ARGS+=(--multi_gpu); fi
 echo "source=$SOURCE VLM=$VLM_PROMPT_TOKENS action=0 trainable=$((VLM_PROMPT_TOKENS * 2048)) dtype=$DTYPE"
 echo "GPU_IDS=$GPU_IDS per_device_batch=$BATCH_SIZE global_batch=$((BATCH_SIZE * NUM_PROCESSES)) port=$MAIN_PROCESS_PORT"
-echo "output=$OUTPUT_DIR (initial=000000, interval=$SAVE_FREQ, final=$FLOW_STEPS)"
+if [[ "$SAVE_ONLY_FINAL" == true ]]; then
+  echo "output=$OUTPUT_DIR (final only=$FLOW_STEPS; no initial/intermediate checkpoints)"
+else
+  echo "output=$OUTPUT_DIR (initial=000000, interval=$SAVE_FREQ, final=$FLOW_STEPS)"
+fi
 if [[ "$DRY_RUN" == true ]]; then
   printf '%q ' env "CUDA_VISIBLE_DEVICES=$GPU_IDS" accelerate "${LAUNCH_ARGS[@]}" \
     lerobot-train "${TRAIN_ARGS[@]}" "${EXTRA_ARGS[@]}"

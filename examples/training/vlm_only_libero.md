@@ -94,6 +94,42 @@ run 名称：`pi05-base-vlm1-seed0`、`pi05-finetuned-vlm1-seed0`。
 日志在 `/root/autodl-tmp/logs/vlm-only`。保存 `000000`、`001000`、`002000`、`003000` 的完整模型；
 两组共 8 份 checkpoint，需预留相应磁盘空间。`SAVE_FREQ=3000` 可只保存初始化和最终模型。
 
+### 仅重跑 v044，并只保存最终模型
+
+`SAVE_ONLY_FINAL=true` 同时关闭 `000000` 初始化快照和中间保存，仅在训练结束保存
+`003000`；`checkpoints/last` 是指向最终 checkpoint 的软链接，不是另一份模型。
+它覆盖 `SAVE_FREQ`；只设置 `SAVE_FREQ=3000` 仍然会保存初始化模型。
+
+下例沿用双卡、每卡 batch 32（总 batch 64）、1 个 VLM token、3000 步和原学习率，
+从官方 v044 重新开始。将新输出写到 `/root/autodl-fs/wyn/`，避免和旧输出冲突。
+先用 `df -h /root/autodl-tmp /root/autodl-fs/wyn` 确认可用空间；不会删除旧 checkpoint。
+
+```bash
+export FINETUNED_PRETRAINED_PATH=/root/autodl-fs/wyn/models/pi05_libero_finetuned_v044
+export TOKENIZER_PATH=/root/autodl-fs/wyn/models/google/paligemma-3b-pt-224
+export DATASET_ROOT=/root/autodl-fs/wyn/datasets/libero
+export OUTPUT_ROOT=/root/autodl-fs/wyn/chkpt/2601-lerobot/vlm-only-final
+export LOG_ROOT=/root/autodl-fs/wyn/logs/vlm-only-final
+export TMPDIR=/root/autodl-fs/wyn/tmp
+export TORCHINDUCTOR_CACHE_DIR=/root/autodl-fs/wyn/cache/torchinductor/pi05-finetuned-vlm1-seed0
+export TRITON_CACHE_DIR=/root/autodl-fs/wyn/cache/triton/pi05-finetuned-vlm1-seed0
+
+SAVE_ONLY_FINAL=true GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKENS=1 FLOW_STEPS=3000 \
+bash examples/training/train_pi05_vlm_only.sh finetuned 0 \
+  --wandb.enable=true --wandb.project=prompt-learning \
+  --wandb.mode=online --wandb.disable_artifact=true
+
+# 同一终端，完成后测四个 suite（新终端先重新设置上面的路径变量）。
+CKPT_ROOT="$OUTPUT_ROOT" BASE_OUTPUT=/root/autodl-fs/wyn/eval/vlm-only-final \
+GPU_ID=0 VLM_PROMPT_TOKENS=1 CHECKPOINT_STEP=3000 \
+bash run_eval_libero_vlm_only.sh finetuned trained all 0
+```
+
+`trained` 模式在没有 `000000` 时直接验证最终 checkpoint 的 prompt、训练来源及处理器，
+v044 的归一化仍须与源模型一致。有 `000000` 时仍做跨 checkpoint 检查。
+本次未保存真实随机初始化，不能选择 `initial` 或包含它的 `all`；当前 `baseline` 入口
+也需要 step-0 处理器，因此上述最终模型使用 `trained` 模式评估。
+
 ## 三组对照与评测
 
 每个来源均对比：
@@ -113,7 +149,8 @@ MEAN_STD 统计量。**每个来源的三组对照内部保持数据处理一致
 
 baseline 生成不加载/修改 source 权重，只在该 run 的 `matched_baseline/pretrained_model`
 创建指向原权重的符号链接并复制小型配置/处理器文件；原模型目录需要保留。
-baseline 和 initial 评测需要该 run 已保存 `000000`；trained 还需要所选训练步的 checkpoint。
+baseline 和 initial 评测需要该 run 已保存 `000000`；trained 需要所选训练步的 checkpoint，
+并在 `000000` 存在时额外比较初始化配置和统计量。
 评测前检查 prompt 张量、源路径、配置、处理器及统计量是否匹配。
 
 训练完成后，分别在两个终端评测，使用两张卡：
