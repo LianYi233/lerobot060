@@ -90,6 +90,24 @@ def validate_processors(directory, config):
                     raise ValueError(f"Missing/invalid normalization tensor: {feature}.{key}")
 
 
+def _loaded_processor_stat(value, key, step):
+    """Mirror normalization load_state_dict without loading torch or policy weights.
+
+    The loader casts saved statistics to float32, then reshapes every 1-D visual
+    statistic to (-1, 1, 1), including the unused image count. Compare that loaded
+    representation, not the serialization layout. Do not allow numeric tolerances
+    or reshape action/state statistics: either could hide real normalization drift.
+    """
+    import numpy as np
+
+    if step["registry_name"] in {"normalizer_processor", "unnormalizer_processor"}:
+        value = value.astype(np.float32)
+        feature = key.rsplit(".", 1)[0]
+        if step["config"]["features"].get(feature, {}).get("type") == "VISUAL" and value.ndim == 1:
+            value = value.reshape(-1, 1, 1)
+    return value
+
+
 def assert_same_processors(reference, candidate):
     import numpy as np
     from safetensors.numpy import load_file
@@ -97,11 +115,12 @@ def assert_same_processors(reference, candidate):
     for filename in PROCESSORS:
         left = read_json(Path(reference) / filename)["steps"]
         right = read_json(Path(candidate) / filename)["steps"]
+        context = f"{filename}: reference={reference}; candidate={candidate}"
         if len(left) != len(right):
-            raise ValueError("Processor steps differ between checkpoints")
+            raise ValueError(f"Processor steps differ between checkpoints ({context})")
         for a, b in zip(left, right, strict=True):
             if a.get("registry_name") != b.get("registry_name"):
-                raise ValueError("Processor order differs between checkpoints")
+                raise ValueError(f"Processor order differs between checkpoints ({context})")
             # Only runtime device and local tokenizer location may move between machines.
             ac, bc = dict(a["config"]), dict(b["config"])
             if a["registry_name"] == "device_processor":
@@ -111,12 +130,29 @@ def assert_same_processors(reference, candidate):
                 ac.pop("tokenizer_name", None)
                 bc.pop("tokenizer_name", None)
             if ac != bc or bool(a.get("state_file")) != bool(b.get("state_file")):
-                raise ValueError("Processor configuration differs between checkpoints")
+                raise ValueError(f"Processor configuration differs between checkpoints ({context})")
             if a.get("state_file"):
                 x = load_file(Path(reference) / a["state_file"])
                 y = load_file(Path(candidate) / b["state_file"])
-                if x.keys() != y.keys() or any(not np.array_equal(v, y[k]) for k, v in x.items()):
-                    raise ValueError("Processor statistics differ between checkpoints")
+                if x.keys() != y.keys():
+                    raise ValueError(
+                        f"Processor statistics differ between checkpoints ({context}): "
+                        f"missing={sorted(x.keys() - y.keys())}; extra={sorted(y.keys() - x.keys())}"
+                    )
+                for key, value in x.items():
+                    loaded_x = _loaded_processor_stat(value, key, a)
+                    loaded_y = _loaded_processor_stat(y[key], key, b)
+                    if not np.array_equal(loaded_x, loaded_y):
+                        detail = (
+                            f"{key}: saved shapes {value.shape} -> {y[key].shape}, "
+                            f"dtypes {value.dtype} -> {y[key].dtype}"
+                        )
+                        if loaded_x.shape == loaded_y.shape:
+                            delta = np.abs(loaded_x.astype(np.float64) - loaded_y.astype(np.float64))
+                            detail += f", max_abs_diff_after_load={float(delta.max(initial=0)):.9g}"
+                        raise ValueError(
+                            f"Processor statistics differ between checkpoints ({context}): {detail}"
+                        )
 
 
 def validate_checkpoint(directory, tokens, reference=None, source=None, kind=None):

@@ -243,6 +243,79 @@ class VLMOnlyTest(unittest.TestCase):
         self.assertNotIn("Evaluating source=", result.stdout)
         self.assertFalse((self.work / "eval").exists())
 
+    def test_finetuned_processor_load_save_roundtrip_preserves_comparison(self):
+        from safetensors.torch import load_file as load_torch, save_file as save_torch
+
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep
+
+        source = self.source("finetuned")
+        filename = "policy_preprocessor.json"
+        pipeline = json.loads((source / filename).read_text())
+        step = pipeline["steps"][0]
+        tensors = load_file(source / step["state_file"])
+        # v044 contains 1-D counts even though its image mean/std are already 3-D.
+        for camera in ("image", "image2"):
+            feature = f"observation.images.{camera}"
+            step["config"]["features"][feature] = {"type": "VISUAL", "shape": [3, 256, 256]}
+            tensors[f"{feature}.count"] = np.array([100], dtype=np.float32)
+            tensors[f"{feature}.mean"] = np.ones((3, 1, 1), dtype=np.float32)
+        (source / filename).write_text(json.dumps(pipeline))
+        save_file(tensors, source / step["state_file"])
+        # Use the real loader/saver, rather than assuming what serialization does.
+        processor = NormalizerProcessorStep(**step["config"])
+        processor.load_state_dict(load_torch(source / step["state_file"]))
+        saved = processor.state_dict()
+        self.assertEqual(saved["observation.images.image.count"].shape, (1, 1, 1))
+        for training_step in (0, 3000):
+            model = self.model("finetuned", training_step)
+            (model / filename).write_text(json.dumps(pipeline))
+            save_torch(saved, model / step["state_file"])
+        validate_checkpoint(self.model("finetuned", 0), 1, source=source, kind="finetuned")
+        result = self.run_script(EVAL, "finetuned", "all", "all", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("Evaluating source="), 3)
+        # Canonicalizing shape must not hide changed values, even for image counts.
+        saved["observation.images.image.count"] += 1
+        save_torch(saved, self.model("finetuned", 3000) / step["state_file"])
+        with self.assertRaisesRegex(ValueError, r"observation.images.image.count.*max_abs_diff_after_load=1"):
+            validate_checkpoint(self.model("finetuned", 3000), 1, reference=self.model("finetuned", 0))
+
+    def test_float32_loader_conversion_is_allowed_but_not_numeric_tolerance(self):
+        from safetensors.torch import load_file as load_torch, save_file as save_torch
+
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep
+
+        source = self.source("finetuned")
+        step = json.loads((source / "policy_preprocessor.json").read_text())["steps"][0]
+        tensors = load_file(source / step["state_file"])
+        tensors["action.mean"] = np.linspace(0.123456789012, 0.765432198765, 7, dtype=np.float64)
+        save_file(tensors, source / step["state_file"])
+        processor = NormalizerProcessorStep(**step["config"])
+        processor.load_state_dict(load_torch(source / step["state_file"]))
+        save_torch(processor.state_dict(), self.model("finetuned", 0) / step["state_file"])
+        validate_checkpoint(self.model("finetuned", 0), 1, source=source, kind="finetuned")
+        tensors = load_file(self.model("finetuned", 0) / step["state_file"])
+        # One float32 ULP would pass a broad allclose(), but is genuine drift.
+        tensors["action.mean"][0] = np.nextafter(tensors["action.mean"][0], np.float32(np.inf))
+        save_file(tensors, self.model("finetuned", 0) / step["state_file"])
+        with self.assertRaisesRegex(ValueError, r"reference=.*candidate=.*action.mean.*max_abs_diff"):
+            validate_checkpoint(self.model("finetuned", 0), 1, source=source, kind="finetuned")
+
+    def test_nonvisual_stat_shapes_and_missing_keys_remain_strict(self):
+        state = self.model("finetuned", 3000) / "normalizer_processor.safetensors"
+        tensors = load_file(state)
+        for step in (0, 3000):
+            save_file(
+                {**tensors, "action.count": np.array([100], dtype=np.float32)},
+                self.model("finetuned", step) / state.name,
+            )
+        save_file({**tensors, "action.count": np.ones((1, 1, 1), dtype=np.float32) * 100}, state)
+        with self.assertRaisesRegex(ValueError, r"action.count: saved shapes"):
+            validate_checkpoint(self.model("finetuned", 3000), 1, reference=self.model("finetuned", 0))
+        save_file(tensors, state)
+        with self.assertRaisesRegex(ValueError, r"missing=\['action.count'\]"):
+            validate_checkpoint(self.model("finetuned", 3000), 1, reference=self.model("finetuned", 0))
+
     def test_dry_eval_plans_six_conditions_without_writing_baselines(self):
         result = self.run_script(EVAL, "both", "all", "all", "0")
         self.assertEqual(result.returncode, 0, result.stderr)
