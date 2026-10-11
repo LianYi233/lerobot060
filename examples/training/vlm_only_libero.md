@@ -24,13 +24,15 @@ VLM prompt 读取 observations 和自己的 prompt 块，action tokens 读取完
 
 ## AutoDL 启动
 
-已有 checkout，且本地修改已妥善保存：
+已有 checkout，且本地修改已妥善保存，第一次创建本地 `vlm-only` 分支：
 
 ```bash
-git fetch origin
-git switch vlm-only
-git pull --ff-only origin vlm-only
+git fetch origin vlm-only
+git switch -c vlm-only FETCH_HEAD
 ```
+
+这也适用于之前用 `--single-branch` 克隆的仓库。
+若本地已存在 `vlm-only`，则执行 `git switch vlm-only` 和 `git pull --ff-only origin vlm-only`。
 
 新机器可直接：
 
