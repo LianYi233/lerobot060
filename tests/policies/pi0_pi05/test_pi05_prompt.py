@@ -672,6 +672,51 @@ def test_same_noise_sampling_changes_with_each_prompt_bank(prompt_name):
         assert not torch.allclose(first_context, second_context)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("num_vlm_prompts,num_prompts", [(0, 0), (1, 0), (_VLM_PROMPTS, _PROMPTS)])
+@torch.no_grad()
+def test_cached_sampling_sdpa_bias_matches_query_dtype(dtype, num_vlm_prompts, num_prompts, monkeypatch):
+    """Exercise both cache paths under the stricter CUDA SDPA bias contract on CPU."""
+    core = PI05Policy(
+        _config(
+            dtype=dtype,
+            num_vlm_prompt_tokens=num_vlm_prompts,
+            num_prompt_tokens=num_prompts,
+            cabo_enabled=False,
+            attention_implementation="sdpa",
+        )
+    ).model.eval()
+    inputs = _inputs()
+    inputs["images"].append(torch.randn_like(inputs["images"][0]))
+    inputs["img_masks"].append(torch.tensor([True, True]))
+    noise = _actions()
+    # Oracle uses the existing full-forward training path and identical Euler steps.
+    expected = noise.clone()
+    for time in (1.0, 0.5):
+        expected = expected - 0.5 * core.predict_velocity(**inputs, x_t=expected, time=torch.full((2,), time))
+
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+    seen_queries = []
+
+    def strict_sdpa(query, key, value, attn_mask=None, **kwargs):
+        if attn_mask is not None and attn_mask.is_floating_point():
+            # CPU SDPA accepts fp32 bias with bf16 Q; some CUDA kernels reject it.
+            assert attn_mask.dtype == query.dtype, "SDPA attention bias must match query dtype"
+            assert torch.isfinite(attn_mask).all(), "PI05 finite padding sentinel must stay finite"
+            seen_queries.append(query.shape[-2])
+        return original_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", strict_sdpa)
+    actual = core.sample_actions(**inputs, noise=noise, num_steps=2)
+    assert torch.isfinite(actual).all()
+    # Prefix and action expert both used SDPA; checking just one misses the other crash.
+    prefix_length = 2 * 4 + inputs["tokens"].shape[1] + num_vlm_prompts
+    assert prefix_length in seen_queries
+    assert _HORIZON + num_prompts in seen_queries
+    tolerance = 0.03 if dtype == "bfloat16" else 1e-5
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
 @pytest.mark.parametrize("missing_keys", [{_VLM_PROMPT_KEY}, {_PROMPT_KEY}, _PROMPT_KEYS])
 def test_legacy_checkpoint_initializes_only_missing_prompts(tmp_path, missing_keys):
     policy = PI05Policy(_config())

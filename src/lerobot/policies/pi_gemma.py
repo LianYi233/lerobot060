@@ -276,6 +276,14 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
+        # Explicit 4-D masks bypass Transformers' mask conversion. Prefix/suffix
+        # embeddings can be float32 before the cast above, leaving a float32 bias
+        # for bfloat16 queries. Some CUDA SDPA kernels require matching dtypes.
+        # Cast once per model call, preserving boolean masks and the finite PI05
+        # padding sentinel (which is representable in bfloat16).
+        if causal_mask is not None and causal_mask.is_floating_point():
+            causal_mask = causal_mask.to(dtype=hidden_states.dtype)
+
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
