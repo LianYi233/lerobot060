@@ -1713,6 +1713,12 @@ class PI05Policy(PreTrainedPolicy):
 
     def get_optim_params(self):
         self.model._freeze_vlm()
+        if getattr(self.config, "vlm_prompt_only", False):
+            parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+            prompt = self.model.vlm_prompt_tokens.weight
+            if len(parameters) != 1 or parameters[0] is not prompt or prompt.numel() == 0:
+                raise ValueError("vlm_prompt_only must optimize exactly model.vlm_prompt_tokens.weight")
+            return parameters
         if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
             raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
         if not PI05Policy._is_cabo_active(self):

@@ -199,6 +199,94 @@ def test_projection_adaptation_rejects_prompt_only_cabo_and_peft():
         policy.wrap_with_peft()
 
 
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_single_vlm_token_updates_through_frozen_expert_without_action_prompt(
+    checkpointing, dtype, monkeypatch
+):
+    policy = PI05Policy(
+        _config(
+            dtype=dtype,
+            vlm_prompt_only=True,
+            num_vlm_prompt_tokens=1,
+            num_prompt_tokens=0,
+            training_stage="flow",
+            next_action_pretrain_steps=0,
+            next_action_bridge_steps=0,
+            cabo_enabled=False,
+            gradient_checkpointing=checkpointing,
+        )
+    )
+    policy.train()
+    parameters = policy.get_optim_params()
+    assert len(parameters) == 1 and parameters[0] is policy.model.vlm_prompt_tokens.weight
+    assert {name for name, p in policy.named_parameters() if p.requires_grad} == {_VLM_PROMPT_KEY}
+    assert policy.model.prompt_tokens.weight.numel() == 0
+    inputs = _inputs()
+    monkeypatch.setattr(policy, "_preprocess_images", lambda _: (inputs["images"], inputs["img_masks"]))
+    batch = {
+        ACTION: _actions(),
+        "action_is_pad": torch.zeros(2, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: inputs["tokens"],
+        OBS_LANGUAGE_ATTENTION_MASK: inputs["masks"],
+    }
+    before = {name: value.clone() for name, value in policy.state_dict().items()}
+    optimizer = torch.optim.AdamW(parameters, lr=0.01, weight_decay=0)
+    loss, _ = policy(batch)
+    loss.backward()
+    gradient = policy.model.vlm_prompt_tokens.weight.grad
+    assert gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+    for name, parameter in policy.named_parameters():
+        if name != _VLM_PROMPT_KEY:
+            assert parameter.grad is None, name
+    optimizer.step()
+    for name, value in policy.state_dict().items():
+        if name == _VLM_PROMPT_KEY:
+            assert not torch.equal(value, before[name])
+        else:
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        {"num_prompt_tokens": 1},
+        {"num_vlm_prompt_tokens": 0},
+        {"cabo_enabled": True},
+        {"next_action_pretrain_steps": 1000},
+        {"next_action_bridge_steps": 250},
+        {"training_stage": "next_action"},
+        {"train_action_projections": True},
+        {"use_peft": True},
+    ],
+)
+def test_vlm_only_contract_rejects_other_adaptation_paths(conflict):
+    options = {
+        "vlm_prompt_only": True,
+        "num_vlm_prompt_tokens": 1,
+        "num_prompt_tokens": 0,
+        "training_stage": "flow",
+        "next_action_pretrain_steps": 0,
+        "next_action_bridge_steps": 0,
+        "cabo_enabled": False,
+    }
+    options.update(conflict)
+    with pytest.raises(ValueError, match="vlm_prompt_only"):
+        _config(**options)
+
+
+def test_zero_prompt_attention_matches_original_pi05_prefix_action_mask():
+    pad_masks = torch.tensor([[True, True, False, True, True, True]])
+    original = modeling_pi05.make_att_2d_masks(pad_masks, torch.tensor([[0, 0, 0, 1, 0, 0]]))
+    actual = modeling_pi05.make_pi05_att_2d_masks(
+        pad_masks,
+        prefix_length=3,
+        num_vlm_prompt_tokens=0,
+        num_prompt_tokens=0,
+    )
+    torch.testing.assert_close(actual, original)
+
+
 @pytest.mark.parametrize("phase", ["action_only", "bridge", "flow"])
 def test_projection_adaptation_updates_only_prompts_and_action_maps(phase, monkeypatch, tmp_path):
     cfg = _config(

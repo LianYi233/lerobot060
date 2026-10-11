@@ -57,6 +57,9 @@ class PI05Config(PreTrainedConfig):
     # Either bank can be disabled for an ablation with CABO disabled. Both may be 0 for inference only.
     num_prompt_tokens: int = 16
     prompt_init_std: float = 0.02
+    # Explicit experiment contract: only the VLM prompt bank may train in ordinary flow.
+    # Existing dual-prompt and staged recipes remain available when this is False.
+    vlm_prompt_only: bool = False
     # Opt-in embodiment adaptation: also train the existing action input/output linear maps.
     # This changes the prompt-only parameter budget and requires CABO/PEFT to be disabled.
     # It adds no checkpoint tensors and never unfreezes the VLM or action transformer.
@@ -197,6 +200,20 @@ class PI05Config(PreTrainedConfig):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer, got {value}")
+        if self.vlm_prompt_only and (
+            self.num_vlm_prompt_tokens < 1
+            or self.num_prompt_tokens != 0
+            or self.training_stage != PI05TrainingStage.FLOW
+            or self.next_action_pretrain_steps != 0
+            or self.next_action_bridge_steps != 0
+            or self.cabo_enabled
+            or self.train_action_projections
+            or self.use_peft
+        ):
+            raise ValueError(
+                "vlm_prompt_only requires VLM tokens > 0, action tokens = 0, ordinary flow, "
+                "and no priming, bridge, CABO, action projection training or PEFT adapters."
+            )
         if not math.isfinite(self.prompt_init_std) or self.prompt_init_std <= 0:
             raise ValueError(f"prompt_init_std must be finite and greater than 0, got {self.prompt_init_std}")
 
