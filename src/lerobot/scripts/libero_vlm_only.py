@@ -95,9 +95,10 @@ def _loaded_processor_stat(value, key, step):
 
     The loader casts saved statistics to float32, then reshapes every 1-D visual
     statistic to (-1, 1, 1). Its reconstructed stats dict converts single-element
-    tensors to Python scalars, so a later processor.to() saves counts as shape ().
-    Count metadata does not participate in normalization: canonicalize singleton
-    counts only, keeping their values exact. Do not allow numeric tolerances or
+    tensors to Python scalars, so a later processor.to() saves them as shape ().
+    Counts and stats for keys absent from the configured features (episode_index,
+    timestamp, etc.) do not participate in normalization. Canonicalize their
+    singleton shapes, keeping values exact. Do not allow numeric tolerances or
     reshape other action/state statistics, which could hide normalization drift.
     """
     import numpy as np
@@ -105,9 +106,10 @@ def _loaded_processor_stat(value, key, step):
     if step["registry_name"] in {"normalizer_processor", "unnormalizer_processor"}:
         value = value.astype(np.float32)
         feature, statistic = key.rsplit(".", 1)
-        if statistic == "count" and value.size == 1:
+        features = step["config"]["features"]
+        if value.size == 1 and (statistic == "count" or feature not in features):
             return value.reshape(())
-        if step["config"]["features"].get(feature, {}).get("type") == "VISUAL" and value.ndim == 1:
+        if features.get(feature, {}).get("type") == "VISUAL" and value.ndim == 1:
             value = value.reshape(-1, 1, 1)
     return value
 
@@ -143,6 +145,7 @@ def assert_same_processors(reference, candidate):
                         f"Processor statistics differ between checkpoints ({context}): "
                         f"missing={sorted(x.keys() - y.keys())}; extra={sorted(y.keys() - x.keys())}"
                     )
+                differences = []
                 for key, value in x.items():
                     loaded_x = _loaded_processor_stat(value, key, a)
                     loaded_y = _loaded_processor_stat(y[key], key, b)
@@ -154,9 +157,12 @@ def assert_same_processors(reference, candidate):
                         if loaded_x.shape == loaded_y.shape:
                             delta = np.abs(loaded_x.astype(np.float64) - loaded_y.astype(np.float64))
                             detail += f", max_abs_diff_after_load={float(delta.max(initial=0)):.9g}"
-                        raise ValueError(
-                            f"Processor statistics differ between checkpoints ({context}): {detail}"
-                        )
+                        differences.append(detail)
+                if differences:
+                    raise ValueError(
+                        f"Processor statistics differ between checkpoints ({context}): "
+                        + "; ".join(differences)
+                    )
 
 
 def validate_checkpoint(directory, tokens, reference=None, source=None, kind=None):

@@ -287,6 +287,11 @@ class VLMOnlyTest(unittest.TestCase):
         tensors = load_file(source / step["state_file"])
         for feature in ("action", "observation.state"):
             tensors[f"{feature}.count"] = np.array([100], dtype=np.float32)
+        # Dataset metadata is saved alongside model feature statistics. The
+        # same scalar conversion affects every statistic, not just counts.
+        for feature in ("episode_index", "frame_index", "index", "task_index", "timestamp", "extra_metadata"):
+            for stat in ("min", "max", "mean", "std", "q01", "q99", "count"):
+                tensors[f"{feature}.{stat}"] = np.array([100], dtype=np.float32)
         # v044 contains 1-D counts even though its image mean/std are already 3-D.
         for camera in ("image", "image2"):
             feature = f"observation.images.{camera}"
@@ -304,7 +309,7 @@ class VLMOnlyTest(unittest.TestCase):
         processor.to(device="cpu")
         saved = processor.state_dict()
         for key in tensors:
-            if key.endswith(".count"):
+            if tensors[key].size == 1:
                 self.assertEqual(saved[key].shape, ())
         for training_step in (0, 3000):
             model = self.model("finetuned", training_step)
@@ -394,6 +399,60 @@ class VLMOnlyTest(unittest.TestCase):
                         validate_checkpoint(
                             self.model("finetuned", 3000), 1, reference=self.model("finetuned", 0)
                         )
+
+    def test_final_only_metadata_roundtrip_in_both_processors(self):
+        from safetensors.torch import load_file as load_torch, save_file as save_torch
+
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+
+        source, model = self.source("finetuned"), self.model("finetuned", 3000)
+        shutil.rmtree(self.model("finetuned", 0).parent)
+        for filename, processor_type in (
+            ("policy_preprocessor.json", NormalizerProcessorStep),
+            ("policy_postprocessor.json", UnnormalizerProcessorStep),
+        ):
+            step = json.loads((source / filename).read_text())["steps"][0]
+            tensors = load_file(source / step["state_file"])
+            tensors["episode_index.max"] = np.array([100], dtype=np.float32)
+            tensors["timestamp.mean"] = np.array([0.5], dtype=np.float32)
+            save_file(tensors, source / step["state_file"])
+            processor = processor_type(**step["config"])
+            processor.load_state_dict(load_torch(source / step["state_file"]))
+            processor.to(device="cpu")
+            saved = processor.state_dict()
+            self.assertEqual(saved["episode_index.max"].shape, ())
+            save_torch(saved, model / step["state_file"])
+        result = self.run_script(EVAL, "finetuned", "trained", "all", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No step-0 checkpoint", result.stdout)
+        self.assertIn("Evaluating source=finetuned condition=trained", result.stdout)
+
+    def test_metadata_values_cardinality_missing_keys_and_all_differences_remain_checked(self):
+        source, model = self.source("finetuned"), self.model("finetuned", 3000)
+        filename = "normalizer_processor.safetensors"
+        reference = load_file(source / filename)
+        reference["episode_index.max"] = np.array([100], dtype=np.float32)
+        reference["timestamp.mean"] = np.array([0.5], dtype=np.float32)
+        save_file(reference, source / filename)
+        for changed in (np.array(101, dtype=np.float32), np.array([100, 100], dtype=np.float32)):
+            with self.subTest(episode_max=changed):
+                save_file({**reference, "episode_index.max": changed}, model / filename)
+                with self.assertRaisesRegex(ValueError, r"episode_index.max: saved shapes"):
+                    validate_checkpoint(model, 1, source=source, kind="finetuned")
+        save_file(
+            {key: value for key, value in reference.items() if key != "episode_index.max"}, model / filename
+        )
+        with self.assertRaisesRegex(ValueError, r"missing=\['episode_index.max'\]"):
+            validate_checkpoint(model, 1, source=source, kind="finetuned")
+        # Report all differences in this state file so debugging does not stop
+        # at another metadata key on each retry.
+        candidate = {**reference, "episode_index.max": np.array(101, dtype=np.float32)}
+        candidate["timestamp.mean"] = np.array(0.75, dtype=np.float32)
+        save_file(candidate, model / filename)
+        with self.assertRaisesRegex(ValueError, "statistics differ") as error:
+            validate_checkpoint(model, 1, source=source, kind="finetuned")
+        self.assertIn("episode_index.max", str(error.exception))
+        self.assertIn("timestamp.mean", str(error.exception))
 
     def test_dry_eval_plans_six_conditions_without_writing_baselines(self):
         result = self.run_script(EVAL, "both", "all", "all", "0")
