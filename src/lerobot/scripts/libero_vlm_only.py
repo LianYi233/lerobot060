@@ -91,18 +91,22 @@ def validate_processors(directory, config):
 
 
 def _loaded_processor_stat(value, key, step):
-    """Mirror normalization load_state_dict without loading torch or policy weights.
+    """Compare effective normalization statistics without loading torch or weights.
 
     The loader casts saved statistics to float32, then reshapes every 1-D visual
-    statistic to (-1, 1, 1), including the unused image count. Compare that loaded
-    representation, not the serialization layout. Do not allow numeric tolerances
-    or reshape action/state statistics: either could hide real normalization drift.
+    statistic to (-1, 1, 1). Its reconstructed stats dict converts single-element
+    tensors to Python scalars, so a later processor.to() saves counts as shape ().
+    Count metadata does not participate in normalization: canonicalize singleton
+    counts only, keeping their values exact. Do not allow numeric tolerances or
+    reshape other action/state statistics, which could hide normalization drift.
     """
     import numpy as np
 
     if step["registry_name"] in {"normalizer_processor", "unnormalizer_processor"}:
         value = value.astype(np.float32)
-        feature = key.rsplit(".", 1)[0]
+        feature, statistic = key.rsplit(".", 1)
+        if statistic == "count" and value.size == 1:
+            return value.reshape(())
         if step["config"]["features"].get(feature, {}).get("type") == "VISUAL" and value.ndim == 1:
             value = value.reshape(-1, 1, 1)
     return value
