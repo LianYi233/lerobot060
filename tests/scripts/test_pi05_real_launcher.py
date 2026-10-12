@@ -719,7 +719,7 @@ class RealLauncherTest(unittest.TestCase):
     def test_prompt_only_token_sweep_freezes_expert_and_projections(self):
         commands = []
         outputs, jobs, ports = set(), set(), set()
-        for tokens, gpu_ids in ((32, "0,1"), (64, "2,3"), (128, "0,1")):
+        for tokens, gpu_ids in ((32, "0,1"), (64, "2,3"), (128, "0,1"), (512, "2,3")):
             with self.subTest(tokens=tokens):
                 result = self.run_autodl(
                     "1", str(tokens), "0", script=PROMPT_ONLY,
@@ -768,13 +768,13 @@ class RealLauncherTest(unittest.TestCase):
                 commands.append([arg for arg in command if not arg.startswith(varying)])
         for command in commands[1:]:
             self.assertEqual(commands[0], command)
-        self.assertEqual((len(outputs), len(jobs), len(ports)), (3, 3, 3))
+        self.assertEqual((len(outputs), len(jobs), len(ports)), (4, 4, 4))
         self.assertFalse((self.work / "prompt output").exists())
         self.assertFalse((self.work / "prompt log").exists())
 
     def test_prompt_only_control_batch_lr_and_budget_overrides(self):
         outputs = []
-        for tokens, batch in ((16, 64), (128, 64), (128, 128)):
+        for tokens, batch in ((16, 64), (128, 64), (128, 128), (512, 64)):
             result = self.run_autodl(
                 "3", str(tokens), "2", script=PROMPT_ONLY,
                 PRETRAINED_PATH=str(self.work / "models/pi05_base"),
@@ -792,7 +792,7 @@ class RealLauncherTest(unittest.TestCase):
             self.assertIn(f"expected trainable={tokens * 3072}", result.stdout)
             self.assertIn(f"global={batch * 2}", result.stdout)
             outputs.append(next(arg for arg in command if arg.startswith("--output_dir=")))
-        self.assertEqual(len(set(outputs)), 3)
+        self.assertEqual(len(set(outputs)), 4)
 
     def test_prompt_only_defaults_and_sequential_tasks(self):
         result = self.run_autodl(

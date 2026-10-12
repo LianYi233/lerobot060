@@ -3,12 +3,13 @@
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'EOF'
-Usage: bash examples/training/train_piper_prompt_only.sh [TASK] [16|32|64|128] [SEED]
+Usage: bash examples/training/train_piper_prompt_only.sh [TASK] [16|32|64|128|512] [SEED]
 
 Defaults: task 1, 32 tokens PER BANK, seed 0. TASK accepts 1/2/3/4/all.
 32 means VLM 32x2048 + action 32x1024 = 98,304 trainable parameters.
 64 means VLM 64x2048 + action 64x1024 = 196,608 trainable parameters.
 128 means VLM 128x2048 + action 128x1024 = 393,216 trainable parameters.
+512 means VLM 512x2048 + action 512x1024 = 1,572,864 trainable parameters.
 16 is a matched 49,152-parameter control. Counts assume gemma_2b/gemma_300m.
 Only vlm_prompt_tokens.weight and prompt_tokens.weight train. Both backbones, action
 input/output projections, time MLPs and final norm stay frozen; PEFT wrappers are off.
@@ -38,12 +39,12 @@ TASK="${1:-1}"
 TOKENS="${2:-32}"
 SEED="${3:-0}"
 if (( $# > 3 )) || [[ ! "${TASK}" =~ ^([1-4]|all)$ ]]; then
-  echo "Use TASK (1..4 or all), TOKENS (16/32/64/128), SEED; no extra CLI arguments" >&2
+  echo "Use TASK (1..4 or all), TOKENS (16/32/64/128/512), SEED; no extra CLI arguments" >&2
   exit 2
 fi
 case "${TOKENS}" in
-  16|32|64|128) ;;
-  *) echo "TOKENS must be 16, 32, 64 or 128 PER BANK" >&2; exit 2 ;;
+  16|32|64|128|512) ;;
+  *) echo "TOKENS must be 16, 32, 64, 128 or 512 PER BANK" >&2; exit 2 ;;
 esac
 if [[ -z "${PRETRAINED_PATH:-}" ]]; then
   echo "Set PRETRAINED_PATH explicitly to the local original base checkpoint" >&2

@@ -1,4 +1,4 @@
-# Piper：只训练两组 prompt，比较 16 / 32 / 64 / 128 个 token
+# Piper：只训练两组 prompt，比较 16 / 32 / 64 / 128 / 512 个 token
 
 入口：`bash examples/training/train_piper_prompt_only.sh TASK TOKENS SEED`。
 默认 task 1、每组 32 个 token、seed 0；TASK 支持 1/2/3/4/all。
@@ -19,9 +19,10 @@ VLM、视觉编码器、整个 action expert、动作输入/输出投影、时�
 | 32 | 32 × 2048 | 32 × 1024 | 98,304 |
 | 64 | 64 × 2048 | 64 × 1024 | 196,608 |
 | 128 | 128 × 2048 | 128 × 1024 | 393,216 |
+| 512 | 512 × 2048 | 512 × 1024 | 1,572,864 |
 
 计数对应默认 gemma_2b / gemma_300m 架构，不包括被冻结的原模型。
-32/64/128 档已经超过原来约 0.05M 的 prompt 参数预算，报告实验时应分别标明。
+32/64/128/512 档已经超过原来约 0.05M 的 prompt 参数预算，报告实验时应分别标明。
 这是减少训练参数，推理仍需完整模型；保存的也仍是完整 checkpoint，不是仅含 prompt 的文件。
 冻结骨干仍需让梯度经过其计算图传回 prompt，增加 token 或 batch 都可能增加显存。
 
@@ -132,10 +133,57 @@ Batch: per_GPU=64, processes=2, global=128
 128+128 的激活显存需要实测。更多 token 是容量对照，不能仅凭总体 loss 判断夹爪为何未闭合；
 还要看示范闭合阶段的夹爪预测、实际下发目标和反馈。
 
+## 并行比较 128+128 和 512+512
+
+在两个终端分别激活原训练环境、进入仓库并更新代码，执行相同的共同设置：
+
+```bash
+conda activate lerobot
+cd /home/wyn/VLAA/lerobot060
+git pull --ff-only origin piper
+
+export WORK_ROOT=/data1/wyn/piper-work
+export PRETRAINED_PATH=/data1/wyn/piper-work/models/pi05_base
+export DATASET_BASE=/data/datasets/May-pick-and-place
+export TOKENIZER_PATH=/data/models/paligemma-3b-pt-224
+export RUN_GROUP=piper-task1-prompt128-512-b64-reference-lr-12k-01
+export OUTPUT_ROOT="/data1/wyn/chkpt/2601-lerobot/${RUN_GROUP}"
+export LOG_ROOT="/data1/wyn/logs/${RUN_GROUP}"
+export FLOW_STEPS=12000
+export SAVE_STEPS='[6000,9000,12000]'
+```
+
+终端 1，GPU 0、1：
+
+```bash
+GPU_IDS=0,1 MAIN_PROCESS_PORT=30128 BATCH_SIZE=64 \
+PROMPT_LR=0.0001 PROMPT_FINAL_LR=0.00001 DRY_RUN=false \
+  bash examples/training/train_piper_prompt_only.sh 1 128 0
+```
+
+终端 2，GPU 2、3：
+
+```bash
+GPU_IDS=2,3 MAIN_PROCESS_PORT=30512 BATCH_SIZE=64 \
+PROMPT_LR=0.0001 PROMPT_FINAL_LR=0.00001 DRY_RUN=false \
+  bash examples/training/train_piper_prompt_only.sh 1 512 0
+```
+
+两组均使用 reference 学习率，global batch 各为 128；仍只训练两组 prompt。
+输出和日志各自追加 `prompt-only-t128-b64` / `prompt-only-t512-b64`，W&B job 名也不同。
+若 128 组已经从原始 base 按相同 LR/batch/步数启动，无需重跑，只启动另一终端的 512 组；
+已启动那组继续保存在原目录。
+
+512 组实际可训练参数应为 1,572,864（约 1.573M），冻结条件与小 token 档相同。
+启动参数和冻结范围检查不代表实际 GPU 显存验证；512+512 的长序列会增加激活计算和显存，
+每卡 batch 64 是否可用需要实测。若出现 OOM，可降低 batch；若要严格比较 token 数量，
+两组使用相同的全局 batch，并为重跑选择新目录。
+
 ## 检查冻结范围和结果
 
 训练开始时检查实际的 `Trainable parameter report`。32 档合计应为 98,304，64 档应为
-196,608，128 档应为 393,216，且 `action_projection=0`、`action_expert_blocks=0`、`other=0`。
+196,608，128 档应为 393,216，512 档应为 1,572,864，且 `action_projection=0`、
+`action_expert_blocks=0`、`other=0`。
 模型结构不同则以实际报告为准，不能仅依赖启动脚本打印的默认架构估算。
 
 `OUTPUT_ROOT`、`LOG_ROOT` 是父目录；入口追加 token 数和每卡 batch：

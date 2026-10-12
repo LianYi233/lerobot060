@@ -70,7 +70,7 @@ class Module:
 class PromptPartitionTest(unittest.TestCase):
     def test_supported_prompt_banks_are_the_only_parameters_in_optimizer(self):
         production = load_production_methods()
-        for tokens, expected in ((16, 49152), (32, 98304), (64, 196608), (128, 393216)):
+        for tokens, expected in ((16, 49152), (32, 98304), (64, 196608), (128, 393216), (512, 1572864)):
             with self.subTest(tokens=tokens):
                 model = production["PI05Pytorch"]()
                 model.config = SimpleNamespace(

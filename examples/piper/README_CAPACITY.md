@@ -9,7 +9,7 @@
 [低学习率 / 大 batch 对照](README_CAPACITY_LR_BATCH.md)。
 
 若希望完全冻结动作专家和动作投影、只训练两组 prompt，使用独立的
-[prompt-only 16 / 32 / 64 / 128 token 对照](README_PROMPT_ONLY.md)，不要沿用本入口的投影解冻设置。
+[prompt-only 16 / 32 / 64 / 128 / 512 token 对照](README_PROMPT_ONLY.md)，不要沿用本入口的投影解冻设置。
 
 这组实验检验“动作专家的适配容量是否限制了 Piper 拟合”，不能保证成功抓取。
 仿真和真机不需要遵守同一个可训练参数预算，但应按迁移难度、数据量及验证结果决定，
