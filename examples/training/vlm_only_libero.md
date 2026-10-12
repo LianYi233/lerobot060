@@ -137,6 +137,31 @@ GPU_ID=0 VLM_PROMPT_TOKENS=2 CHECKPOINT_STEP=3000 \
 bash run_eval_libero_vlm_only.sh base trained all 0
 ```
 
+### 依次评测四个 2/4-token 模型，只显示最终成功率
+
+批量评测入口默认选择 `base-vlm2`、`base-vlm4`、`finetuned-vlm2`、`finetuned-vlm4`，
+依次在同一张 GPU 上评测 `003000`，四套 LIBERO、每套 100 次、每个模型共 400 次。
+输入模型/tokenizer 默认在 `/root/autodl-fs/wyn/models/`，checkpoint 默认在
+`/root/autodl-tmp/chkpt/2601-lerobot/vlm-only/`，与上面的批量训练目录一致。
+
+```bash
+env -u PRETRAINED_PATH -u RUN_NAME -u VLM_PROMPT_TOKENS -u BASE_CKPT -u BASE_MODEL_PATH \
+CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+BASE_OUTPUT=/root/autodl-tmp/eval/vlm-only \
+GPU_ID=1 VLM_PROMPT_TOKEN_COUNTS="2 4" CHECKPOINT_STEP=3000 \
+bash run_eval_libero_vlm_only_token_sweep.sh both all 0
+```
+
+正常运行期间终端保持安静，每个模型完成后仅显示其名称、四个 suite 和 overall 成功率。
+进度信息、逐任务输出、视频路径和完整异常写入 `BASE_OUTPUT/logs/` 中本次调用独立的日志；
+视频仍按原脚本保存。不会从累计 summary 日志读取结果，避免打印上次结果或重复结果。
+开始前先检查四个 checkpoint；任一评测失败或结果不完整会停止后续模型并提示日志位置。
+沿用原评测脚本的逐任务续跑及一致性校验。
+
+`DRY_RUN=true` 只检查并打印命令，不评测或写日志。可选择尚未完成的来源/token 数，
+例如 `VLM_PROMPT_TOKEN_COUNTS=4 GPU_ID=1 bash run_eval_libero_vlm_only_token_sweep.sh finetuned all 0`。
+与之前一致，默认评测 `EVAL_SEED=1000`；自定义 `EPISODES_PER_TASK` 会相应改变总次数。
+
 ### 仅重跑 v044，并只保存最终模型
 
 `SAVE_ONLY_FINAL=true` 同时关闭 `000000` 初始化快照和中间保存，仅在训练结束保存

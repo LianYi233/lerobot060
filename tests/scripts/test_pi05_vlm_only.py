@@ -21,6 +21,7 @@ TRAIN = ROOT / "examples/training/train_pi05_vlm_only.sh"
 PAIR = ROOT / "examples/training/train_pi05_vlm_only_pair.sh"
 SWEEP = ROOT / "examples/training/train_pi05_vlm_only_token_sweep.sh"
 EVAL = ROOT / "run_eval_libero_vlm_only.sh"
+EVAL_SWEEP = ROOT / "run_eval_libero_vlm_only_token_sweep.sh"
 
 
 class VLMOnlyTest(unittest.TestCase):
@@ -61,10 +62,14 @@ class VLMOnlyTest(unittest.TestCase):
     def source(self, kind):
         return self.work / "sources" / kind
 
-    def model(self, kind, step):
-        return self.work / "checkpoints" / f"pi05-{kind}-vlm1-seed0/checkpoints/{step:06d}/pretrained_model"
+    def model(self, kind, step, tokens=1):
+        return (
+            self.work
+            / "checkpoints"
+            / f"pi05-{kind}-vlm{tokens}-seed0/checkpoints/{step:06d}/pretrained_model"
+        )
 
-    def make_model(self, path, kind, source=False):
+    def make_model(self, path, kind, source=False, tokens=1):
         path.mkdir(parents=True)
         mode = "MEAN_STD" if kind == "finetuned" or source else "QUANTILES"
         norm = {"ACTION": mode, "STATE": mode, "VISUAL": "IDENTITY"}
@@ -79,7 +84,7 @@ class VLMOnlyTest(unittest.TestCase):
         if not source:
             config.update(
                 vlm_prompt_only=True,
-                num_vlm_prompt_tokens=1,
+                num_vlm_prompt_tokens=tokens,
                 num_prompt_tokens=0,
                 training_stage="flow",
                 next_action_pretrain_steps=0,
@@ -88,7 +93,7 @@ class VLMOnlyTest(unittest.TestCase):
                 train_action_projections=False,
                 use_peft=False,
             )
-            weights["model.vlm_prompt_tokens.weight"] = np.ones((1, 2048), dtype=np.float32)
+            weights["model.vlm_prompt_tokens.weight"] = np.ones((tokens, 2048), dtype=np.float32)
             weights["model.prompt_tokens.weight"] = np.empty((0, 1024), dtype=np.float32)
             (path / "train_config.json").write_text(
                 json.dumps({"policy": {"pretrained_path": str(self.source(kind))}})
@@ -131,6 +136,119 @@ class VLMOnlyTest(unittest.TestCase):
             check=False,
             timeout=30,
         )
+
+    def make_eval_sweep(self):
+        for kind in ("base", "finetuned"):
+            for count in (2, 4):
+                self.make_model(self.model(kind, 3000, count), kind, tokens=count)
+
+    def install_fake_evaluator(self):
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        capture = self.work / "evaluations.jsonl"
+        python = bin_dir / "python"
+        python.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "if sys.argv[1:3] != ['-u', '-']:\n"
+            f"    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+            "args = dict(arg.split('=', 1) for arg in sys.argv[3:])\n"
+            "with open(os.environ['CAPTURE_FILE'], 'a') as f:\n"
+            "    f.write(json.dumps({'gpu': os.environ['CUDA_VISIBLE_DEVICES'], **args}) + '\\n')\n"
+            "name = Path(args['--policy.path']).parents[2].name\n"
+            "print('progress-noise 50%\\rprogress-noise 100%', file=sys.stderr)\n"
+            "print({'video_paths': ['/verbose/video-path.mp4'] * 30})\n"
+            "if name == os.environ.get('FAIL_RUN'): sys.exit(7)\n"
+            "output = Path(args['--output_dir'])\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "episodes = int(args['--eval.n_episodes'])\n"
+            "tasks = [{'task_group': suite, 'task_id': tid,\n"
+            "          'metrics': {'successes': [True] * (episodes - 1) + [False]}}\n"
+            "         for suite in args['--env.task'].split(',') for tid in range(10)]\n"
+            "if os.environ.get('BAD_RESULT') == 'missing': tasks.pop()\n"
+            "if os.environ.get('BAD_RESULT') == 'duplicate': tasks[-1] = tasks[0]\n"
+            "if os.environ.get('BAD_RESULT') == 'episodes': tasks[-1]['metrics']['successes'].pop()\n"
+            "(output / 'eval_info.json').write_text(json.dumps({'per_task': tasks}))\n"
+        )
+        python.chmod(0o755)
+        self.env.update(PATH=f"{bin_dir}{os.pathsep}{self.env['PATH']}", CAPTURE_FILE=str(capture))
+        return capture
+
+    def test_eval_sweep_dry_run_matches_four_final_checkpoints_without_writes(self):
+        self.make_eval_sweep()
+        result = self.run_script(EVAL_SWEEP, "both", "all", "0", GPU_ID="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = [
+            shlex.split(line) for line in result.stdout.splitlines() if line.startswith("python -u -")
+        ]
+        self.assertEqual(len(commands), 4)
+        for (kind, count), command in zip(
+            (("base", 2), ("base", 4), ("finetuned", 2), ("finetuned", 4)), commands, strict=True
+        ):
+            self.assertIn(f"--policy.path={self.model(kind, 3000, count)}", command)
+            self.assertIn("--seed=1000", command)
+            self.assertIn("--eval.n_episodes=10", command)
+            self.assertIn("--policy.n_action_steps=10", command)
+            self.assertIn("--env.task=libero_spatial,libero_object,libero_goal,libero_10", command)
+        self.assertFalse((self.work / "eval").exists())
+
+    def test_eval_sweep_checks_last_model_before_launching_first(self):
+        self.make_eval_sweep()
+        capture = self.install_fake_evaluator()
+        config_path = self.model("finetuned", 3000, 4) / "config.json"
+        config = json.loads(config_path.read_text())
+        config["num_vlm_prompt_tokens"] = 2
+        config_path.write_text(json.dumps(config))
+        result = self.run_script(EVAL_SWEEP, DRY_RUN="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Preflight failed: pi05-finetuned-vlm4", result.stderr)
+        self.assertFalse(capture.exists())
+
+    def test_eval_sweep_prints_only_fresh_rates_and_retains_noisy_logs(self):
+        self.make_eval_sweep()
+        capture = self.install_fake_evaluator()
+        output = self.work / "eval"
+        output.mkdir()
+        stale = output / "eval_pi05-base-vlm2-seed0-libero-all4-summary.log"
+        stale.write_text("STALE SUCCESS RATE: 12.34%\n")
+        result = self.run_script(EVAL_SWEEP, DRY_RUN="false", GPU_ID="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launches = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertEqual(
+            [Path(run["--policy.path"]).parents[2].name for run in launches],
+            [f"pi05-{kind}-vlm{n}-seed0" for kind in ("base", "finetuned") for n in (2, 4)],
+        )
+        self.assertEqual({run["gpu"] for run in launches}, {"1"})
+        self.assertEqual(result.stdout.count("overall: 90.00% (360/400)"), 4)
+        self.assertEqual(result.stdout.count("libero_10: 90.00% (90/100)"), 4)
+        self.assertEqual(len(result.stdout.strip().splitlines()), 27)  # 6 lines/model + blank separators
+        self.assertEqual(result.stderr, "")
+        for noise in ("STALE", "progress-noise", ".mp4", "per-task", "No step-0"):
+            self.assertNotIn(noise, result.stdout)
+        logs = list((output / "logs").glob("*.log"))
+        self.assertEqual(len(logs), 4)
+        for log in logs:
+            self.assertIn("progress-noise", log.read_text())
+            self.assertIn("video-path.mp4", log.read_text())
+        # A failed rerun must not print the previous valid eval_info.json as a new score.
+        failed = self.run_script(EVAL_SWEEP, DRY_RUN="false", FAIL_RUN="pi05-base-vlm2-seed0")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("Evaluation failed: pi05-base-vlm2", failed.stderr)
+        self.assertEqual(len(capture.read_text().splitlines()), 5)
+
+    def test_eval_sweep_rejects_partial_or_duplicate_results_and_stops(self):
+        self.make_eval_sweep()
+        capture = self.install_fake_evaluator()
+        for index, bad in enumerate(("missing", "duplicate", "episodes"), 1):
+            with self.subTest(bad=bad):
+                result = self.run_script(EVAL_SWEEP, DRY_RUN="false", BAD_RESULT=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Result validation failed", result.stderr)
+                self.assertEqual(len(capture.read_text().splitlines()), index)
 
     def commands(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
