@@ -260,6 +260,11 @@ except Exception as error:
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+# The sweep keeps ordinary stdout/stderr in its log and exposes only this stream
+# to the terminal. Existing direct invocations keep their original progress style.
+progress_fd = os.environ.get("LIBERO_PROGRESS_FD")
+progress_stream = os.fdopen(os.dup(int(progress_fd)), "w", buffering=1) if progress_fd else sys.stderr
+
 entries = list(importlib.metadata.entry_points(group="console_scripts", name="lerobot-eval"))
 if len(entries) != 1:
     raise RuntimeError("Cannot uniquely resolve lerobot-eval in this Python environment")
@@ -344,7 +349,7 @@ state = {"bar": None, "task_done": 0, "task_total": 0,
 
 def refresh():
     bar = state["bar"]
-    if bar is not None:
+    if bar is not None and not progress_fd:
         bar.set_postfix_str(
             f"剩余={int(bar.total - bar.n)} "
             f"任务={state['task_done']}/{state['task_total']} "
@@ -411,13 +416,24 @@ def all_with_progress(*args, **kwargs):
                 state["successes"] += sum(saved["successes"])
     print(f"恢复进度：已保存 {state['task_done']} 个任务 / {saved_episodes} 个 episode", flush=True)
     state["current"] = "准备开始"
+    progress_options = {}
+    if progress_fd:
+        progress_options = {
+            "desc": os.environ.get("LIBERO_PROGRESS_LABEL", "LIBERO"),
+            "file": progress_stream, "leave": False, "ascii": True,
+            "mininterval": 1.0,
+            "bar_format": "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                          "[{elapsed} ETA {remaining}]",
+        }
     state["bar"] = tqdm(
         total=state["task_total"] * state["per_task"],
         initial=saved_episodes,
-        desc="LIBERO 总进度", unit="episode", dynamic_ncols=True,
-        disable=False, mininterval=0.2, position=0,
-        bar_format="{desc}: {percentage:5.1f}%|{bar}| 已完成 {n_fmt}/{total_fmt} "
-                   "[已用 {elapsed}, 预计剩余 {remaining}, {rate_fmt}] {postfix}",
+        unit="episode", dynamic_ncols=True, disable=False, position=0,
+        **({
+            "desc": "LIBERO 总进度", "mininterval": 0.2,
+            "bar_format": "{desc}: {percentage:5.1f}%|{bar}| 已完成 {n_fmt}/{total_fmt} "
+                          "[已用 {elapsed}, 预计剩余 {remaining}, {rate_fmt}] {postfix}",
+        } | progress_options),
     )
     refresh()
     try:

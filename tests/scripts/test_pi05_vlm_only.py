@@ -159,6 +159,9 @@ class VLMOnlyTest(unittest.TestCase):
             "name = Path(args['--policy.path']).parents[2].name\n"
             "print('progress-noise 50%\\rprogress-noise 100%', file=sys.stderr)\n"
             "print({'video_paths': ['/verbose/video-path.mp4'] * 30})\n"
+            "if os.environ.get('LIBERO_PROGRESS_FD'):\n"
+            "    line = '\\r' + os.environ['LIBERO_PROGRESS_LABEL'] + ': 50% 200/400 [ETA 10:00]'\n"
+            "    os.write(int(os.environ['LIBERO_PROGRESS_FD']), line.encode())\n"
             "if name == os.environ.get('FAIL_RUN'): sys.exit(7)\n"
             "output = Path(args['--output_dir'])\n"
             "output.mkdir(parents=True, exist_ok=True)\n"
@@ -249,6 +252,23 @@ class VLMOnlyTest(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn("Result validation failed", result.stderr)
                 self.assertEqual(len(capture.read_text().splitlines()), index)
+
+    def test_eval_sweep_progress_stream_bypasses_logs_without_leaking_other_output(self):
+        self.make_eval_sweep()
+        self.install_fake_evaluator()
+        result = self.run_script(EVAL_SWEEP, DRY_RUN="false", PROGRESS="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for index, (kind, count) in enumerate(
+            (("base", 2), ("base", 4), ("finetuned", 2), ("finetuned", 4)), 1
+        ):
+            self.assertIn(f"[{index}/4] {kind}-vlm{count}: 50% 200/400 [ETA 10:00]", result.stderr)
+        self.assertIn("loading model/environments", result.stderr)
+        self.assertIn("\x1b[K", result.stderr)
+        self.assertEqual(result.stdout.count("overall: 90.00% (360/400)"), 4)
+        for noise in ("progress-noise", ".mp4", "per-task", "No step-0"):
+            self.assertNotIn(noise, result.stdout + result.stderr)
+        for log in (self.work / "eval/logs").glob("*.log"):
+            self.assertNotIn("ETA 10:00", log.read_text())
 
     def commands(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)

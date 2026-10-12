@@ -11,7 +11,9 @@ All checkpoints pass the existing VLM-only preflight before any GPU evaluation s
 Runs sequentially on GPU_ID=0 (override to 1); stop on the first failure.
 Same evaluation protocol: EVAL_SEED=1000, 10 episodes/task, n_action_steps=10.
 
-Terminal output contains only each model's final suite and overall success rates.
+Terminal output shows one in-place episode progress bar, then final success rates.
+The bar shows model index, completed/total episodes, elapsed time and this model's ETA.
+PROGRESS=auto (default) shows it in a terminal; true forces it, false hides it.
 Full output (including errors/video paths) is saved under BASE_OUTPUT/logs;
 EVAL_LOG_ROOT can override that log directory. On failure, print the log path.
 Existing per-task resume checks still apply. Videos are still saved as before.
@@ -55,6 +57,8 @@ for count in "${TOKEN_COUNTS[@]}"; do
 done
 DRY_RUN="${DRY_RUN:-false}"
 if [[ "$DRY_RUN" != true && "$DRY_RUN" != false ]]; then echo "Invalid DRY_RUN" >&2; exit 2; fi
+PROGRESS="${PROGRESS:-auto}"
+case "$PROGRESS" in auto|true|false) ;; *) echo "Invalid PROGRESS: use auto, true or false" >&2; exit 2 ;; esac
 RUN_PREFIX="${RUN_PREFIX:-pi05}"
 export GPU_ID="${GPU_ID:-0}" CHECKPOINT_STEP="${CHECKPOINT_STEP:-3000}"
 export EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}" EVAL_SEED="${EVAL_SEED:-1000}"
@@ -73,6 +77,21 @@ export TQDM_DISABLE=1
 EVAL_LOG_ROOT="${EVAL_LOG_ROOT:-$BASE_OUTPUT/logs}"
 STEP_PADDED=$(printf '%06d' "$CHECKPOINT_STEP")
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+TOTAL_MODELS=$((${#SOURCES[@]} * ${#TOKEN_COUNTS[@]}))
+# Keep a dedicated terminal stream across nested shell/Python log redirections.
+# Only the overall bar writes here; warnings, inner bars and video paths stay in logs.
+unset LIBERO_PROGRESS_FD LIBERO_PROGRESS_LABEL
+if [[ "$DRY_RUN" != true && ( "$PROGRESS" == true || ( "$PROGRESS" == auto && -t 2 ) ) ]]; then
+  exec 3>&2
+  export LIBERO_PROGRESS_FD=3
+fi
+progress_status() {
+  if [[ -n "${LIBERO_PROGRESS_FD:-}" ]]; then printf '\r\033[K%s' "$1" >&3; fi
+}
+progress_clear() {
+  if [[ -n "${LIBERO_PROGRESS_FD:-}" ]]; then printf '\r\033[K' >&3; fi
+}
+trap progress_clear EXIT
 
 run_one() {
   local source="$1" count="$2" dry="$3"
@@ -86,15 +105,19 @@ select_run() {
 
 # Check the entire sweep before starting the first expensive rollout.
 if [[ "$DRY_RUN" != true ]]; then mkdir -p "$EVAL_LOG_ROOT"; fi
+MODEL_INDEX=0
 for source in "${SOURCES[@]}"; do
   for count in "${TOKEN_COUNTS[@]}"; do
+    MODEL_INDEX=$((MODEL_INDEX + 1))
     select_run "$source" "$count"
+    progress_status "Checking [$MODEL_INDEX/$TOTAL_MODELS] $source-vlm$count ..."
     if [[ "$DRY_RUN" == true ]]; then
       run_one "$source" "$count" true
     elif run_one "$source" "$count" true >"$LOG" 2>&1; then
       :
     else
       status=$?
+      progress_clear
       echo "Preflight failed: $NAME (exit=$status); log: $LOG" >&2
       exit "$status"
     fi
@@ -102,13 +125,18 @@ for source in "${SOURCES[@]}"; do
 done
 if [[ "$DRY_RUN" == true ]]; then exit 0; fi
 
+MODEL_INDEX=0
 for source in "${SOURCES[@]}"; do
   for count in "${TOKEN_COUNTS[@]}"; do
+    MODEL_INDEX=$((MODEL_INDEX + 1))
     select_run "$source" "$count"
+    export LIBERO_PROGRESS_LABEL="[$MODEL_INDEX/$TOTAL_MODELS] $source-vlm$count"
+    progress_status "$LIBERO_PROGRESS_LABEL loading model/environments ..."
     if run_one "$source" "$count" false >>"$LOG" 2>&1; then
-      :
+      progress_clear
     else
       status=$?
+      progress_clear
       echo "Evaluation failed: $NAME (exit=$status); log: $LOG" >&2
       exit "$status"
     fi

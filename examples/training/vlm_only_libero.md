@@ -137,7 +137,7 @@ GPU_ID=0 VLM_PROMPT_TOKENS=2 CHECKPOINT_STEP=3000 \
 bash run_eval_libero_vlm_only.sh base trained all 0
 ```
 
-### 依次评测四个 2/4-token 模型，只显示最终成功率
+### 依次评测四个 2/4-token 模型，单行进度与最终成功率
 
 批量评测入口默认选择 `base-vlm2`、`base-vlm4`、`finetuned-vlm2`、`finetuned-vlm4`，
 依次在同一张 GPU 上评测 `003000`，四套 LIBERO、每套 100 次、每个模型共 400 次。
@@ -152,11 +152,19 @@ GPU_ID=1 VLM_PROMPT_TOKEN_COUNTS="2 4" CHECKPOINT_STEP=3000 \
 bash run_eval_libero_vlm_only_token_sweep.sh both all 0
 ```
 
-正常运行期间终端保持安静，每个模型完成后仅显示其名称、四个 suite 和 overall 成功率。
-进度信息、逐任务输出、视频路径和完整异常写入 `BASE_OUTPUT/logs/` 中本次调用独立的日志；
+默认 `PROGRESS=auto`：在终端显示一条原地更新的进度条，包括第几个模型、当前模型的
+已完成/总 episode、耗时和预计剩余时间。每完成一个 episode 更新，不逐帧输出；
+模型/环境加载期间显示加载状态，开始 rollout 后才估算 ETA。ETA 针对当前模型，
+不同任务的耗时会影响估计；续跑计数包含已保存任务，速度根据本次运行估算。
+每个模型完成后显示其名称、四个 suite 和 overall 成功率。
+逐任务输出、视频路径和完整异常写入 `BASE_OUTPUT/logs/` 中本次调用独立的日志；
 视频仍按原脚本保存。不会从累计 summary 日志读取结果，避免打印上次结果或重复结果。
+重定向输出时默认不显示动态进度，避免日志刷屏。`PROGRESS=true` 强制显示，
+`PROGRESS=false` 恢复完全静默、只输出最终成功率。
 开始前先检查四个 checkpoint；任一评测失败或结果不完整会停止后续模型并提示日志位置。
 沿用原评测脚本的逐任务续跑及一致性校验。
+已启动的旧进程不会自动切换显示方式；需停止旧进程、更新脚本后用原命令重启。
+已完整保存的任务会跳过，未完成的当前任务会重新评测。
 
 `DRY_RUN=true` 只检查并打印命令，不评测或写日志。可选择尚未完成的来源/token 数，
 例如 `VLM_PROMPT_TOKEN_COUNTS=4 GPU_ID=1 bash run_eval_libero_vlm_only_token_sweep.sh finetuned all 0`。
