@@ -5,8 +5,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
   cat <<'EOF'
 Usage: bash examples/training/train_pi05_vlm_only_token_sweep.sh [base|finetuned|both] [SEED] [extra args...]
-Defaults: both sources, seed 0, VLM_PROMPT_TOKEN_COUNTS="2 4".
-Order: base-vlm2, base-vlm4, finetuned-vlm2, finetuned-vlm4.
+Defaults: both sources, seed 0, VLM_PROMPT_TOKEN_COUNTS="8 16 32 64".
+Order: base-vlm8/16/32/64, then finetuned-vlm8/16/32/64 (eight independent runs).
 Each run independently starts from its source; all runs are sequential.
 GPU_IDS=0,1 and BATCH_SIZE=32 default to two-GPU DDP, global batch 64.
 Only VLM prompts train; action prompts=0, backbone frozen. torch.compile is off by default.
@@ -29,7 +29,7 @@ and token counts explicitly after a partial sweep, or choose a new RUN_PREFIX.
 
 GPU_IDS=0,1 BATCH_SIZE=32 bash examples/training/train_pi05_vlm_only_token_sweep.sh both 0
 DRY_RUN=true bash examples/training/train_pi05_vlm_only_token_sweep.sh both 0
-VLM_PROMPT_TOKEN_COUNTS=4 bash examples/training/train_pi05_vlm_only_token_sweep.sh finetuned 0
+VLM_PROMPT_TOKEN_COUNTS="32 64" bash examples/training/train_pi05_vlm_only_token_sweep.sh finetuned 0
 EOF
   exit 0
 fi
@@ -45,7 +45,7 @@ if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then echo "Invalid SEED" >&2; exit 2; f
 for key in RUN_NAME VLM_PROMPT_TOKENS PRETRAINED_PATH; do
   if [[ -n "${!key:-}" ]]; then echo "Sweep controls $key; see --help" >&2; exit 2; fi
 done
-read -r -a TOKEN_COUNTS <<< "${VLM_PROMPT_TOKEN_COUNTS-2 4}"
+read -r -a TOKEN_COUNTS <<< "${VLM_PROMPT_TOKEN_COUNTS-8 16 32 64}"
 if (( ${#TOKEN_COUNTS[@]} == 0 )); then echo "VLM_PROMPT_TOKEN_COUNTS cannot be empty" >&2; exit 2; fi
 declare -A SEEN_COUNTS=()
 for count in "${TOKEN_COUNTS[@]}"; do

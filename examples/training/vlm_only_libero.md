@@ -94,15 +94,17 @@ run 名称：`pi05-base-vlm1-seed0`、`pi05-finetuned-vlm1-seed0`。
 日志在 `/root/autodl-tmp/logs/vlm-only`。保存 `000000`、`001000`、`002000`、`003000` 的完整模型；
 两组共 8 份 checkpoint，需预留相应磁盘空间。`SAVE_FREQ=3000` 可只保存初始化和最终模型。
 
-### 两个来源分别训练 2、4 个 token，只保存 3000 步
+### 两个来源分别训练 8、16、32、64 个 token，只保存 3000 步
 
-新入口沿用上面的 VLM-only 配方，默认每次用两张卡训练，按顺序运行四个独立实验：
-`base-vlm2` → `base-vlm4` → `finetuned-vlm2` → `finetuned-vlm4`。
+批量入口沿用上面的 VLM-only 配方，默认每次用两张卡训练，按顺序运行八个独立实验：
+先 `base-vlm8/16/32/64`，再 `finetuned-vlm8/16/32/64`。
 每个实验都从对应的原始模型开始，不从上一个 token 数的模型继续训练。
 
 ```bash
+env -u PRETRAINED_PATH -u RUN_NAME -u VLM_PROMPT_TOKENS \
 OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
-GPU_IDS=0,1 BATCH_SIZE=32 \
+LOG_ROOT=/root/autodl-tmp/logs/vlm-only \
+GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKEN_COUNTS="8 16 32 64" \
 bash examples/training/train_pi05_vlm_only_token_sweep.sh both 0 \
   --wandb.enable=true --wandb.project=prompt-learning \
   --wandb.mode=online --wandb.disable_artifact=true
@@ -112,30 +114,35 @@ bash examples/training/train_pi05_vlm_only_token_sweep.sh both 0 \
 `/root/autodl-tmp/`。每卡 batch 32、全局 batch 64；学习率保持 `2.5e-5`。
 默认关闭 `torch.compile`，保留 bf16 和 gradient checkpointing。
 固定 `FLOW_STEPS=3000`、`SAVE_ONLY_FINAL=true`，只保存 `003000`；
-token=2/4 分别训练 4096/8192 个参数。W&B 默认开启，项目 `prompt-learning`。
+token=8/16/32/64 分别训练 16384/32768/65536/131072 个参数。
+W&B 默认开启，项目 `prompt-learning`。
 
-输出目录为 `$OUTPUT_ROOT/pi05-{base|finetuned}-vlm{2|4}-seed0/checkpoints/003000/`，
-`last` 只是软链接。每个 checkpoint 仍包含完整冻结模型权重，四份权重约需 30 GB。
+输出目录为 `$OUTPUT_ROOT/pi05-{base|finetuned}-vlm{8|16|32|64}-seed0/checkpoints/003000/`，
+`last` 只是软链接。每个 checkpoint 仍包含完整冻结模型权重，共保存八份最终模型。
 开始前会检查所有选定实验；已有输出不覆盖，也不自动跳过。训练失败后停止后续实验。
 可设置 `DRY_RUN=true` 仅检查并打印命令，或选择尚未执行的组合，例如：
 
 ```bash
-VLM_PROMPT_TOKEN_COUNTS=4 GPU_IDS=0,1 BATCH_SIZE=32 \
+VLM_PROMPT_TOKEN_COUNTS="32 64" GPU_IDS=0,1 BATCH_SIZE=32 \
 bash examples/training/train_pi05_vlm_only_token_sweep.sh finetuned 0
 ```
 
 可用 `RUN_PREFIX=retry` 给失败实验选择新目录。此入口要求取消旧的单模型
 `RUN_NAME`、`PRETRAINED_PATH`、`VLM_PROMPT_TOKENS` 环境变量，分别使用
 `RUN_PREFIX`、两个来源的路径变量、`VLM_PROMPT_TOKEN_COUNTS` 控制实验。
-评测入口不变；例如测 base-token2：
+仍可显式设置 `VLM_PROMPT_TOKEN_COUNTS="2 4"` 选择之前的训练组合。
+评测入口不变；例如测 base-token8：
 
 ```bash
 BASE_PRETRAINED_PATH=/root/autodl-fs/wyn/models/pi05_libero_base \
 TOKENIZER_PATH=/root/autodl-fs/wyn/models/google/paligemma-3b-pt-224 \
 CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
-GPU_ID=0 VLM_PROMPT_TOKENS=2 CHECKPOINT_STEP=3000 \
+GPU_ID=0 VLM_PROMPT_TOKENS=8 CHECKPOINT_STEP=3000 \
 bash run_eval_libero_vlm_only.sh base trained all 0
 ```
+
+批量评测这八个模型时，在下面的批量评测命令中设置
+`VLM_PROMPT_TOKEN_COUNTS="8 16 32 64"` 即可。
 
 ### 依次评测四个 2/4-token 模型，单行进度与最终成功率
 

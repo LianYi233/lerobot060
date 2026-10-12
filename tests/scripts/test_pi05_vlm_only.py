@@ -327,9 +327,11 @@ class VLMOnlyTest(unittest.TestCase):
             SWEEP, "both", "0", FLOW_STEPS="6000", SAVE_ONLY_FINAL="false", SAVE_FREQ="1"
         )
         commands = self.commands(result)
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 8)
         for (source, count), command in zip(
-            (("base", 2), ("base", 4), ("finetuned", 2), ("finetuned", 4)), commands, strict=True
+            [(source, count) for source in ("base", "finetuned") for count in (8, 16, 32, 64)],
+            commands,
+            strict=True,
         ):
             args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
             self.assertIn("CUDA_VISIBLE_DEVICES=0,1", command)
@@ -389,7 +391,7 @@ class VLMOnlyTest(unittest.TestCase):
                 self.assertNotEqual(self.run_script(SWEEP, "both", "0", **env).returncode, 0)
 
     def test_token_sweep_checks_last_destination_before_starting_any_training(self):
-        output = self.work / "training/pi05-finetuned-vlm4-seed0"
+        output = self.work / "training/pi05-finetuned-vlm64-seed0"
         output.mkdir(parents=True)
         result = self.run_script(SWEEP, "both", "0", DRY_RUN="false")
         self.assertNotEqual(result.returncode, 0)
@@ -406,7 +408,7 @@ class VLMOnlyTest(unittest.TestCase):
             f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
             "job = next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--job_name='))\n"
             "with Path(os.environ['CAPTURE_LOG']).open('a') as stream: stream.write(job + '\\n')\n"
-            "print(job, flush=True)\nsys.exit(7 if '-base-vlm4-' in job else 0)\n"
+            "print(job, flush=True)\nsys.exit(7 if '-base-vlm16-' in job else 0)\n"
         )
         trainer = bin_dir / "lerobot-train"
         trainer.write_text("#!/bin/sh\nexit 0\n")
@@ -426,9 +428,10 @@ class VLMOnlyTest(unittest.TestCase):
             **cache,
         )
         self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertEqual(capture.read_text().splitlines(), ["pi05-base-vlm2-seed0", "pi05-base-vlm4-seed0"])
-        self.assertIn("Sweep stopped: source=base VLM=4 exit=7", result.stderr)
-        self.assertFalse((self.work / "logs/pi05-finetuned-vlm2-seed0.log").exists())
+        self.assertEqual(capture.read_text().splitlines(), ["pi05-base-vlm8-seed0", "pi05-base-vlm16-seed0"])
+        self.assertIn("Sweep stopped: source=base VLM=16 exit=7", result.stderr)
+        self.assertFalse((self.work / "logs/pi05-base-vlm32-seed0.log").exists())
+        self.assertFalse((self.work / "logs/pi05-finetuned-vlm8-seed0.log").exists())
 
     def test_final_only_saves_3000_without_initial_or_periodic_checkpoints(self):
         from lerobot.configs.default import DatasetConfig
