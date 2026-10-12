@@ -719,7 +719,7 @@ class RealLauncherTest(unittest.TestCase):
     def test_prompt_only_token_sweep_freezes_expert_and_projections(self):
         commands = []
         outputs, jobs, ports = set(), set(), set()
-        for tokens, gpu_ids in ((32, "0,1"), (64, "2,3")):
+        for tokens, gpu_ids in ((32, "0,1"), (64, "2,3"), (128, "0,1")):
             with self.subTest(tokens=tokens):
                 result = self.run_autodl(
                     "1", str(tokens), "0", script=PROMPT_ONLY,
@@ -766,32 +766,33 @@ class RealLauncherTest(unittest.TestCase):
                     "CUDA_VISIBLE_DEVICES=", "--main_process_port=", "--job_name=", "--output_dir=",
                 )
                 commands.append([arg for arg in command if not arg.startswith(varying)])
-        self.assertEqual(*commands)
-        self.assertEqual((len(outputs), len(jobs), len(ports)), (2, 2, 2))
+        for command in commands[1:]:
+            self.assertEqual(commands[0], command)
+        self.assertEqual((len(outputs), len(jobs), len(ports)), (3, 3, 3))
         self.assertFalse((self.work / "prompt output").exists())
         self.assertFalse((self.work / "prompt log").exists())
 
     def test_prompt_only_control_batch_lr_and_budget_overrides(self):
         outputs = []
-        for batch in (64, 128):
+        for tokens, batch in ((16, 64), (128, 64), (128, 128)):
             result = self.run_autodl(
-                "3", "16", "2", script=PROMPT_ONLY,
+                "3", str(tokens), "2", script=PROMPT_ONLY,
                 PRETRAINED_PATH=str(self.work / "models/pi05_base"),
                 BATCH_SIZE=str(batch), PROMPT_LR="0.0001", PROMPT_FINAL_LR="0.00001",
                 FLOW_STEPS="3000", SAVE_STEPS="[3000]", MAIN_PROCESS_PORT="30116",
             )
             (command,) = self.command_args(result)
             for arg in (
-                "--policy.num_vlm_prompt_tokens=16", "--policy.num_prompt_tokens=16",
+                f"--policy.num_vlm_prompt_tokens={tokens}", f"--policy.num_prompt_tokens={tokens}",
                 f"--batch_size={batch}", "--steps=3000", "--save_steps=[3000]", "--seed=2",
                 "--policy.optimizer_lr=0.0001", "--policy.scheduler_decay_lr=0.00001",
                 "--main_process_port=30116", "--piper_eval.seed=2",
             ):
                 self.assertIn(arg, command)
-            self.assertIn("expected trainable=49152", result.stdout)
+            self.assertIn(f"expected trainable={tokens * 3072}", result.stdout)
             self.assertIn(f"global={batch * 2}", result.stdout)
             outputs.append(next(arg for arg in command if arg.startswith("--output_dir=")))
-        self.assertNotEqual(*outputs)
+        self.assertEqual(len(set(outputs)), 3)
 
     def test_prompt_only_defaults_and_sequential_tasks(self):
         result = self.run_autodl(

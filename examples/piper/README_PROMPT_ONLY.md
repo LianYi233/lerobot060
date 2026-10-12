@@ -1,4 +1,4 @@
-# Piper：只训练两组 prompt，比较 16 / 32 / 64 个 token
+# Piper：只训练两组 prompt，比较 16 / 32 / 64 / 128 个 token
 
 入口：`bash examples/training/train_piper_prompt_only.sh TASK TOKENS SEED`。
 默认 task 1、每组 32 个 token、seed 0；TASK 支持 1/2/3/4/all。
@@ -18,9 +18,10 @@ VLM、视觉编码器、整个 action expert、动作输入/输出投影、时�
 | 16（同条件基线） | 16 × 2048 | 16 × 1024 | 49,152 |
 | 32 | 32 × 2048 | 32 × 1024 | 98,304 |
 | 64 | 64 × 2048 | 64 × 1024 | 196,608 |
+| 128 | 128 × 2048 | 128 × 1024 | 393,216 |
 
 计数对应默认 gemma_2b / gemma_300m 架构，不包括被冻结的原模型。
-32/64 档已经超过原来约 0.05M 的 prompt 参数预算，报告实验时应分别标明。
+32/64/128 档已经超过原来约 0.05M 的 prompt 参数预算，报告实验时应分别标明。
 这是减少训练参数，推理仍需完整模型；保存的也仍是完整 checkpoint，不是仅含 prompt 的文件。
 冻结骨干仍需让梯度经过其计算图传回 prompt，增加 token 或 batch 都可能增加显存。
 
@@ -94,10 +95,47 @@ GPU_IDS=0,1 MAIN_PROCESS_PORT=30016 BATCH_SIZE=64 DRY_RUN=false \
   bash examples/training/train_piper_prompt_only.sh 1 16 0
 ```
 
+## 128+128 扩容，保持 reference 学习率
+
+更新到支持 128 的版本后，`1 128 0` 表示 task 1、**每组 128 个 token**、seed 0。
+仍从共同设置中的原始 `pi05_base` 开始，不直接恢复 64-token checkpoint；两者的 prompt
+权重形状不同。沿用上面的数据和模型路径，新建输出目录并显式传入 reference 学习率：
+
+```bash
+git pull --ff-only origin piper
+export RUN_GROUP=piper-task1-prompt128-b64-reference-lr-12k-01
+export OUTPUT_ROOT="/data1/wyn/chkpt/2601-lerobot/${RUN_GROUP}"
+export LOG_ROOT="/data1/wyn/logs/${RUN_GROUP}"
+export FLOW_STEPS=12000
+export SAVE_STEPS='[6000,9000,12000]'
+
+GPU_IDS=0,1 MAIN_PROCESS_PORT=30128 BATCH_SIZE=64 \
+PROMPT_LR=0.0001 PROMPT_FINAL_LR=0.00001 DRY_RUN=false \
+  bash examples/training/train_piper_prompt_only.sh 1 128 0
+```
+
+`MAIN_PROCESS_PORT` 只用于分布式通信，不控制 token 数；30032 在空闲时也可用。
+128-token 档默认端口是 30128，这里显式填写以免继承旧端口。
+输出子目录为 `$OUTPUT_ROOT/prompt-only-t128-b64/`。其余配置与 32/64 档一致，
+扩容不改变学习率默认值，未显式设置 LR 的新终端仍默认 5e-5 → 5e-6。
+两卡、每卡 batch 64 的全局 batch 为 128，与 128+128 token 是两个不同的概念。
+
+启动输出应包含：
+
+```text
+Both prompt banks: peak LR=0.0001, final LR=1e-05; warmup + cosine
+Piper prompt-only: VLM=128x2048, action=128x1024; expected trainable=393216
+Trainable ONLY: vlm_prompt_tokens.weight, prompt_tokens.weight; expert layers=0, action projections=false
+Batch: per_GPU=64, processes=2, global=128
+```
+
+128+128 的激活显存需要实测。更多 token 是容量对照，不能仅凭总体 loss 判断夹爪为何未闭合；
+还要看示范闭合阶段的夹爪预测、实际下发目标和反馈。
+
 ## 检查冻结范围和结果
 
 训练开始时检查实际的 `Trainable parameter report`。32 档合计应为 98,304，64 档应为
-196,608，且 `action_projection=0`、`action_expert_blocks=0`、`other=0`。
+196,608，128 档应为 393,216，且 `action_projection=0`、`action_expert_blocks=0`、`other=0`。
 模型结构不同则以实际报告为准，不能仅依赖启动脚本打印的默认架构估算。
 
 `OUTPUT_ROOT`、`LOG_ROOT` 是父目录；入口追加 token 数和每卡 batch：
