@@ -19,6 +19,7 @@ from lerobot.scripts.libero_vlm_only import prepare_baseline, validate_checkpoin
 
 TRAIN = ROOT / "examples/training/train_pi05_vlm_only.sh"
 PAIR = ROOT / "examples/training/train_pi05_vlm_only_pair.sh"
+SWEEP = ROOT / "examples/training/train_pi05_vlm_only_token_sweep.sh"
 EVAL = ROOT / "run_eval_libero_vlm_only.sh"
 
 
@@ -182,6 +183,114 @@ class VLMOnlyTest(unittest.TestCase):
                 "--seed=2",
             ):
                 self.assertIn(arg, command)
+
+    def test_two_source_token_sweep_uses_ddp_final_only_and_no_compile(self):
+        result = self.run_script(
+            SWEEP, "both", "0", FLOW_STEPS="6000", SAVE_ONLY_FINAL="false", SAVE_FREQ="1"
+        )
+        commands = self.commands(result)
+        self.assertEqual(len(commands), 4)
+        for (source, count), command in zip(
+            (("base", 2), ("base", 4), ("finetuned", 2), ("finetuned", 4)), commands, strict=True
+        ):
+            args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
+            self.assertIn("CUDA_VISIBLE_DEVICES=0,1", command)
+            self.assertIn("--multi_gpu", command)
+            for key, value in {
+                "num_processes": "2",
+                "batch_size": "32",
+                "steps": "3000",
+                "save_freq": "3000",
+                "save_steps": "[]",
+                "policy.path": str(self.source(source)),
+                "policy.num_vlm_prompt_tokens": str(count),
+                "policy.num_prompt_tokens": "0",
+                "policy.vlm_prompt_only": "true",
+                "policy.ntk_save_stage_snapshots": "false",
+                "policy.compile_model": "false",
+                "policy.optimizer_lr": "2.5e-5",
+                "wandb.enable": "true",
+                "wandb.mode": "online",
+                "wandb.project": "prompt-learning",
+                "wandb.disable_artifact": "true",
+                "output_dir": str(self.work / "training" / f"pi05-{source}-vlm{count}-seed0"),
+            }.items():
+                self.assertEqual(args[key], value, key)
+        self.assertFalse((self.work / "training").exists())
+        self.assertFalse((self.work / "logs").exists())
+
+    def test_token_sweep_selects_remaining_runs_and_rejects_ambiguous_settings(self):
+        (command,) = self.commands(
+            self.run_script(
+                SWEEP,
+                "finetuned",
+                "2",
+                "--wandb.mode=offline",
+                VLM_PROMPT_TOKEN_COUNTS="4",
+                GPU_IDS="2,3",
+                BATCH_SIZE="16",
+                RUN_PREFIX="retry",
+            )
+        )
+        self.assertIn("--job_name=retry-finetuned-vlm4-seed2", command)
+        self.assertIn("CUDA_VISIBLE_DEVICES=2,3", command)
+        self.assertIn("--batch_size=16", command)
+        self.assertEqual(
+            [arg for arg in command if arg.startswith("--wandb.mode=")][-1], "--wandb.mode=offline"
+        )
+        for env in (
+            {"VLM_PROMPT_TOKEN_COUNTS": ""},
+            {"VLM_PROMPT_TOKEN_COUNTS": "2 2"},
+            {"VLM_PROMPT_TOKEN_COUNTS": "2 0"},
+            {"VLM_PROMPT_TOKEN_COUNTS": "2 x"},
+            {"RUN_NAME": "old-run"},
+            {"VLM_PROMPT_TOKENS": "1"},
+            {"PRETRAINED_PATH": "old-source"},
+        ):
+            with self.subTest(env=env):
+                self.assertNotEqual(self.run_script(SWEEP, "both", "0", **env).returncode, 0)
+
+    def test_token_sweep_checks_last_destination_before_starting_any_training(self):
+        output = self.work / "training/pi05-finetuned-vlm4-seed0"
+        output.mkdir(parents=True)
+        result = self.run_script(SWEEP, "both", "0", DRY_RUN="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Output already exists", result.stderr)
+        self.assertNotIn("Starting source=", result.stdout)
+        self.assertEqual(list((self.work / "training").iterdir()), [output])
+        self.assertFalse((self.work / "logs").exists())
+
+    def test_token_sweep_stops_on_training_failure_before_later_runs(self):
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        accelerate = bin_dir / "accelerate"
+        accelerate.write_text(
+            f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
+            "job = next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--job_name='))\n"
+            "with Path(os.environ['CAPTURE_LOG']).open('a') as stream: stream.write(job + '\\n')\n"
+            "print(job, flush=True)\nsys.exit(7 if '-base-vlm4-' in job else 0)\n"
+        )
+        trainer = bin_dir / "lerobot-train"
+        trainer.write_text("#!/bin/sh\nexit 0\n")
+        for path in (accelerate, trainer):
+            path.chmod(0o755)
+        capture = self.work / "launches.txt"
+        cache = dict.fromkeys(
+            ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"), str(self.work / "cache")
+        )
+        result = self.run_script(
+            SWEEP,
+            "both",
+            "0",
+            DRY_RUN="false",
+            PATH=f"{bin_dir}{os.pathsep}{self.env['PATH']}",
+            CAPTURE_LOG=str(capture),
+            **cache,
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(capture.read_text().splitlines(), ["pi05-base-vlm2-seed0", "pi05-base-vlm4-seed0"])
+        self.assertIn("Sweep stopped: source=base VLM=4 exit=7", result.stderr)
+        self.assertFalse((self.work / "logs/pi05-finetuned-vlm2-seed0.log").exists())
 
     def test_final_only_saves_3000_without_initial_or_periodic_checkpoints(self):
         from lerobot.configs.default import DatasetConfig

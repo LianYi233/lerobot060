@@ -94,6 +94,49 @@ run 名称：`pi05-base-vlm1-seed0`、`pi05-finetuned-vlm1-seed0`。
 日志在 `/root/autodl-tmp/logs/vlm-only`。保存 `000000`、`001000`、`002000`、`003000` 的完整模型；
 两组共 8 份 checkpoint，需预留相应磁盘空间。`SAVE_FREQ=3000` 可只保存初始化和最终模型。
 
+### 两个来源分别训练 2、4 个 token，只保存 3000 步
+
+新入口沿用上面的 VLM-only 配方，默认每次用两张卡训练，按顺序运行四个独立实验：
+`base-vlm2` → `base-vlm4` → `finetuned-vlm2` → `finetuned-vlm4`。
+每个实验都从对应的原始模型开始，不从上一个 token 数的模型继续训练。
+
+```bash
+OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+GPU_IDS=0,1 BATCH_SIZE=32 \
+bash examples/training/train_pi05_vlm_only_token_sweep.sh both 0 \
+  --wandb.enable=true --wandb.project=prompt-learning \
+  --wandb.mode=online --wandb.disable_artifact=true
+```
+
+此入口默认模型、tokenizer 和数据集从 `/root/autodl-fs/wyn/` 读取，训练输出和日志写到
+`/root/autodl-tmp/`。每卡 batch 32、全局 batch 64；学习率保持 `2.5e-5`。
+默认关闭 `torch.compile`，保留 bf16 和 gradient checkpointing。
+固定 `FLOW_STEPS=3000`、`SAVE_ONLY_FINAL=true`，只保存 `003000`；
+token=2/4 分别训练 4096/8192 个参数。W&B 默认开启，项目 `prompt-learning`。
+
+输出目录为 `$OUTPUT_ROOT/pi05-{base|finetuned}-vlm{2|4}-seed0/checkpoints/003000/`，
+`last` 只是软链接。每个 checkpoint 仍包含完整冻结模型权重，四份权重约需 30 GB。
+开始前会检查所有选定实验；已有输出不覆盖，也不自动跳过。训练失败后停止后续实验。
+可设置 `DRY_RUN=true` 仅检查并打印命令，或选择尚未执行的组合，例如：
+
+```bash
+VLM_PROMPT_TOKEN_COUNTS=4 GPU_IDS=0,1 BATCH_SIZE=32 \
+bash examples/training/train_pi05_vlm_only_token_sweep.sh finetuned 0
+```
+
+可用 `RUN_PREFIX=retry` 给失败实验选择新目录。此入口要求取消旧的单模型
+`RUN_NAME`、`PRETRAINED_PATH`、`VLM_PROMPT_TOKENS` 环境变量，分别使用
+`RUN_PREFIX`、两个来源的路径变量、`VLM_PROMPT_TOKEN_COUNTS` 控制实验。
+评测入口不变；例如测 base-token2：
+
+```bash
+BASE_PRETRAINED_PATH=/root/autodl-fs/wyn/models/pi05_libero_base \
+TOKENIZER_PATH=/root/autodl-fs/wyn/models/google/paligemma-3b-pt-224 \
+CKPT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+GPU_ID=0 VLM_PROMPT_TOKENS=2 CHECKPOINT_STEP=3000 \
+bash run_eval_libero_vlm_only.sh base trained all 0
+```
+
 ### 仅重跑 v044，并只保存最终模型
 
 `SAVE_ONLY_FINAL=true` 同时关闭 `000000` 初始化快照和中间保存，仅在训练结束保存
@@ -101,26 +144,27 @@ run 名称：`pi05-base-vlm1-seed0`、`pi05-finetuned-vlm1-seed0`。
 它覆盖 `SAVE_FREQ`；只设置 `SAVE_FREQ=3000` 仍然会保存初始化模型。
 
 下例沿用双卡、每卡 batch 32（总 batch 64）、1 个 VLM token、3000 步和原学习率，
-从官方 v044 重新开始。将新输出写到 `/root/autodl-fs/wyn/`，避免和旧输出冲突。
-先用 `df -h /root/autodl-tmp /root/autodl-fs/wyn` 确认可用空间；不会删除旧 checkpoint。
+从官方 v044 重新开始。训练输出统一写到 `/root/autodl-tmp/chkpt/2601-lerobot/vlm-only/`，
+使用独立 run 名称，并关闭编译。
 
 ```bash
 export FINETUNED_PRETRAINED_PATH=/root/autodl-fs/wyn/models/pi05_libero_finetuned_v044
 export TOKENIZER_PATH=/root/autodl-fs/wyn/models/google/paligemma-3b-pt-224
 export DATASET_ROOT=/root/autodl-fs/wyn/datasets/libero
-export OUTPUT_ROOT=/root/autodl-fs/wyn/chkpt/2601-lerobot/vlm-only-final
-export LOG_ROOT=/root/autodl-fs/wyn/logs/vlm-only-final
-export TMPDIR=/root/autodl-fs/wyn/tmp
-export TORCHINDUCTOR_CACHE_DIR=/root/autodl-fs/wyn/cache/torchinductor/pi05-finetuned-vlm1-seed0
-export TRITON_CACHE_DIR=/root/autodl-fs/wyn/cache/triton/pi05-finetuned-vlm1-seed0
+export OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only
+export LOG_ROOT=/root/autodl-tmp/logs/vlm-only
+export TMPDIR=/root/autodl-tmp/tmp
 
+RUN_NAME=pi05-finetuned-vlm1-seed0-nocompile \
 SAVE_ONLY_FINAL=true GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKENS=1 FLOW_STEPS=3000 \
 bash examples/training/train_pi05_vlm_only.sh finetuned 0 \
+  --policy.compile_model=false \
   --wandb.enable=true --wandb.project=prompt-learning \
   --wandb.mode=online --wandb.disable_artifact=true
 
 # 同一终端，完成后测四个 suite（新终端先重新设置上面的路径变量）。
-CKPT_ROOT="$OUTPUT_ROOT" BASE_OUTPUT=/root/autodl-fs/wyn/eval/vlm-only-final \
+RUN_NAME=pi05-finetuned-vlm1-seed0-nocompile \
+CKPT_ROOT="$OUTPUT_ROOT" BASE_OUTPUT=/root/autodl-tmp/eval/vlm-only \
 GPU_ID=0 VLM_PROMPT_TOKENS=1 CHECKPOINT_STEP=3000 \
 bash run_eval_libero_vlm_only.sh finetuned trained all 0
 ```
