@@ -21,6 +21,7 @@ PRETRAINED_PATH, BASE_PRETRAINED_PATH, FINETUNED_PRETRAINED_PATH, DATASET_ROOT,
 DATASET_REPO_ID, TOKENIZER_PATH, OUTPUT_ROOT, LOG_ROOT, RUN_NAME, DRY_RUN.
 Extra args (use --key=value): --wandb.*, --policy.optimizer_*, --policy.scheduler_*,
 --policy.compile_model, --policy.gradient_checkpointing, --num_workers, --log_freq.
+--prompt_rank.* enables fixed-probe velocity-to-prompt Jacobian spectra (requires no compile).
 EOF
   exit 0
 fi
@@ -31,7 +32,7 @@ EXTRA_ARGS=("$@")
 for arg in "${EXTRA_ARGS[@]}"; do
   case "$arg" in
     --wandb.*=*|--policy.optimizer_*=*|--policy.scheduler_*=*|--policy.compile_model=*|\
-    --policy.gradient_checkpointing=*|--num_workers=*|--log_freq=*) ;;
+    --policy.gradient_checkpointing=*|--num_workers=*|--log_freq=*|--prompt_rank.*=*) ;;
     *) echo "Unsupported override: $arg; use --help for VLM-only controls" >&2; exit 2 ;;
   esac
 done

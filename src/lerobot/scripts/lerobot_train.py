@@ -593,6 +593,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
+        if cfg.prompt_rank.freq > 0 and accelerator.distributed_type not in (
+            DistributedType.NO,
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_CPU,
+        ):
+            raise NotImplementedError("prompt_rank supports unsharded single-device/DDP training only")
         if cfg.piper_eval.enabled and accelerator.distributed_type not in (
             DistributedType.NO,
             DistributedType.MULTI_GPU,
@@ -1023,6 +1029,45 @@ def _train_single_stage(
     if cfg.piper_eval.freq > 0:
         log_action_evaluation(step)
 
+    prompt_rank_monitor = None
+    if cfg.prompt_rank.freq > 0:
+        from lerobot.utils.prompt_rank import PromptRankMonitor, collective_call
+
+        prompt_rank_monitor = collective_call(
+            accelerator,
+            lambda: PromptRankMonitor(
+                dataset, preprocessor, active_cfg, cfg.prompt_rank, cfg.output_dir, device
+            ),
+        )
+        prompt_rank_monitor.verify_across_ranks(accelerator)
+        collective_call(
+            accelerator, lambda: prompt_rank_monitor.save_protocol(step) if is_main_process else None
+        )
+
+    def log_prompt_rank(completed_step):
+        if is_main_process:
+            logging.info("PROMPT_RANK starting step=%d (fixed velocity Jacobian probes)", completed_step)
+        scores = prompt_rank_monitor.measure(accelerator.unwrap_model(policy), completed_step, accelerator)
+        if is_main_process:
+            logging.info(
+                "PROMPT_RANK step=%d J-erank=%.3f NTK-erank=%.3f rank95=%d ceiling=%d time=%.1fs",
+                completed_step,
+                scores["jacobian_erank"],
+                scores["ntk_erank"],
+                scores["rank95_energy"],
+                scores["rank_ceiling"],
+                scores["probe_seconds"],
+            )
+            if wandb_logger:
+                wandb_logger.log_dict(
+                    {f"prompt_rank/{key}": value for key, value in scores.items()},
+                    step=completed_step,
+                    mode="eval",
+                )
+
+    if prompt_rank_monitor is not None:
+        log_prompt_rank(step)
+
     pi05_diagnostics_enabled = not cfg.is_reward_model_training and active_cfg.type == "pi05"
     diagnostics = None
     if is_main_process and pi05_diagnostics_enabled:
@@ -1169,6 +1214,9 @@ def _train_single_stage(
             step % cfg.piper_eval.freq == 0 or step == cfg.steps or step == pi05_stage1_bridge_start_step
         ):
             log_action_evaluation(step)
+
+        if prompt_rank_monitor is not None and (step % cfg.prompt_rank.freq == 0 or step == cfg.steps):
+            log_prompt_rank(step)
 
         if is_eval_step:
             policy.eval()

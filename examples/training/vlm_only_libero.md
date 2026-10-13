@@ -24,6 +24,11 @@ VLM prompt 读取 observations 和自己的 prompt 块，action tokens 读取完
 
 ## AutoDL 启动
 
+如果要重新训练 base 的 1/2/4/8/16/32 token、seed1，并记录动作 velocity 对 VLM prompt
+的有效秩，使用 `examples/training/train_pi05_vlm_only_rank_sweep.sh 1`。
+它每 250 步测量固定探针，仍只保存 3000 步的完整模型；参见
+[有效秩监测协议和完整命令](../analysis/README_vlm_prompt_rank.md)。
+
 已有 checkout，且本地修改已妥善保存，第一次创建本地 `vlm-only` 分支：
 
 ```bash

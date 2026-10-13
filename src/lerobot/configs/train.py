@@ -34,6 +34,7 @@ from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
 from .piper import PiperEvalConfig
 from .policies import PreTrainedConfig
+from .prompt_rank import PromptRankConfig
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
@@ -111,6 +112,7 @@ class TrainPipelineConfig(HubMixin):
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
     piper_eval: PiperEvalConfig = field(default_factory=PiperEvalConfig)
+    prompt_rank: PromptRankConfig = field(default_factory=PromptRankConfig)
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -228,6 +230,7 @@ class TrainPipelineConfig(HubMixin):
     def validate(self) -> None:
         self.validate_checkpoint_schedule()
         self.piper_eval.validate()
+        self.prompt_rank.validate()
         self._resolve_pretrained_from_cli()
 
         if self.policy is None and self.reward_model is None:
@@ -237,6 +240,19 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.prompt_rank.freq > 0:
+            if (
+                self.is_reward_model_training
+                or active_cfg.type != "pi05"
+                or not getattr(active_cfg, "vlm_prompt_only", False)
+                or self.dataset.streaming
+                or self.peft is not None
+                or active_cfg.use_peft
+                or self.rename_map
+            ):
+                raise ValueError("prompt_rank requires native PI05 VLM-only and a non-streaming dataset")
+            if active_cfg.compile_model:
+                raise ValueError("prompt_rank requires --policy.compile_model=false")
         if self.preserve_pretrained_normalization and (
             self.is_reward_model_training or not active_cfg.pretrained_path
         ):

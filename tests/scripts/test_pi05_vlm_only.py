@@ -20,6 +20,7 @@ from lerobot.scripts.libero_vlm_only import prepare_baseline, validate_checkpoin
 TRAIN = ROOT / "examples/training/train_pi05_vlm_only.sh"
 PAIR = ROOT / "examples/training/train_pi05_vlm_only_pair.sh"
 SWEEP = ROOT / "examples/training/train_pi05_vlm_only_token_sweep.sh"
+RANK_SWEEP = ROOT / "examples/training/train_pi05_vlm_only_rank_sweep.sh"
 EVAL = ROOT / "run_eval_libero_vlm_only.sh"
 EVAL_SWEEP = ROOT / "run_eval_libero_vlm_only_token_sweep.sh"
 
@@ -358,6 +359,32 @@ class VLMOnlyTest(unittest.TestCase):
                 self.assertEqual(args[key], value, key)
         self.assertFalse((self.work / "training").exists())
         self.assertFalse((self.work / "logs").exists())
+
+    def test_rank_sweep_six_base_seed1_runs_and_fixed_probe_settings(self):
+        commands = self.commands(self.run_script(RANK_SWEEP))
+        self.assertEqual(len(commands), 6)
+        for count, command in zip((1, 2, 4, 8, 16, 32), commands, strict=True):
+            args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
+            for key, value in {
+                "seed": "1",
+                "policy.path": str(self.source("base")),
+                "policy.num_vlm_prompt_tokens": str(count),
+                "policy.num_prompt_tokens": "0",
+                "policy.compile_model": "false",
+                "steps": "3000",
+                "save_steps": "[]",
+                "policy.ntk_save_stage_snapshots": "false",
+                "prompt_rank.freq": "250",
+                "prompt_rank.samples": "16",
+                "prompt_rank.output_probes": "4",
+                "prompt_rank.seed": "2026",
+                "prompt_rank.timesteps": "[0.2,0.5,0.8]",
+                "job_name": f"pi05-base-vlm{count}-seed1",
+            }.items():
+                self.assertEqual(args[key], value, key)
+        self.assertFalse((self.work / "training").exists())
+        result = self.run_script(RANK_SWEEP, "1", "--policy.compile_model=true")
+        self.assertNotEqual(result.returncode, 0)
 
     def test_token_sweep_selects_remaining_runs_and_rejects_ambiguous_settings(self):
         (command,) = self.commands(
