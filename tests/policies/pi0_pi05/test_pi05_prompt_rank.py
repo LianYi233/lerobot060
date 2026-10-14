@@ -231,6 +231,100 @@ def test_same_probe_across_token_counts_and_no_mutation_of_model_output(tmp_path
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_offline_cache_replay_and_residual_sign_match_real_velocity(tmp_path, dtype):
+    from lerobot.scripts.analyze_pi05_prompt_alignment import collect_alignment
+
+    policy = make_policy(dtype).train()
+    original = policy.model.vlm_prompt_tokens.weight
+    before = original.detach().clone()
+    monitor = make_monitor(policy, tmp_path)
+    monitor.save_protocol(0)
+    replay = PromptRankMonitor.from_cache(monitor.output_dir, "cpu")
+    arrays, mse = collect_alignment(policy, replay, heldout_probes=2, progress=False)
+    assert policy.model.vlm_prompt_tokens.weight is original
+    torch.testing.assert_close(original, before, rtol=0, atol=0)
+    assert mse > 0
+
+    # Match the exact same autocast path as the standalone replay.
+    class NativeAccelerator(LocalAccelerator):
+        @staticmethod
+        def autocast():
+            return torch.autocast("cpu", dtype=torch.bfloat16) if dtype == "bfloat16" else nullcontext()
+
+    replay.measure(policy, 0, NativeAccelerator())
+    with np.load(monitor.output_dir / "step_000000.npz") as saved:
+        np.testing.assert_allclose(arrays["gram"], saved["gram"], rtol=1e-12, atol=1e-12)
+    with isolated_prompt(policy), torch.enable_grad(), NativeAccelerator.autocast():
+        velocity, target, probes, valid = replay._probe_forward(policy, 0, replay.options.timesteps[0])
+        projected = [
+            (float(((target.float() - velocity.float()).detach() * probe).sum())) for probe in probes
+        ]
+    np.testing.assert_allclose(arrays["residual"][:2], projected, rtol=0, atol=0)
+    assert not valid[0, -1]  # This sample includes padding, masked by the stored projections.
+    assert arrays["cross_gram"].shape == arrays["gram"].shape
+
+    cache_path = monitor.output_dir / "fixed_probe.pt"
+    cache = torch.load(cache_path, weights_only=True)
+    cache["samples"][0]["action"][0, 0, 0] += 1
+    torch.save(cache, cache_path)
+    with pytest.raises(ValueError, match="hash"):
+        PromptRankMonitor.from_cache(monitor.output_dir, "cpu")
+
+
+def test_offline_analysis_restores_three_prompts_and_resumes_without_model_reload(tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    from lerobot.scripts import analyze_pi05_prompt_alignment as script
+
+    policy = make_policy().train()
+    count = policy.config.num_vlm_prompt_tokens
+    run = tmp_path / f"pi05-base-vlm{count}-seed1"
+    monitor = make_monitor(policy, run)
+    monitor.save_protocol(0)
+    for step in (0, 1500, 3000):
+        with torch.no_grad():
+            policy.model.vlm_prompt_tokens.weight.add_(0.01)
+        monitor.measure(policy, step, LocalAccelerator())
+    checkpoint = run / "checkpoints/003000/pretrained_model"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"test loader supplies tiny actual PI05")
+    calls = []
+
+    def load(*args):
+        calls.append(args)
+        return deepcopy(policy).eval()
+
+    monkeypatch.setattr(script, "load_policy", load)
+    args = SimpleNamespace(
+        ckpt_root=tmp_path,
+        tokens=[count],
+        seed=1,
+        source="base",
+        run_prefix="pi05",
+        steps=[0, 1500, 3000],
+        checkpoint_step=3000,
+        heldout_probes=2,
+        heldout_seed=2027,
+        ridge_relative=0.01,
+        gram_rtol=0.02,
+        device="cpu",
+        no_progress=True,
+        analysis_name="prompt_alignment",
+    )
+    script.analyze(args)
+    script.analyze(args)
+    assert len(calls) == 1
+    for step in args.steps:
+        scores = json.loads((run / f"prompt_alignment/step_{step:06d}.json").read_text())
+        assert scores["gram_relative_error"] < 1e-12
+        assert scores["step"] == step
+    args.heldout_seed += 1
+    with pytest.raises(ValueError, match="protocol changed"):
+        script.analyze(args)
+
+
 def test_sharded_probe_order_matches_single_process_with_uneven_last_shard(tmp_path):
     policy = make_policy().train()
     single = make_monitor(policy, tmp_path / "single")

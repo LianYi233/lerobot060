@@ -128,6 +128,37 @@ def _fingerprint(samples):
 
 
 class PromptRankMonitor:
+    @classmethod
+    def from_cache(cls, directory, device):
+        """Restore the exact processed observations, noise and projections without a dataset."""
+        from lerobot.configs.prompt_rank import PromptRankConfig
+
+        directory = Path(directory)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        if manifest.get("schema_version") != 1:
+            raise ValueError("Unsupported prompt-rank cache schema")
+        cache = torch.load(directory / "fixed_probe.pt", map_location="cpu", weights_only=True)
+        result = cls.__new__(cls)
+        result.options = PromptRankConfig(**manifest["options"])
+        result.options.validate()
+        result.device, result.output_dir, result.manifest = torch.device(device), directory, manifest
+        result.samples, result.noise, result.probes = (
+            cache["samples"],
+            cache["noise"],
+            cache["output_probes"],
+        )
+        result.action_dim, result.horizon = manifest["action_dim"], manifest["chunk_size"]
+        if _fingerprint(result.samples) != manifest["sample_sha256"]:
+            raise ValueError("Cached observations do not match the recorded hash")
+        if len(result.samples) != len(result.noise) or not result.samples:
+            raise ValueError("Invalid cached noise/sample count")
+        expected = (result.options.output_probes, 1, result.horizon, result.action_dim)
+        if tuple(result.probes.shape) != expected or not torch.isfinite(result.probes).all():
+            raise ValueError("Invalid cached output projections")
+        if any(not torch.isfinite(noise).all() for noise in result.noise):
+            raise ValueError("Non-finite cached noise")
+        return result
+
     def __init__(self, dataset, preprocessor, config, options, output_dir, device):
         from lerobot.utils.collate import lerobot_collate_fn
 
@@ -227,7 +258,8 @@ class PromptRankMonitor:
         if not torch.equal(digests, digests[:1].expand_as(digests)):
             raise ValueError("Processed prompt-rank observations differ between ranks")
 
-    def _rows(self, policy, prompt, sample_index, timestep, autocast_context):
+    def _probe_forward(self, policy, sample_index, timestep):
+        """One native-precision forward; callers own grad/autocast contexts."""
         batch = {key: value.to(self.device) for key, value in self.samples[sample_index].items()}
         actions = policy.prepare_action(batch)
         if actions.shape != self.noise[sample_index].shape:
@@ -240,17 +272,22 @@ class PromptRankMonitor:
         ).bool()
         if not valid.any():
             raise ValueError(f"Probe sample {sample_index} has no valid action targets")
+        images, masks = policy._preprocess_images(batch)
+        velocity = policy.model.predict_velocity(
+            images,
+            masks,
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
+            noisy,
+            time_tensor,
+        )[..., : self.action_dim]
+        target = (noise - actions)[..., : self.action_dim]
+        probes = self.probes.to(self.device) * valid[None, :, :, None]
+        return velocity, target, probes, valid
+
+    def _rows(self, policy, prompt, sample_index, timestep, autocast_context):
         with torch.enable_grad(), autocast_context():
-            images, masks = policy._preprocess_images(batch)
-            velocity = policy.model.predict_velocity(
-                images,
-                masks,
-                batch[OBS_LANGUAGE_TOKENS],
-                batch[OBS_LANGUAGE_ATTENTION_MASK],
-                noisy,
-                time_tensor,
-            )[..., : self.action_dim]
-            probes = self.probes.to(self.device) * valid[None, :, :, None]
+            velocity, _, probes, _ = self._probe_forward(policy, sample_index, timestep)
             rows = []
             for index, probe in enumerate(probes):
                 (gradient,) = torch.autograd.grad(
