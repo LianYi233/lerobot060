@@ -862,6 +862,57 @@ class RealLauncherTest(unittest.TestCase):
                 for key in ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "HF_HOME"):
                     self.assertTrue(Path(expected[key]).is_dir(), key)
 
+    def test_piper_entrypoints_migrate_stale_autodl_runtime_exports(self):
+        for script, profile in (
+            (PROMPT_ONLY, "128"), (CAPACITY, "last4"), (BASE, "last2"),
+            (DROID, "last2"), (DROID_LR, "reference"), (AUTODL, "dual_prompt_only"),
+        ):
+            with self.subTest(script=script.name):
+                result = self.run_autodl(
+                    "1", profile, "0", script=script,
+                    WORK_ROOT="/root/autodl-tmp", TMPDIR="/root/autodl-tmp/tmp",
+                    TMP="/root/autodl-tmp/tmp", TEMP="/root/autodl-tmp/tmp",
+                    TORCHINDUCTOR_CACHE_DIR="/root/autodl-tmp/cache/torchinductor",
+                    TRITON_CACHE_DIR="/root/autodl-tmp/cache/triton",
+                    HF_HOME="/root/autodl-tmp/cache/huggingface",
+                    DATASET_BASE=str(self.work / "datasets/May-pick-and-place"),
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    PI05_BASE_PATH=str(self.work / "models/pi05_base"),
+                    PI05_DROID_PATH=str(self.work / "models/pi05_droid"),
+                    TOKENIZER_PATH=str(self.work / "models/google/paligemma-3b-pt-224"),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("TMPDIR=/data1/wyn/piper-work/tmp", result.stdout)
+                self.assertIn("HF_HOME=/data1/wyn/piper-work/cache/huggingface", result.stdout)
+                self.assertIn("output=/data1/wyn/piper-work/", result.stdout)
+                self.assertNotIn("/root/autodl-tmp", result.stdout)
+                self.assertIn("Piper local paths:", result.stderr)
+
+    def test_piper_runtime_defaults_and_custom_paths(self):
+        helper = ROOT / "examples/training/piper_runtime_paths.sh"
+        keys = ("WORK_ROOT", "TMPDIR", "TMP", "TEMP", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "HF_HOME")
+        for custom in (False, True):
+            with self.subTest(custom=custom):
+                env = {key: value for key, value in os.environ.items() if key not in keys}
+                if custom:
+                    env.update({key: str(self.work / "custom runtime" / key) for key in keys})
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; "$2" -c "$3"', "_", str(helper), sys.executable,
+                     f"import json, os; print(json.dumps({{key: os.environ[key] for key in {keys!r}}}))"],
+                    env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                actual = json.loads(result.stdout)
+                if custom:
+                    self.assertEqual(actual, {key: env[key] for key in keys})
+                else:
+                    self.assertEqual(actual["WORK_ROOT"], "/data1/wyn/piper-work")
+                    self.assertEqual(actual["TMPDIR"], "/data1/wyn/piper-work/tmp")
+                    self.assertEqual(actual["TMP"], actual["TMPDIR"])
+                    self.assertEqual(actual["TEMP"], actual["TMPDIR"])
+                    self.assertTrue(all(value.startswith("/data1/wyn/piper-work") for value in actual.values()))
+                self.assertFalse((self.work / "custom runtime").exists())
+
     def test_prompt_history_is_opt_in_and_has_separate_output(self):
         outputs = []
         for history in ("0", "20"):

@@ -12,7 +12,7 @@ Counts assume gemma_2b / gemma_300m, 16+16 prompts, max_action_dim=32.
 The actual trainable parameter report is printed by lerobot-train.
 
 Download lerobot/pi05_base in LeRobot safetensors format first. Set PI05_BASE_PATH;
-default: ${WORK_ROOT:-/root/autodl-tmp}/models/pi05_base.
+default: ${WORK_ROOT:-/data1/wyn/piper-work}/models/pi05_base.
 This entry point deliberately replaces PRETRAINED_PATH with PI05_BASE_PATH so an old
 export pointing to pi05_libero_base cannot silently select the previous checkpoint.
 A directory name does not verify weight provenance; use the documented Hub download.
@@ -41,7 +41,7 @@ case "${PROFILE}" in
   *) echo "Unknown base profile: ${PROFILE}; use last2 or last4" >&2; exit 2 ;;
 esac
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 export PI05_BASE_PATH="${PI05_BASE_PATH:-${WORK_ROOT}/models/pi05_base}"
 if [[ -n "${PRETRAINED_PATH:-}" && "${PRETRAINED_PATH}" != "${PI05_BASE_PATH}" ]]; then
   echo "Base experiment: replacing PRETRAINED_PATH=${PRETRAINED_PATH} with PI05_BASE_PATH=${PI05_BASE_PATH}"

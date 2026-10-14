@@ -189,7 +189,8 @@ def main() -> int:
             "feature, output and resume overrides are not supported by this fresh-run launcher"
         )
     env = os.environ.copy()
-    work_root = Path(env.get("WORK_ROOT", "/root/autodl-tmp")).expanduser().resolve()
+    work_root = Path(env.get("WORK_ROOT", "/data1/wyn/piper-work")).expanduser().resolve()
+    env["WORK_ROOT"] = str(work_root)
     defaults = {
         "DATASET_BASE": str(work_root / "datasets/May-pick-and-place"),
         "PRETRAINED_PATH": str(work_root / "models/pi05_libero_base"),

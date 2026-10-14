@@ -26,6 +26,7 @@ More prompt tokens still require gradients through frozen backbones and may incr
 
 Old EXPERT_LAST_N_LAYERS, token-count and optimizer-LR exports are replaced deliberately.
 DATASET_BASE, TOKENIZER_PATH, WORK_ROOT, FLOW_STEPS/SAVE_STEPS and W&B settings work as usual.
+Local-server WORK_ROOT default: /data1/wyn/piper-work. Old AutoDL runtime exports are migrated.
 RUN_GROUP is a parent label. OUTPUT_ROOT / LOG_ROOT are PARENT directories; each gets
 prompt-only-tTOKENS-bBATCH (per-GPU batch). Different tokens/batches do not overwrite each other.
 Changing LR, base or process count requires a new parent run directory.
@@ -80,7 +81,7 @@ print(f"Both prompt banks: peak LR={peak:g}, final LR={floor:g}; warmup + cosine
 PY
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 PIPER_PROMPT_GROUP="${RUN_GROUP:-piper-task${TASK}-prompt-only-$(date +%Y%m%d-%H%M%S)}"
 PIPER_PROMPT_OUTPUT="${OUTPUT_ROOT:-${WORK_ROOT}/chkpt/2601-lerobot/piper/${PIPER_PROMPT_GROUP}}"
 PIPER_PROMPT_LOG="${LOG_ROOT:-${WORK_ROOT}/logs/piper/${PIPER_PROMPT_GROUP}}"

@@ -78,7 +78,7 @@ if [[ -z "${PRETRAINED_PATH:-}" ]]; then
 fi
 export PRETRAINED_PATH
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 PIPER_CAPACITY_GROUP="${RUN_GROUP:-piper-task${TASK}-capacity-$(date +%Y%m%d-%H%M%S)}"
 PIPER_CAPACITY_OUTPUT="${OUTPUT_ROOT:-${WORK_ROOT}/chkpt/2601-lerobot/piper/${PIPER_CAPACITY_GROUP}}"
 PIPER_CAPACITY_LOG="${LOG_ROOT:-${WORK_ROOT}/logs/piper/${PIPER_CAPACITY_GROUP}}"

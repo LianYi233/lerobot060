@@ -49,7 +49,8 @@ esac
 export ACTION_EXPERT_LR_SCALE=0.1
 export NUM_PROCESSES=2
 export BATCH_SIZE="${BATCH_SIZE:-16}"
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 COMPARISON_GROUP="${RUN_GROUP:-piper-task${TASK}-droid-lr-$(date +%Y%m%d-%H%M%S)}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${WORK_ROOT}/chkpt/2601-lerobot/piper/${COMPARISON_GROUP}}/lr-${LR_PROFILE}"
 export LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs/piper/${COMPARISON_GROUP}}/lr-${LR_PROFILE}"
@@ -57,6 +58,5 @@ export RUN_GROUP="${COMPARISON_GROUP}-lr-${LR_PROFILE}"
 export JOB_NAME="${RUN_GROUP}-task${TASK}-seed${SEED}"
 # An inherited W&B identity could merge two experiments. Each fresh run gets its own ID.
 unset WANDB_RUN_ID WANDB_RESUME
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 echo "DROID LR comparison: ${LR_PROFILE}; GPUs=${GPU_IDS}; port=${MAIN_PROCESS_PORT}; job=${JOB_NAME}"
 exec bash "${SCRIPT_DIR}/train_piper_droid.sh" "${TASK}" last2 "${SEED}"

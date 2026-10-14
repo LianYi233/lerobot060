@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AutoDL preset for four independent Piper policies. Run in the training conda env.
+# Legacy filename: Piper preset for the local /data1 server. Run in the training conda env.
 set -euo pipefail
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
@@ -17,6 +17,7 @@ Training predicts 50 actions; deployment executes 8 actions per observation.
 All four tasks train separately, in sequence, from the same base checkpoint.
 
 Set DATASET_BASE, PRETRAINED_PATH and TOKENIZER_PATH to the actual local paths.
+WORK_ROOT defaults to /data1/wyn/piper-work; old /root/autodl-tmp runtime exports are migrated.
 Set RUN_GROUP to reuse a chosen output group, or leave it unset for a timestamp.
 DRY_RUN=true validates metadata/paths and prints commands without using a GPU.
 W&B is enabled by default (project piper-action-fit); WANDB_MODE=offline records locally.
@@ -43,7 +44,7 @@ else
 fi
 
 # Edit these three defaults, or export the variables before running this script.
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 export DATASET_BASE="${DATASET_BASE:-${WORK_ROOT}/datasets/May-pick-and-place}"
 export PRETRAINED_PATH="${PRETRAINED_PATH:-${WORK_ROOT}/models/pi05_libero_base}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-${WORK_ROOT}/models/google/paligemma-3b-pt-224}"

@@ -51,8 +51,10 @@ git pull --ff-only origin piper
 
 export WORK_ROOT=/data1/wyn/piper-work
 export PRETRAINED_PATH=/data1/wyn/piper-work/models/pi05_base
-export DATASET_BASE=/data/datasets/May-pick-and-place
-export TOKENIZER_PATH=/data/models/paligemma-3b-pt-224
+# 沿用本机已经通过预检查的数据集和 tokenizer 路径；不能从 /data1 推断更深层目录。
+: "${DATASET_BASE:?请设置本机 May-pick-and-place 的实际完整路径}"
+: "${TOKENIZER_PATH:?请设置本机 paligemma tokenizer 的实际完整路径}"
+export DATASET_BASE TOKENIZER_PATH
 export RUN_GROUP="piper-task1-t128-history20-$(date +%Y%m%d-%H%M%S)"
 export OUTPUT_ROOT="/data1/wyn/chkpt/2601-lerobot/${RUN_GROUP}"
 export LOG_ROOT="/data1/wyn/logs/${RUN_GROUP}"
@@ -70,9 +72,10 @@ W&B 和已有 action 误差评估继续启用。命令中显式指定 reference 
 
 `WORK_ROOT` 同时指定默认临时/缓存目录：`tmp`、`cache/torchinductor`、`cache/triton`、
 `cache/huggingface`。`OUTPUT_ROOT` 只指定模型输出位置，不能代替它。
-启动时会打印这些路径，dry-run 也会打印但不创建目录。如果之前已显式设置过 `TMPDIR`、
-`TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR` 或 `HF_HOME`，它们优先于 `WORK_ROOT`；
-旧值指向不可写的 `/root` 时，需要同时改为自己有权限的目录。
+Piper 启动链默认使用本地服务器 `/data1/wyn/piper-work`。统一初始化脚本
+`examples/training/piper_runtime_paths.sh` 会将遗留的 `/root/autodl-tmp` 工作目录和
+临时/缓存环境变量切换到此目录，并打印迁移提示；其他显式自定义路径保留。
+启动时会打印最终路径，dry-run 也会打印但不创建目录。
 
 最终 checkpoint 在：
 

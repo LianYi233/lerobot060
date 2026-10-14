@@ -7,7 +7,7 @@ Usage: bash examples/training/train_piper_droid.sh [TASK] [last2|last4] [SEED] [
 
 Defaults: task 1, last2, seed 0. TASK also accepts 2/3/4/all.
 Download lerobot/pi05_droid with examples/piper/download_pi05_droid.py first.
-PI05_DROID_PATH defaults to ${WORK_ROOT:-/root/autodl-tmp}/models/pi05_droid.
+PI05_DROID_PATH defaults to ${WORK_ROOT:-/data1/wyn/piper-work}/models/pi05_droid.
 This entry point replaces inherited PI05_BASE_PATH / PRETRAINED_PATH with PI05_DROID_PATH.
 
 Same training recipe as train_piper_base.sh: absolute Piper actions, predict 16 / execute 8,
@@ -28,7 +28,7 @@ PROFILE="${2:-last2}"
 SEED="${3:-0}"
 if (( $# >= 3 )); then shift 3; else shift "$#"; fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+source "${SCRIPT_DIR}/piper_runtime_paths.sh"
 export PI05_DROID_PATH="${PI05_DROID_PATH:-${WORK_ROOT}/models/pi05_droid}"
 if [[ -n "${PI05_BASE_PATH:-}" && "${PI05_BASE_PATH}" != "${PI05_DROID_PATH}" ]]; then
   echo "DROID experiment: replacing PI05_BASE_PATH=${PI05_BASE_PATH} with ${PI05_DROID_PATH}"

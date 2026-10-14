@@ -5,6 +5,7 @@
 
 入口：`bash examples/training/train_piper_prompt_only.sh TASK TOKENS SEED`。
 默认 task 1、每组 32 个 token、seed 0；TASK 支持 1/2/3/4/all。
+Piper 本地服务器默认 `WORK_ROOT=/data1/wyn/piper-work`；启动链自动迁移旧 AutoDL 临时/缓存路径。
 `TOKENS` 是**每一组**的数量，例如 32 表示 VLM 32 个、action 32 个。
 
 本轮检验增加 prompt 容量能否改善真机动作拟合。只训练以下两个权重：

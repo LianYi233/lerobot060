@@ -1,5 +1,9 @@
 # AutoDL：重新训练 Piper 四个真机任务
 
+> 下文保留早期 AutoDL 记录。当前 `piper` 分支的 Piper 启动器默认在本地服务器使用
+> `/data1/wyn/piper-work`，脚本名 `train_piper_autodl.sh` 仅为兼容保留。
+> 本地服务器当前实验请使用 [夹爪历史训练说明](README_GRIPPER_HISTORY.md)，不要照抄下文旧路径。
+
 之前的入口是 `examples/training/train_pi05_real.sh` 和 `train_pi05_real.py`，已经支持
 `May-pick-and-place` 的 LeRobot v3.0 数据。新增的 `train_piper_autodl.sh` 复用此入口，
 集中设置 AutoDL 路径和本次重训参数。训练只使用离线数据，不连接机械臂或相机。
