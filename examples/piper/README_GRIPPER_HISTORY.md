@@ -49,6 +49,7 @@ action loss。它只读取自身；action prompt 和 action 查询可以读取�
 ```bash
 git pull --ff-only origin piper
 
+export WORK_ROOT=/data1/wyn/piper-work
 export PRETRAINED_PATH=/data1/wyn/piper-work/models/pi05_base
 export DATASET_BASE=/data/datasets/May-pick-and-place
 export TOKENIZER_PATH=/data/models/paligemma-3b-pt-224
@@ -66,6 +67,12 @@ PROMPT_LR=0.0001 PROMPT_FINAL_LR=0.00001 DRY_RUN=false \
 按 episode 留出 10% 验证集。Batch 为**每卡 64**，双卡全局 128。保存 6000、9000、12000。
 W&B 和已有 action 误差评估继续启用。命令中显式指定 reference 学习率 `1e-4 -> 1e-5`；
 若不指定，原启动器的默认值仍为 `5e-5 -> 5e-6`。
+
+`WORK_ROOT` 同时指定默认临时/缓存目录：`tmp`、`cache/torchinductor`、`cache/triton`、
+`cache/huggingface`。`OUTPUT_ROOT` 只指定模型输出位置，不能代替它。
+启动时会打印这些路径，dry-run 也会打印但不创建目录。如果之前已显式设置过 `TMPDIR`、
+`TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR` 或 `HF_HOME`，它们优先于 `WORK_ROOT`；
+旧值指向不可写的 `/root` 时，需要同时改为自己有权限的目录。
 
 最终 checkpoint 在：
 

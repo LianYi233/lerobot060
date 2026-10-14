@@ -806,6 +806,62 @@ class RealLauncherTest(unittest.TestCase):
             self.assertIn("--policy.num_prompt_tokens=32", command)
             self.assertIn(f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}", command)
 
+    def test_runtime_cache_paths_reach_non_dry_launcher(self):
+        # Exercise the real shell's mkdir/export path, with no GPU or training process.
+        keys = ("TMPDIR", "TMP", "TEMP", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "HF_HOME")
+        bin_dir = self.work / "fake bin"
+        bin_dir.mkdir()
+        capture = self.work / "capture runtime.py"
+        capture.write_text(
+            "import json, os, pathlib\n"
+            f"keys = {keys!r}\n"
+            "pathlib.Path(os.environ['PIPER_TEST_RESULT']).write_text("
+            "json.dumps({key: os.environ[key] for key in keys}))\n"
+        )
+        for name, body in (
+            ("accelerate", '#!/bin/sh\nexec "$PIPER_TEST_PYTHON" "$PIPER_TEST_CAPTURE"\n'),
+            ("lerobot-train", "#!/bin/sh\nexit 99\n"),
+        ):
+            executable = bin_dir / name
+            executable.write_text(body)
+            executable.chmod(0o755)
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                runtime = self.work / f"runtime {explicit}"
+                report = self.work / f"runtime-{explicit}.json"
+                env = {key: value for key, value in self.env.items() if key not in keys}
+                env.update(
+                    WORK_ROOT=str(runtime),
+                    DATASET_ROOT=str(self.work / "datasets/May-pick-and-place" / MODULE.TASKS["1"]),
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    TOKENIZER_PATH=str(self.work / "models/google/paligemma-3b-pt-224"),
+                    OUTPUT_ROOT=str(self.work / "runtime outputs"), LOG_ROOT=str(self.work / "runtime logs"),
+                    RUN_NAME=f"cache-test-{explicit}",
+                    PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                    PIPER_TEST_PYTHON=sys.executable, PIPER_TEST_CAPTURE=str(capture),
+                    PIPER_TEST_RESULT=str(report),
+                )
+                expected = {
+                    "TMPDIR": str(runtime / "tmp"), "TMP": str(runtime / "tmp"), "TEMP": str(runtime / "tmp"),
+                    "TORCHINDUCTOR_CACHE_DIR": str(runtime / "cache/torchinductor"),
+                    "TRITON_CACHE_DIR": str(runtime / "cache/triton"), "HF_HOME": str(runtime / "cache/huggingface"),
+                }
+                if explicit:
+                    expected = {key: str(runtime / "custom" / key) for key in keys}
+                    env.update(expected)
+                command = ["bash", str(ROOT / "examples/training/train_pi05_prompt_ablation.sh"),
+                           "dual_prompt_only", "0"]
+                dry = subprocess.run(command, env=dict(env, DRY_RUN="true"), capture_output=True, text=True)
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertIn(f"HF_HOME={expected['HF_HOME']}", dry.stdout)
+                self.assertFalse(runtime.exists())
+                self.assertFalse(report.exists())
+                run = subprocess.run(command, env=dict(env, DRY_RUN="false"), capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(json.loads(report.read_text()), expected)
+                for key in ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "HF_HOME"):
+                    self.assertTrue(Path(expected[key]).is_dir(), key)
+
     def test_prompt_history_is_opt_in_and_has_separate_output(self):
         outputs = []
         for history in ("0", "20"):

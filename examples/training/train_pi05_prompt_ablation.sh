@@ -23,6 +23,9 @@ to override the flow checkpoint interval. Other variants keep their existing def
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
 MAIN_PROCESS_PORT selects a distributed port; use different ports for concurrent GPU groups.
 JOB_NAME optionally overrides the W&B display name without changing checkpoint filenames.
+WORK_ROOT controls default temporary/cache paths (default /root/autodl-tmp for AutoDL).
+On other machines set WORK_ROOT to a writable directory, e.g. /data1/wyn/piper-work.
+Explicit TMPDIR, TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR and HF_HOME take precedence.
 VLM_PROMPT_TOKENS / ACTION_PROMPT_TOKENS override the active bank sizes (default 16 each).
 vlm_only / action_only always disable the other bank, regardless of its environment override.
 EOF
@@ -233,6 +236,17 @@ if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then
     "${OUTPUT_DIR}" "${FLOW_STEPS}" "$((PRETRAIN_STEPS + FLOW_STEPS))"
 fi
 
+# Resolve and print these even in dry-run: OUTPUT_ROOT does not control runtime caches.
+RUNTIME_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TMP="${TMP:-${TMPDIR}}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${RUNTIME_ROOT}/cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${RUNTIME_ROOT}/cache/triton}"
+export HF_HOME="${HF_HOME:-${RUNTIME_ROOT}/cache/huggingface}"
+printf 'Runtime directories: TMPDIR=%s\n  TORCHINDUCTOR_CACHE_DIR=%s\n  TRITON_CACHE_DIR=%s\n  HF_HOME=%s\n' \
+  "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
+
 if [[ "${DRY_RUN}" == true ]]; then
   printf '%q ' env "CUDA_VISIBLE_DEVICES=${GPU_IDS}" accelerate "${LAUNCH_ARGS[@]}" \
     lerobot-train "${TRAIN_ARGS[@]}" "${EXTRA_ARGS[@]}"
@@ -241,12 +255,6 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
-export TMPDIR="${TMPDIR:-/root/autodl-tmp/tmp}"
-export TMP="${TMP:-${TMPDIR}}"
-export TEMP="${TEMP:-${TMPDIR}}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/root/autodl-tmp/cache/torchinductor}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/autodl-tmp/cache/triton}"
-export HF_HOME="${HF_HOME:-/root/autodl-tmp/cache/huggingface}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
