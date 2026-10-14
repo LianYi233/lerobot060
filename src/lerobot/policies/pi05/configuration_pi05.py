@@ -69,6 +69,9 @@ class PI05Config(PreTrainedConfig):
     # Opt-in Piper experiment. Refit state/action statistics on the selected training split.
     # Relative labels use q[t+k] - q[t] for six joints; gripper stays absolute.
     piper_train_normalization: bool = False
+    # Optional continuous expert context: [state(7), past gripper actions(20), zeros(5)].
+    # Reuses action_in_proj; adds no parameters. Zero preserves existing checkpoints.
+    piper_gripper_history_steps: int = 0
     use_relative_actions: bool = False
     action_feature_names: list[str] | None = None
     state_feature_names: list[str] | None = None
@@ -214,6 +217,21 @@ class PI05Config(PreTrainedConfig):
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
+        if type(self.piper_gripper_history_steps) is not int or self.piper_gripper_history_steps not in (0, 20):
+            raise ValueError("piper_gripper_history_steps must be 0 (off) or 20")
+        if self.piper_gripper_history_steps and (
+            not self.piper_train_normalization
+            or self.use_relative_actions
+            or self.max_action_dim != 32
+            or self.n_obs_steps != 1
+            or self.training_stage != "flow"
+            or self.next_action_pretrain_steps != 0
+            or self.next_action_bridge_steps != 0
+        ):
+            raise ValueError(
+                "Piper history requires absolute actions, piper_train_normalization, max_action_dim=32, "
+                "n_obs_steps=1 and direct flow (pretrain/bridge steps=0)"
+            )
         if self.use_relative_actions and not self.piper_train_normalization:
             raise ValueError("PI05 relative actions require piper_train_normalization=True")
         if self.piper_train_normalization and self.use_peft:

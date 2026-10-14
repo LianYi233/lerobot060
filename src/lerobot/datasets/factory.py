@@ -24,6 +24,7 @@ from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
+from lerobot.utils.piper_gripper_history import configure_gripper_history
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -101,6 +102,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
         else:
+            if getattr(cfg.trainable_config, "piper_gripper_history_steps", 0):
+                raise ValueError("Piper gripper history requires a local, non-streaming dataset")
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -140,7 +143,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                     dtype=torch.float32,
                 )
 
-    return dataset
+    return configure_gripper_history(dataset, cfg.trainable_config)
 
 
 def make_train_eval_datasets(
@@ -218,4 +221,7 @@ def make_train_eval_datasets(
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
-    return train_dataset, eval_dataset
+    return (
+        configure_gripper_history(train_dataset, cfg.trainable_config),
+        configure_gripper_history(eval_dataset, cfg.trainable_config),
+    )

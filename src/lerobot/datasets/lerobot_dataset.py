@@ -503,7 +503,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if reader.hf_dataset is None:
             # One-shot load after finalize()
             reader.load_and_activate()
-        return reader.get_item(idx)
+        item = reader.get_item(idx)
+        history = getattr(self, "_piper_gripper_history", None)
+        if history is not None:
+            from lerobot.utils.piper_gripper_history import HISTORY_KEY
+
+            item[HISTORY_KEY] = torch.from_numpy(history[idx])
+        return item
 
     def select_columns(self, column_names: str | list[str]):
         """Select specific columns from the underlying dataset.

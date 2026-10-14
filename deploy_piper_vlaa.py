@@ -365,15 +365,27 @@ def run_episode(
 
     total_infers = 0
     step = 0
+    from lerobot.utils.piper_gripper_history import HISTORY_KEY, ExecutedGripperHistory
+
+    history_enabled = bool(getattr(worker._policy_cfg, "piper_gripper_history_steps", 0))
+    gripper_history = None
 
     while step < steps:
         # ── 读取当前观测，触发后台推理下一个 chunk ───────────────
         obs_raw = robot.get_observation()
         obs_frame = build_observation(obs_raw, ds_features, camera_map, color_order)
+        if history_enabled:
+            if gripper_history is None:
+                gripper_history = ExecutedGripperHistory(float(obs_raw["gripper.pos"]))
+            obs_frame[HISTORY_KEY] = gripper_history.observation()
         worker.trigger(obs_frame)
 
         # ── 推理等待期间用保活线程持续发送当前位置，防止固件超时软停 ──
         hold_action = {key: float(obs_raw[key]) for key in robot.action_features}
+        if gripper_history is not None and step > 0:
+            # Keep the last commanded opening while waiting. Replacing it with a still-
+            # moving measured opening would interrupt closure and disagree with history.
+            hold_action["gripper.pos"] = float(gripper_history.observation()[-1])
         if not all(math.isfinite(value) for value in hold_action.values()):
             raise ValueError("保位观测包含非有限值")
         if step == 0:
@@ -406,6 +418,10 @@ def run_episode(
 
             loop_start = time.perf_counter()
             robot.send_action(action)
+            if gripper_history is not None:
+                # Only after a successful send: never record future chunk predictions or
+                # count the 100 Hz hold thread as policy control steps.
+                gripper_history.append(action["gripper.pos"])
 
             elapsed = time.perf_counter() - loop_start
             sleep_t = control_interval - elapsed
@@ -443,6 +459,10 @@ def run_dry_run(worker, ds_features, policy, preprocessor, postprocessor):
         if key.startswith("observation.")
     }
     reset_inference_state(policy, preprocessor, postprocessor)
+    if getattr(policy.config, "piper_gripper_history_steps", 0):
+        from lerobot.utils.piper_gripper_history import HISTORY_KEY, HISTORY_STEPS
+
+        obs_frame[HISTORY_KEY] = np.zeros(HISTORY_STEPS, dtype=np.float32)
     forward_count = 0
     predict_chunk = policy.predict_action_chunk
 
@@ -604,6 +624,8 @@ def main(argv=None):
     )
     if control_hz is not None:
         print(f"动作执行频率={control_hz}Hz；等待推理的时间会额外增加 chunk 之间的间隔")
+    if getattr(policy_cfg, "piper_gripper_history_steps", 0):
+        print("夹爪历史条件已启用: state7 + 已发送的20步夹爪action + zero5 -> 1个expert条件token")
     worker = ChunkInferenceWorker(
         policy=policy,
         preprocessor=preprocessor,

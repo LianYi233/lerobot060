@@ -70,6 +70,7 @@ class RealLauncherTest(unittest.TestCase):
             "ACTION_PROMPT_TOKENS",
             "PROMPT_LR",
             "PROMPT_FINAL_LR",
+            "GRIPPER_HISTORY_STEPS",
             "MAIN_PROCESS_PORT",
             "JOB_NAME",
             "LR_LOW_GPU_IDS",
@@ -804,6 +805,23 @@ class RealLauncherTest(unittest.TestCase):
             self.assertIn("--policy.num_vlm_prompt_tokens=32", command)
             self.assertIn("--policy.num_prompt_tokens=32", command)
             self.assertIn(f"--dataset.root={self.work / 'datasets/May-pick-and-place' / folder}", command)
+
+    def test_prompt_history_is_opt_in_and_has_separate_output(self):
+        outputs = []
+        for history in ("0", "20"):
+            result = self.run_autodl(
+                "1", "128", "0", script=PROMPT_ONLY,
+                PRETRAINED_PATH=str(self.work / "models/pi05_base"), GRIPPER_HISTORY_STEPS=history,
+                PROMPT_LR="0.0001", PROMPT_FINAL_LR="0.00001",
+            )
+            (command,) = self.command_args(result)
+            self.assertIn(f"--policy.piper_gripper_history_steps={history}", command)
+            self.assertIn("--policy.train_action_projections=false", command)
+            self.assertIn("--policy.train_action_expert_last_n_layers=0", command)
+            self.assertIn("expected trainable=393216", result.stdout)
+            outputs.append(next(arg for arg in command if arg.startswith("--output_dir=")))
+        self.assertNotEqual(*outputs)
+        self.assertIn("history20", outputs[1])
 
     def test_prompt_only_invalid_options_fail_before_launch(self):
         for args, env, expected in (

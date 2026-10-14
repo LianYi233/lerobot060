@@ -1,5 +1,8 @@
 # Piper：只训练两组 prompt，比较 16 / 32 / 64 / 128 / 512 个 token
 
+可选 `GRIPPER_HISTORY_STEPS=20`：增加当前状态与过去夹爪 action 条件，仍只训练两组 prompt。
+维度、因果约定和训练命令见 [README_GRIPPER_HISTORY.md](README_GRIPPER_HISTORY.md)。默认关闭。
+
 入口：`bash examples/training/train_piper_prompt_only.sh TASK TOKENS SEED`。
 默认 task 1、每组 32 个 token、seed 0；TASK 支持 1/2/3/4/all。
 `TOKENS` 是**每一组**的数量，例如 32 表示 VLM 32 个、action 32 个。

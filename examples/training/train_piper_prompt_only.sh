@@ -32,6 +32,8 @@ Changing LR, base or process count requires a new parent run directory.
 MAIN_PROCESS_PORT defaults to 30000 + TOKENS; override for concurrent batches/seeds of one token count.
 DRY_RUN=true prints the command and exits successfully without loading weights or using GPUs.
 No extra CLI arguments. See examples/piper/README_PROMPT_ONLY.md.
+GRIPPER_HISTORY_STEPS=20 enables [state7|past gripper20|zeros5] as ONE expert context
+token through frozen action_in_proj. Default 0 = unchanged. No added trainable parameters.
 EOF
   exit 0
 fi
@@ -51,6 +53,11 @@ if [[ -z "${PRETRAINED_PATH:-}" ]]; then
   exit 2
 fi
 export PRETRAINED_PATH
+export GRIPPER_HISTORY_STEPS="${GRIPPER_HISTORY_STEPS:-0}"
+if [[ "${GRIPPER_HISTORY_STEPS}" != 0 && "${GRIPPER_HISTORY_STEPS}" != 20 ]]; then
+  echo "GRIPPER_HISTORY_STEPS must be 0 (off) or 20" >&2
+  exit 2
+fi
 export BATCH_SIZE="${BATCH_SIZE:-64}"
 if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "BATCH_SIZE must be a positive integer" >&2
@@ -78,6 +85,9 @@ PIPER_PROMPT_GROUP="${RUN_GROUP:-piper-task${TASK}-prompt-only-$(date +%Y%m%d-%H
 PIPER_PROMPT_OUTPUT="${OUTPUT_ROOT:-${WORK_ROOT}/chkpt/2601-lerobot/piper/${PIPER_PROMPT_GROUP}}"
 PIPER_PROMPT_LOG="${LOG_ROOT:-${WORK_ROOT}/logs/piper/${PIPER_PROMPT_GROUP}}"
 PIPER_PROMPT_TAG="prompt-only-t${TOKENS}-b${BATCH_SIZE}"
+if [[ "${GRIPPER_HISTORY_STEPS}" == 20 ]]; then
+  PIPER_PROMPT_TAG+="-history20"
+fi
 export RUN_GROUP="${PIPER_PROMPT_GROUP}-${PIPER_PROMPT_TAG}"
 export OUTPUT_ROOT="${PIPER_PROMPT_OUTPUT}/${PIPER_PROMPT_TAG}"
 export LOG_ROOT="${PIPER_PROMPT_LOG}/${PIPER_PROMPT_TAG}"
@@ -100,6 +110,7 @@ export ACTION_EVAL_SEED="${SEED}" ACTION_EVAL_SAMPLING=episode_stratified ACTION
 echo "Piper prompt-only: VLM=${TOKENS}x2048, action=${TOKENS}x1024; expected trainable=$((TOKENS * 3072))"
 echo "Trainable ONLY: vlm_prompt_tokens.weight, prompt_tokens.weight; expert layers=0, action projections=false"
 echo "Batch: per_GPU=${BATCH_SIZE}, processes=${NUM_PROCESSES}, global=$((BATCH_SIZE * NUM_PROCESSES))"
+echo "Gripper history steps=${GRIPPER_HISTORY_STEPS}; enabled layout=7+20+5 -> frozen 32-to-1024 -> one expert token"
 exec bash "${SCRIPT_DIR}/train_piper_autodl.sh" "${TASK}" dual_prompt_only "${SEED}" \
   --policy.train_action_projections=false \
   --policy.train_action_expert_last_n_layers=0 \
@@ -107,5 +118,6 @@ exec bash "${SCRIPT_DIR}/train_piper_autodl.sh" "${TASK}" dual_prompt_only "${SE
   "--policy.optimizer_lr=${PROMPT_LR}" \
   "--policy.scheduler_decay_lr=${PROMPT_FINAL_LR}" \
   --policy.piper_train_normalization=true \
+  "--policy.piper_gripper_history_steps=${GRIPPER_HISTORY_STEPS}" \
   --policy.use_relative_actions=false \
   --dataset.image_transforms.enable=false --log_freq=50

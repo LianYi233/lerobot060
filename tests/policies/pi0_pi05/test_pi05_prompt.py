@@ -596,6 +596,89 @@ def test_training_requires_at_least_one_prompt_bank():
         policy.get_optim_params()
 
 
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_gripper_context_changes_predictions_and_trains_only_prompt_banks(gradient_checkpointing):
+    from lerobot.utils.piper_gripper_history import CONTEXT_KEY
+
+    cfg = _config(
+        max_action_dim=32,
+        piper_gripper_history_steps=20,
+        piper_train_normalization=True,
+        next_action_pretrain_steps=0,
+        next_action_bridge_steps=0,
+        cabo_enabled=False,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+    policy = PI05Policy(cfg)
+    core = policy.model
+    inputs = _inputs()
+    noise = torch.randn(2, _HORIZON, 32)
+    context = torch.randn(2, 32)
+    context[:, 27:] = 0
+    time = torch.tensor([0.25, 0.75])
+    core.eval()
+    with torch.no_grad():
+        velocity = core.predict_velocity(**inputs, x_t=noise, time=time, state_gripper_context=context)
+        other = context.clone()
+        other[:, 7:27] += 2
+        changed = core.predict_velocity(**inputs, x_t=noise, time=time, state_gripper_context=other)
+        assert not torch.allclose(velocity, changed)
+        prefix, prefix_pad, _ = core.embed_prefix(**inputs)
+        _, cache = core.paligemma_with_expert(
+            attention_mask=core._prepare_attention_masks_4d(
+                modeling_pi05.make_pi05_att_2d_masks(
+                    prefix_pad,
+                    prefix_length=prefix.shape[1],
+                    num_vlm_prompt_tokens=_VLM_PROMPTS,
+                    num_prompt_tokens=0,
+                )
+            ),
+            position_ids=prefix_pad.cumsum(dim=1) - 1,
+            inputs_embeds=[prefix, None],
+            use_cache=True,
+        )
+        cached = core.denoise_step(prefix_pad, cache, noise, time, state_gripper_context=context)
+        torch.testing.assert_close(cached, velocity, atol=1e-5, rtol=1e-5)
+        sampled = core.sample_actions(**inputs, noise=noise, num_steps=2, state_gripper_context=context)
+        assert sampled.shape == noise.shape and torch.isfinite(sampled).all()
+    assert {name for name, p in policy.named_parameters() if p.requires_grad} == _PROMPT_KEYS
+    policy.train()
+    policy._preprocess_images = lambda batch: (inputs["images"], inputs["img_masks"])
+    batch = {
+        ACTION: _actions(),
+        "action_is_pad": torch.zeros(2, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: inputs["tokens"],
+        OBS_LANGUAGE_ATTENTION_MASK: inputs["masks"],
+        CONTEXT_KEY: context,
+    }
+    loss, _ = policy(batch)
+    loss.backward()
+    for name, parameter in policy.named_parameters():
+        if name in _PROMPT_KEYS:
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            assert parameter.grad.abs().sum() > 0
+        else:
+            assert parameter.grad is None, name
+    assert policy.predict_action_chunk(batch, noise=noise, num_steps=2).shape == _actions().shape
+    with pytest.raises(ValueError, match="Missing Piper history"):
+        policy.predict_action_chunk({k: v for k, v in batch.items() if k != CONTEXT_KEY})
+
+
+def test_history_attention_is_cached_prefix_safe_and_conditioning_only():
+    # 2 observations | 1 VLM prompt | 1 context | 2 expert prompts | 3 actions
+    allowed = modeling_pi05.make_pi05_att_2d_masks(
+        torch.ones(1, 9, dtype=torch.bool),
+        prefix_length=3,
+        num_vlm_prompt_tokens=1,
+        num_context_tokens=1,
+        num_prompt_tokens=2,
+    )[0]
+    assert not allowed[:3, 3:].any()  # cached VLM never reads suffix
+    assert allowed[3, 3] and allowed[3].sum() == 1  # context does not read noisy targets
+    assert allowed[4:6, 3:].all()  # expert prompts can read context and noisy actions
+    assert allowed[6:].all()  # action queries read all valid tokens
+
+
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("num_vlm_prompts", [0, _VLM_PROMPTS])
 @pytest.mark.parametrize("num_prompts", [0, _PROMPTS])

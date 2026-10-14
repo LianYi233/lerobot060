@@ -212,6 +212,10 @@ def evaluate(dataset, indices, predict, features, output, *, chunk_size, executi
     state_names = features["observation.state"]["names"]
     cameras = [key for key in features if key.startswith("observation.images.")]
     input_keys = ["observation.state", *cameras]
+    if getattr(dataset, "_piper_gripper_history", None) is not None:
+        from lerobot.utils.piper_gripper_history import HISTORY_KEY
+
+        input_keys.append(HISTORY_KEY)
     plot_positions = set(np.linspace(0, len(indices) - 1, min(plots, len(indices)), dtype=int))
     values = {
         key: []
@@ -415,6 +419,9 @@ def main(argv=None):
         return_uint8=True,
         image_transforms=None,
     )
+    from lerobot.utils.piper_gripper_history import configure_gripper_history
+
+    configure_gripper_history(dataset, config)
     indices = select_indices(
         dataset.select_columns(["episode_index", "frame_index"]), args.stride, args.max_samples
     )
@@ -447,6 +454,8 @@ def main(argv=None):
         "chunk_size": config.chunk_size,
         "dtype": config.dtype,
         "use_amp": config.use_amp,
+        "piper_gripper_history_steps": getattr(config, "piper_gripper_history_steps", 0),
+        "history_evaluation": "recorded past actions (teacher-forced), not closed-loop predictions",
         "protocol": "Recorded current RGB views + state + task; labels t..t+H-1; padded tails excluded. "
         "One seeded noise draw per observation; checkpoint normalization; no action clipping. "
         "Hold baseline reorders current state into action-name order. "

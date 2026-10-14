@@ -234,6 +234,9 @@ class PiperActionEvaluator:
         }
         if getattr(options, "sampling", "uniform") != "uniform":
             manifest["sampling"] = options.sampling
+        if getattr(policy_config, "piper_gripper_history_steps", 0):
+            manifest["gripper_history"] = "20 recorded past actions t-20..t-1; initial measured state padding"
+            manifest["history_evaluation"] = "teacher-forced recorded past actions, not closed-loop predictions"
         if getattr(policy_config, "piper_train_normalization", False):
             manifest["action_representation"] = (
                 "relative_joints_absolute_gripper" if policy_config.use_relative_actions else "absolute"
@@ -288,6 +291,10 @@ class PiperActionEvaluator:
                 if not isinstance(item["task"], str) or not item["task"].strip():
                     raise ValueError("Fixed action evaluation needs a recorded task string")
                 observation = {key: deepcopy(item[key]) for key in self.config.input_features}
+                if getattr(self.config, "piper_gripper_history_steps", 0):
+                    from lerobot.utils.piper_gripper_history import HISTORY_KEY
+
+                    observation[HISTORY_KEY] = deepcopy(item[HISTORY_KEY])
                 observation["task"] = item["task"]
                 samples.append(
                     {

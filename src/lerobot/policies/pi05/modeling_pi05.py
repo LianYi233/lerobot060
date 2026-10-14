@@ -249,25 +249,36 @@ def make_pi05_att_2d_masks(
     prefix_length: int,
     num_vlm_prompt_tokens: int,
     num_prompt_tokens: int,
+    num_context_tokens: int = 0,
     query_offset: int = 0,
 ) -> Tensor:
-    """Mask [observations, VLM prompts, expert prompts, actions] by direct token visibility.
+    """Mask [observations, VLM prompts, optional context, expert prompts, actions].
 
     Observations read only observations. VLM prompts read observations and VLM prompts;
-    expert prompts read actions and expert prompts. Actions read every valid token.
+    Context reads only itself; expert prompts read context, actions and expert prompts.
+    Actions read every valid token. With no context the previous mask is unchanged.
     ``query_offset=prefix_length`` builds only suffix query rows for cached denoising.
     """
     positions = torch.arange(pad_masks.shape[1], device=pad_masks.device)
     queries = positions[query_offset:, None]
     keys = positions[None, :]
     observation_end = prefix_length - num_vlm_prompt_tokens
-    action_start = prefix_length + num_prompt_tokens
+    context_end = prefix_length + num_context_tokens
+    action_start = context_end + num_prompt_tokens
 
     action_queries = queries >= action_start
     allowed = torch.where(
         queries < observation_end,
         keys < observation_end,
-        torch.where(queries < prefix_length, keys < prefix_length, action_queries | (keys >= prefix_length)),
+        torch.where(
+            queries < prefix_length,
+            keys < prefix_length,
+            torch.where(
+                queries < context_end,
+                (keys >= prefix_length) & (keys < context_end),
+                action_queries | (keys >= prefix_length),
+            ),
+        ),
     )
     return allowed[None, :, :] & pad_masks[:, query_offset:, None] & pad_masks[:, None, :]
 
@@ -965,8 +976,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Embed [prompt, action] blocks with shared timestep conditioning for the expert."""
+    def embed_suffix(self, noisy_actions, timestep, state_gripper_context=None):
+        """Embed [optional state/history, prompts, noisy actions] for the expert."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -998,6 +1009,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         adarms_cond = time_emb
 
         bsize, action_time_dim = action_time_emb.shape[:2]
+        use_history = bool(getattr(self.config, "piper_gripper_history_steps", 0))
+        if use_history:
+            if state_gripper_context is None or state_gripper_context.shape != (bsize, 32):
+                raise ValueError("History-enabled PI05 requires normalized state/history context [B,32]")
+            # No new weights: preserve the prompt-only trainable partition. This token is
+            # conditioning, not a noisy action, and is excluded from action outputs/loss.
+            context = state_gripper_context.to(device=action_emb.device, dtype=noisy_actions.dtype)
+            embs.append(self.action_in_proj(context).unsqueeze(1).to(action_emb.dtype))
+            pad_masks.append(torch.ones((bsize, 1), device=action_emb.device, dtype=torch.bool))
+            att_masks += [1]
+        elif state_gripper_context is not None:
+            raise ValueError("State/history supplied to a PI05 checkpoint without history conditioning")
         if self.config.num_prompt_tokens:
             # Use the embedding forward so PEFT modules_to_save also routes to the active adapter.
             prompt_ids = torch.arange(self.config.num_prompt_tokens, device=action_emb.device)
@@ -1133,10 +1156,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = suffix_out[:, num_prompts:]
         return self._apply_checkpoint(self.action_out_proj, suffix_out)
 
-    def predict_velocity(self, images, img_masks, tokens, masks, x_t, time) -> Tensor:
+    def predict_velocity(
+        self, images, img_masks, tokens, masks, x_t, time, state_gripper_context=None
+    ) -> Tensor:
         """Predict flow velocity for explicit noisy actions and timesteps."""
         prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, time, state_gripper_context)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1151,6 +1176,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prefix_length=prefix_pad_masks.shape[1],
             num_vlm_prompt_tokens=self.config.num_vlm_prompt_tokens,
             num_prompt_tokens=self.config.num_prompt_tokens,
+            num_context_tokens=int(bool(getattr(self.config, "piper_gripper_history_steps", 0))),
         )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
@@ -1191,6 +1217,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         action_is_pad=None,
         inpainting_mask=None,
         objective: PI05TrainingObjective | None = None,
+        state_gripper_context=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if actions is None:
@@ -1238,7 +1265,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        v_t = self.predict_velocity(images, img_masks, tokens, masks, x_t, time)
+        v_t = self.predict_velocity(images, img_masks, tokens, masks, x_t, time, state_gripper_context)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -1252,6 +1279,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         num_steps=None,
         return_prefix_features: bool = False,
+        state_gripper_context=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Do a full inference forward and compute the action."""
@@ -1311,6 +1339,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    state_gripper_context=state_gripper_context,
                 )
 
             if self._rtc_enabled():
@@ -1344,9 +1373,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        state_gripper_context=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+            x_t, timestep, state_gripper_context
+        )
         prefix_len = prefix_pad_masks.shape[1]
         full_att_2d_masks = make_pi05_att_2d_masks(
             torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1),
@@ -1354,6 +1386,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             num_vlm_prompt_tokens=self.config.num_vlm_prompt_tokens,
             num_prompt_tokens=self.config.num_prompt_tokens,
             query_offset=prefix_len,
+            num_context_tokens=int(bool(getattr(self.config, "piper_gripper_history_steps", 0))),
         )
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
@@ -2076,6 +2109,15 @@ class PI05Policy(PreTrainedPolicy):
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
 
+    def _state_gripper_kwargs(self, batch):
+        if not getattr(self.config, "piper_gripper_history_steps", 0):
+            return {}
+        from lerobot.utils.piper_gripper_history import CONTEXT_KEY
+
+        if CONTEXT_KEY not in batch:
+            raise ValueError("Missing Piper history context; use the checkpoint's saved preprocessor")
+        return {"state_gripper_context": batch[CONTEXT_KEY]}
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
@@ -2113,7 +2155,9 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        actions = self.model.sample_actions(
+            images, img_masks, tokens, masks, **self._state_gripper_kwargs(batch), **kwargs
+        )
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -2143,6 +2187,7 @@ class PI05Policy(PreTrainedPolicy):
             tokens,
             masks,
             return_prefix_features=True,
+            **self._state_gripper_kwargs(batch),
             **kwargs,
         )
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -2223,6 +2268,7 @@ class PI05Policy(PreTrainedPolicy):
             masks,
             actions,
             objective=PI05TrainingObjective.OBSERVATION_FLOW,
+            **self._state_gripper_kwargs(batch),
         )
 
         # Truncate losses to actual action dimensions
