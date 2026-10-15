@@ -21,6 +21,84 @@ also saves tiny prompt-only snapshots; it never saves intermediate backbone weig
 `torch.compile` is disabled. Existing run directories cause an error before training.
 To restart a partial sweep, explicitly set the remaining `VLM_PROMPT_TOKEN_COUNTS`.
 
+## Swap initialization across training seeds / 跨服务器复用初始化
+
+The seed number alone does not identify the exact initial prompt: model construction
+consumes random draws before prompt initialization. The existing monitor saves the
+actual initial values in `prompt_rank/step_000000.npz`, key `prompt`. Do not use
+`step_003000.npz` or final model weights for this experiment.
+
+先在两台机器更新同一 `vlm-only` 版本。源服务器导出实际 seed1 初始 prompt：
+
+```bash
+cd /root/lerobot060
+python -m lerobot.scripts.export_pi05_prompt_init export \
+  /root/autodl-tmp/chkpt/2601-lerobot/vlm-only/pi05-base-vlm2-seed1 \
+  --expect-seed 1 \
+  --output /root/autodl-tmp/prompt-inits/pi05-base-vlm2-init-seed1.safetensors
+```
+
+This reads the step-zero NPZ, probe manifest and a saved `train_config.json`.
+It validates the source training seed and shape, records provenance/checksums, and
+exports only the `[2,2048]` float32 prompt (16 KiB tensor payload plus metadata).
+The completed 3000-step checkpoint is used only to read training configuration;
+its learned prompt is **never** exported. If step zero is missing, export fails
+instead of silently substituting trained weights. Existing export files are not overwritten.
+
+把这一份 `.safetensors` 文件下载后上传到另一台服务器，例如放在 `/root/`。
+无需复制完整模型或优化器。两台机器可以互相 SSH 访问时，也可在源服务器使用：
+
+```bash
+scp -P <目标SSH端口> \
+  /root/autodl-tmp/prompt-inits/pi05-base-vlm2-init-seed1.safetensors \
+  root@<目标服务器地址>:/root/
+```
+
+目标服务器验证文件，然后训练：
+
+```bash
+cd /root/lerobot060
+python -m lerobot.scripts.export_pi05_prompt_init check \
+  /root/pi05-base-vlm2-init-seed1.safetensors --tokens 2
+
+env -u PRETRAINED_PATH -u RUN_NAME -u VLM_PROMPT_TOKENS \
+OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+LOG_ROOT=/root/autodl-tmp/logs/vlm-only \
+RUN_PREFIX=pi05-init1-train0 \
+PROMPT_INIT_PATH=/root/pi05-base-vlm2-init-seed1.safetensors \
+GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKEN_COUNTS="2" \
+RANK_FREQ=250 RANK_SAMPLES=16 RANK_OUTPUT_PROBES=4 \
+RANK_SEED=2026 RANK_TIMESTEPS='[0.2,0.5,0.8]' \
+bash examples/training/train_pi05_vlm_only_rank_sweep.sh 0 \
+  --wandb.enable=true --wandb.project=prompt-learning \
+  --wandb.mode=online --wandb.disable_artifact=true
+```
+
+The run is `pi05-init1-train0-base-vlm2-seed0`. Initialization import occurs **after**
+normal seed0 model construction and source-weight loading, **before** DDP, optimizer
+creation and step-zero diagnostics. It copies values in-place, draws no randomness,
+and never restores the source run's RNG or optimizer state. This keeps seed0's data
+ordering, augmentation (if enabled), flow noise **and time sampling**, not just its
+Gaussian noise. It is an initialization-swap intervention, not a noise-only ablation.
+Both DDP ranks verify the same prompt checksum. A shape mismatch, nonfinite values,
+or an inexact cast to the target prompt precision is rejected.
+
+The new run retains `prompt_init.safetensors` and `prompt_init.json`, including the
+source training seed, source step, replaced/loaded tensor hashes and new training
+seed. Normal final checkpoints remain self-contained for evaluation: the external
+initialization file is not needed. On trainer resume the import is skipped and the
+saved learned weights take precedence, even if the original transfer file is gone.
+Full checkpoints are still final-only; rank diagnostics still save tiny snapshots.
+
+For comparison, keep source checkpoint contents, dataset/order, two-GPU world size,
+per-device batch, precision, software versions, learning rate and probe settings
+fixed. Cross-server copying guarantees the same prompt values; a seed alone cannot
+guarantee bitwise identical training on different CUDA/PyTorch/hardware stacks.
+Use the current seed0 recheck as control. If the hybrid recovers, it supports an
+effect of the remaining training randomness conditional on this initialization;
+it does not identify Gaussian noise as the sole cause. If it remains poor, add the
+reverse swap (init0/train1) before attributing all failures to initialization.
+
 ## What is being measured
 
 For fixed observations `x_i`, Gaussian noise `epsilon_i`, and normalized recorded

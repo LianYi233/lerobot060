@@ -593,12 +593,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
-        if cfg.prompt_rank.freq > 0 and accelerator.distributed_type not in (
+        if (
+            cfg.prompt_rank.freq > 0 or cfg.vlm_prompt_init_path is not None
+        ) and accelerator.distributed_type not in (
             DistributedType.NO,
             DistributedType.MULTI_GPU,
             DistributedType.MULTI_CPU,
         ):
-            raise NotImplementedError("prompt_rank supports unsharded single-device/DDP training only")
+            raise NotImplementedError(
+                "prompt diagnostics/initialization support unsharded single-device/DDP only"
+            )
         if cfg.piper_eval.enabled and accelerator.distributed_type not in (
             DistributedType.NO,
             DistributedType.MULTI_GPU,
@@ -704,6 +708,30 @@ def _train_single_stage(
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
         )
+
+    if cfg.vlm_prompt_init_path is not None and not cfg.resume:
+        from lerobot.utils.prompt_initialization import apply_initial_prompt, save_import_record
+        from lerobot.utils.prompt_rank import collective_call
+
+        # Keep seeded construction above intact, including its random draws. Only copy prompt values.
+        record = collective_call(accelerator, lambda: apply_initial_prompt(policy, cfg.vlm_prompt_init_path))
+        digest = torch.tensor(
+            list(bytes.fromhex(record["loaded_prompt_sha256"])), device=device, dtype=torch.uint8
+        )
+        digests = accelerator.gather(digest).reshape(accelerator.num_processes, -1)
+        if not (digests == digests[0]).all().item():
+            raise ValueError("Imported prompt initialization differs across DDP ranks")
+        collective_call(
+            accelerator,
+            lambda: save_import_record(policy, record, cfg.output_dir, cfg.seed) if is_main_process else None,
+        )
+        if is_main_process:
+            logging.info(
+                "PROMPT_INIT source_training_seed=%s training_seed=%s sha256=%s (training RNG unchanged)",
+                record["source_training_seed"],
+                cfg.seed,
+                record["loaded_prompt_sha256"],
+            )
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:

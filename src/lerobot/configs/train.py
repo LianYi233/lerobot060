@@ -95,6 +95,9 @@ class TrainPipelineConfig(HubMixin):
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
+    # Import an exact step-zero VLM prompt AFTER normal seeded model construction/loading.
+    # All other training RNG streams retain `seed`. Ignored on resume; saved weights take precedence.
+    vlm_prompt_init_path: str | None = None
     # Set to True to use deterministic cuDNN algorithms for reproducibility.
     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
     cudnn_deterministic: bool = False
@@ -240,6 +243,22 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.vlm_prompt_init_path is not None:
+            if (
+                self.is_reward_model_training
+                or active_cfg.type != "pi05"
+                or not getattr(active_cfg, "vlm_prompt_only", False)
+                or self.peft is not None
+                or active_cfg.use_peft
+                or active_cfg.compile_model
+            ):
+                raise ValueError(
+                    "vlm_prompt_init_path requires native PI05 VLM-only training without compile"
+                )
+            if not self.resume:
+                from lerobot.utils.prompt_initialization import read_initial_prompt
+
+                read_initial_prompt(self.vlm_prompt_init_path, active_cfg.num_vlm_prompt_tokens)
         if self.prompt_rank.freq > 0:
             if (
                 self.is_reward_model_training

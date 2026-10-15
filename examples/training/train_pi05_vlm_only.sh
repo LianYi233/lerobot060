@@ -17,6 +17,8 @@ For two independent runs: bash examples/training/train_pi05_vlm_only_pair.sh 0
 
 Environment: VLM_PROMPT_TOKENS, GPU_IDS (process count inferred), NUM_PROCESSES,
 MAIN_PROCESS_PORT, BATCH_SIZE, FLOW_STEPS, SAVE_FREQ, SAVE_ONLY_FINAL, DTYPE (bfloat16|float32),
+PROMPT_INIT_PATH optionally imports an exported step-zero .safetensors prompt;
+SEED still controls all other training randomness. Requires --policy.compile_model=false.
 PRETRAINED_PATH, BASE_PRETRAINED_PATH, FINETUNED_PRETRAINED_PATH, DATASET_ROOT,
 DATASET_REPO_ID, TOKENIZER_PATH, OUTPUT_ROOT, LOG_ROOT, RUN_NAME, DRY_RUN.
 Extra args (use --key=value): --wandb.*, --policy.optimizer_*, --policy.scheduler_*,
@@ -87,6 +89,9 @@ if [[ -e "$OUTPUT_DIR" ]]; then echo "Output already exists; choose another RUN_
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 python -m lerobot.scripts.libero_vlm_only "$PRETRAINED_PATH" --kind "$SOURCE" \
   --dataset-root "$DATASET_ROOT" --tokens "$VLM_PROMPT_TOKENS"
+if [[ -n "${PROMPT_INIT_PATH:-}" ]]; then
+  python -m lerobot.scripts.export_pi05_prompt_init check "$PROMPT_INIT_PATH" --tokens "$VLM_PROMPT_TOKENS"
+fi
 TRAIN_ARGS=(
   --policy.path="$PRETRAINED_PATH" --policy.tokenizer_name="$TOKENIZER_PATH"
   --policy.device=cuda --policy.dtype="$DTYPE" --policy.use_amp=false
@@ -105,6 +110,7 @@ TRAIN_ARGS=(
   --seed="$SEED" --env_eval_freq=0 --save_checkpoint=true --save_freq="$SAVE_FREQ"
   --wandb.enable=true --wandb.project=prompt-learning --wandb.mode=online --wandb.disable_artifact=true
 )
+if [[ -n "${PROMPT_INIT_PATH:-}" ]]; then TRAIN_ARGS+=(--vlm_prompt_init_path="$PROMPT_INIT_PATH"); fi
 if [[ "$SAVE_ONLY_FINAL" == true ]]; then TRAIN_ARGS+=(--save_steps='[]'); fi
 LAUNCH_ARGS=(launch --num_machines=1 --num_processes="$NUM_PROCESSES" --mixed_precision="$PRECISION"
   --main_process_port="$MAIN_PROCESS_PORT" --dynamo_backend=no)

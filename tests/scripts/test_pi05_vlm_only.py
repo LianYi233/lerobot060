@@ -386,6 +386,41 @@ class VLMOnlyTest(unittest.TestCase):
         result = self.run_script(RANK_SWEEP, "1", "--policy.compile_model=true")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_rank_sweep_imports_seed1_prompt_but_retains_seed0_training_and_probe_seed(self):
+        from lerobot.utils.prompt_initialization import prompt_hash, write_prompt
+
+        prompt = np.full((2, 2048), 0.03125, dtype=np.float32)
+        path = self.work / "seed1 init.safetensors"
+        write_prompt(
+            path,
+            prompt,
+            {
+                "schema_version": 1,
+                "source_step": 0,
+                "source_training_seed": 1,
+                "num_vlm_prompt_tokens": 2,
+                "prompt_sha256": prompt_hash(prompt),
+            },
+        )
+        result = self.run_script(
+            RANK_SWEEP,
+            "0",
+            VLM_PROMPT_TOKEN_COUNTS="2",
+            PROMPT_INIT_PATH=str(path),
+            RUN_PREFIX="pi05-init1-train0",
+        )
+        (command,) = self.commands(result)
+        args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
+        self.assertEqual(args["seed"], "0")
+        self.assertEqual(args["prompt_rank.seed"], "2026")
+        self.assertEqual(args["vlm_prompt_init_path"], str(path))
+        self.assertEqual(args["policy.path"], str(self.source("base")))
+        self.assertEqual(args["job_name"], "pi05-init1-train0-base-vlm2-seed0")
+        self.assertFalse((self.work / "training").exists())
+        bad = self.run_script(RANK_SWEEP, "0", VLM_PROMPT_TOKEN_COUNTS="2 4", PROMPT_INIT_PATH=str(path))
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("Starting source=", bad.stdout)
+
     def test_token_sweep_selects_remaining_runs_and_rejects_ambiguous_settings(self):
         (command,) = self.commands(
             self.run_script(
