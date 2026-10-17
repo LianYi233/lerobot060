@@ -32,6 +32,7 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
+from .pdet import PDETConfig
 from .piper import PiperEvalConfig
 from .policies import PreTrainedConfig
 from .prompt_rank import PromptRankConfig
@@ -102,6 +103,7 @@ class TrainPipelineConfig(HubMixin):
     vlm_prompt_export_path: str | None = None
     # Optional prompt_init.json from an earlier swap: verify its replaced (pre-import) prompt hash.
     vlm_prompt_export_reference: str | None = None
+    pdet: PDETConfig = field(default_factory=PDETConfig)
     # Set to True to use deterministic cuDNN algorithms for reproducibility.
     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
     cudnn_deterministic: bool = False
@@ -247,6 +249,7 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        self.pdet.validate_training(self)
         if self.vlm_prompt_export_reference is not None and self.vlm_prompt_export_path is None:
             raise ValueError("vlm_prompt_export_reference requires vlm_prompt_export_path")
         if self.vlm_prompt_export_path is not None:

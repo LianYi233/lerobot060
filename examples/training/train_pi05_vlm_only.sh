@@ -18,7 +18,7 @@ For two independent runs: bash examples/training/train_pi05_vlm_only_pair.sh 0
 Environment: VLM_PROMPT_TOKENS, GPU_IDS (process count inferred), NUM_PROCESSES,
 MAIN_PROCESS_PORT, BATCH_SIZE, FLOW_STEPS, SAVE_FREQ, SAVE_ONLY_FINAL, DTYPE (bfloat16|float32),
 PROMPT_INIT_PATH optionally imports an exported step-zero .safetensors prompt;
-SEED still controls all other training randomness. Requires --policy.compile_model=false.
+SEED controls other training randomness unless PDET is enabled. Requires --policy.compile_model=false.
 PROMPT_EXPORT_PATH instead exports the normally constructed initial prompt and exits with zero
 updates (no W&B, optimizer, probes or full checkpoint). Incompatible with PROMPT_INIT_PATH.
 PROMPT_EXPORT_REFERENCE optionally verifies the replaced-prompt hash in an earlier prompt_init.json.
@@ -27,6 +27,7 @@ DATASET_REPO_ID, TOKENIZER_PATH, OUTPUT_ROOT, LOG_ROOT, RUN_NAME, DRY_RUN.
 Extra args (use --key=value): --wandb.*, --policy.optimizer_*, --policy.scheduler_*,
 --policy.compile_model, --policy.gradient_checkpointing, --num_workers, --log_freq.
 --prompt_rank.* enables fixed-probe velocity-to-prompt Jacobian spectra (requires no compile).
+--pdet.* separates data order, flow noise and flow time; prefer train_pi05_vlm_only_pdet_sweep.sh.
 EOF
   exit 0
 fi
@@ -37,7 +38,7 @@ EXTRA_ARGS=("$@")
 for arg in "${EXTRA_ARGS[@]}"; do
   case "$arg" in
     --wandb.*=*|--policy.optimizer_*=*|--policy.scheduler_*=*|--policy.compile_model=*|\
-    --policy.gradient_checkpointing=*|--num_workers=*|--log_freq=*|--prompt_rank.*=*) ;;
+    --policy.gradient_checkpointing=*|--num_workers=*|--log_freq=*|--prompt_rank.*=*|--pdet.*=*) ;;
     *) echo "Unsupported override: $arg; use --help for VLM-only controls" >&2; exit 2 ;;
   esac
 done

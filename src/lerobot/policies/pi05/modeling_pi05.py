@@ -2127,7 +2127,14 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return actions[:, :, :original_action_dim], prefix_features
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        reduction: str = "mean",
+        *,
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
+    ) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
         Args:
@@ -2140,6 +2147,8 @@ class PI05Policy(PreTrainedPolicy):
             raise ValueError(f"Unsupported loss reduction: {reduction!r}")
 
         is_stage1 = self.config.training_stage == PI05TrainingStage.NEXT_ACTION
+        if is_stage1 and (noise is not None or time is not None):
+            raise ValueError("Explicit flow inputs are supported only in observation-flow training")
         if is_stage1 and not self._stage1_bridge_active:
             actions = self.prepare_action(batch)
             if "action_is_pad" not in batch:
@@ -2178,7 +2187,9 @@ class PI05Policy(PreTrainedPolicy):
                 return per_sample_loss, loss_dict
             return loss, loss_dict
 
-        return self._forward_observation_flow(batch, reduction=reduction, stage1_bridge=is_stage1)
+        return self._forward_observation_flow(
+            batch, reduction=reduction, stage1_bridge=is_stage1, noise=noise, time=time
+        )
 
     def _forward_observation_flow(
         self,
@@ -2186,6 +2197,8 @@ class PI05Policy(PreTrainedPolicy):
         *,
         reduction: str,
         stage1_bridge: bool,
+        noise: Tensor | None = None,
+        time: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         """Compute the formal observation-conditioned flow loss for Stage 2 or its Stage-1 bridge."""
         # Prepare inputs
@@ -2201,6 +2214,8 @@ class PI05Policy(PreTrainedPolicy):
             tokens,
             masks,
             actions,
+            noise=noise,
+            time=time,
             objective=PI05TrainingObjective.OBSERVATION_FLOW,
         )
 

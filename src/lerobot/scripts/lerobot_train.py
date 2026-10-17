@@ -212,6 +212,7 @@ def update_policy(
     lock=None,
     sample_weighter=None,
     parameter_monitor=None,
+    forward_kwargs=None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -230,6 +231,7 @@ def update_policy(
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
         parameter_monitor: Optional sampled gradient/actual-update diagnostics on the main rank.
+        forward_kwargs: Optional explicit stochastic flow inputs (PDET experiments only).
 
     Returns:
         A tuple containing:
@@ -253,7 +255,7 @@ def update_policy(
         if sample_weights is not None:
             # Use per-sample loss for weighted training
             # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none", **(forward_kwargs or {}))
 
             # Weighted loss: each sample's contribution is scaled by its weight.
             # We divide by weight sum (not batch size) so that if some weights are zero,
@@ -268,7 +270,7 @@ def update_policy(
             for key, value in weight_stats.items():
                 output_dict[f"sample_weight_{key}"] = value
         else:
-            loss, output_dict = policy.forward(batch)
+            loss, output_dict = policy.forward(batch, **(forward_kwargs or {}))
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
@@ -595,6 +597,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     try:
         if (
             cfg.prompt_rank.freq > 0
+            or cfg.pdet.enabled
             or cfg.vlm_prompt_init_path is not None
             or cfg.vlm_prompt_export_path is not None
         ) and accelerator.distributed_type not in (
@@ -925,7 +928,7 @@ def _train_single_stage(
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
             shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
+            seed=cfg.pdet.data_seed if cfg.pdet.enabled else (cfg.seed if cfg.seed is not None else 0),
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
         if cfg.resume and step > 0:
@@ -963,6 +966,8 @@ def _train_single_stage(
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    # Worker startup must not consume the global RNG or follow D (D is sample order only).
+    worker_generator = torch.Generator().manual_seed(cfg.seed) if cfg.pdet.enabled else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -974,6 +979,7 @@ def _train_single_stage(
         collate_fn=collate_fn,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        generator=worker_generator,
     )
 
     # Build eval dataloader if a held-out split exists
@@ -1020,6 +1026,15 @@ def _train_single_stage(
         load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
 
     dl_iter = cycle(dataloader)
+
+    pdet_streams = None
+    if cfg.pdet.enabled:
+        from lerobot.utils.pdet import PDETStreams
+        from lerobot.utils.prompt_rank import collective_call
+
+        pdet_streams = collective_call(
+            accelerator, lambda: PDETStreams(cfg, accelerator.unwrap_model(policy), accelerator)
+        )
 
     policy.train()
 
@@ -1171,11 +1186,23 @@ def _train_single_stage(
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        sample_indices = batch.get("index") if pdet_streams is not None else None
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
+
+        forward_kwargs = None
+        if pdet_streams is not None:
+
+            def draw_flow(batch=batch, step=step, sample_indices=sample_indices):
+                return pdet_streams.draw(accelerator.unwrap_model(policy), batch, step, sample_indices)
+
+            # Propagate audit I/O failures before any rank enters backward collectives.
+            forward_kwargs = (
+                collective_call(accelerator, draw_flow) if step < cfg.pdet.audit_steps else draw_flow()
+            )
 
         if enable_pi05_stage1_bridge:
             _set_policy_training_progress(policy, accelerator, step=step, total_steps=cfg.steps)
@@ -1195,6 +1222,7 @@ def _train_single_stage(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            forward_kwargs=forward_kwargs,
             parameter_monitor=(
                 parameter_monitor
                 if cfg.piper_eval.update_freq > 0
