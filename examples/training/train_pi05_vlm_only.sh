@@ -19,6 +19,9 @@ Environment: VLM_PROMPT_TOKENS, GPU_IDS (process count inferred), NUM_PROCESSES,
 MAIN_PROCESS_PORT, BATCH_SIZE, FLOW_STEPS, SAVE_FREQ, SAVE_ONLY_FINAL, DTYPE (bfloat16|float32),
 PROMPT_INIT_PATH optionally imports an exported step-zero .safetensors prompt;
 SEED still controls all other training randomness. Requires --policy.compile_model=false.
+PROMPT_EXPORT_PATH instead exports the normally constructed initial prompt and exits with zero
+updates (no W&B, optimizer, probes or full checkpoint). Incompatible with PROMPT_INIT_PATH.
+PROMPT_EXPORT_REFERENCE optionally verifies the replaced-prompt hash in an earlier prompt_init.json.
 PRETRAINED_PATH, BASE_PRETRAINED_PATH, FINETUNED_PRETRAINED_PATH, DATASET_ROOT,
 DATASET_REPO_ID, TOKENIZER_PATH, OUTPUT_ROOT, LOG_ROOT, RUN_NAME, DRY_RUN.
 Extra args (use --key=value): --wandb.*, --policy.optimizer_*, --policy.scheduler_*,
@@ -82,6 +85,12 @@ RUN_NAME="${RUN_NAME:-pi05-${SOURCE}-vlm${VLM_PROMPT_TOKENS}-seed${SEED}}"
 OUTPUT_DIR="$OUTPUT_ROOT/$RUN_NAME"
 DRY_RUN="${DRY_RUN:-false}"
 if [[ "$DRY_RUN" != true && "$DRY_RUN" != false ]]; then echo "DRY_RUN must be true or false" >&2; exit 2; fi
+if [[ -n "${PROMPT_EXPORT_PATH:-}" && -n "${PROMPT_INIT_PATH:-}" ]]; then
+  echo "PROMPT_EXPORT_PATH cannot be combined with PROMPT_INIT_PATH" >&2; exit 2
+fi
+if [[ -n "${PROMPT_EXPORT_REFERENCE:-}" && -z "${PROMPT_EXPORT_PATH:-}" ]]; then
+  echo "PROMPT_EXPORT_REFERENCE requires PROMPT_EXPORT_PATH" >&2; exit 2
+fi
 for directory in "$PRETRAINED_PATH" "$DATASET_ROOT" "$TOKENIZER_PATH"; do
   if [[ ! -d "$directory" ]]; then echo "Directory not found: $directory" >&2; exit 1; fi
 done
@@ -91,6 +100,11 @@ python -m lerobot.scripts.libero_vlm_only "$PRETRAINED_PATH" --kind "$SOURCE" \
   --dataset-root "$DATASET_ROOT" --tokens "$VLM_PROMPT_TOKENS"
 if [[ -n "${PROMPT_INIT_PATH:-}" ]]; then
   python -m lerobot.scripts.export_pi05_prompt_init check "$PROMPT_INIT_PATH" --tokens "$VLM_PROMPT_TOKENS"
+fi
+if [[ -n "${PROMPT_EXPORT_PATH:-}" ]]; then
+  EXPORT_CHECK=(check-export "$PROMPT_EXPORT_PATH" --seed "$SEED" --tokens "$VLM_PROMPT_TOKENS")
+  if [[ -n "${PROMPT_EXPORT_REFERENCE:-}" ]]; then EXPORT_CHECK+=(--reference "$PROMPT_EXPORT_REFERENCE"); fi
+  python -m lerobot.scripts.export_pi05_prompt_init "${EXPORT_CHECK[@]}"
 fi
 TRAIN_ARGS=(
   --policy.path="$PRETRAINED_PATH" --policy.tokenizer_name="$TOKENIZER_PATH"
@@ -111,13 +125,17 @@ TRAIN_ARGS=(
   --wandb.enable=true --wandb.project=prompt-learning --wandb.mode=online --wandb.disable_artifact=true
 )
 if [[ -n "${PROMPT_INIT_PATH:-}" ]]; then TRAIN_ARGS+=(--vlm_prompt_init_path="$PROMPT_INIT_PATH"); fi
+if [[ -n "${PROMPT_EXPORT_PATH:-}" ]]; then TRAIN_ARGS+=(--vlm_prompt_export_path="$PROMPT_EXPORT_PATH"); fi
+if [[ -n "${PROMPT_EXPORT_REFERENCE:-}" ]]; then TRAIN_ARGS+=(--vlm_prompt_export_reference="$PROMPT_EXPORT_REFERENCE"); fi
 if [[ "$SAVE_ONLY_FINAL" == true ]]; then TRAIN_ARGS+=(--save_steps='[]'); fi
 LAUNCH_ARGS=(launch --num_machines=1 --num_processes="$NUM_PROCESSES" --mixed_precision="$PRECISION"
   --main_process_port="$MAIN_PROCESS_PORT" --dynamo_backend=no)
 if (( NUM_PROCESSES > 1 )); then LAUNCH_ARGS+=(--multi_gpu); fi
 echo "source=$SOURCE VLM=$VLM_PROMPT_TOKENS action=0 trainable=$((VLM_PROMPT_TOKENS * 2048)) dtype=$DTYPE"
 echo "GPU_IDS=$GPU_IDS per_device_batch=$BATCH_SIZE global_batch=$((BATCH_SIZE * NUM_PROCESSES)) port=$MAIN_PROCESS_PORT"
-if [[ "$SAVE_ONLY_FINAL" == true ]]; then
+if [[ -n "${PROMPT_EXPORT_PATH:-}" ]]; then
+  echo "initialization only: export=$PROMPT_EXPORT_PATH (0 updates; no optimizer/probes/full checkpoint/W&B)"
+elif [[ "$SAVE_ONLY_FINAL" == true ]]; then
   echo "output=$OUTPUT_DIR (final only=$FLOW_STEPS; no initial/intermediate checkpoints)"
 else
   echo "output=$OUTPUT_DIR (initial=000000, interval=$SAVE_FREQ, final=$FLOW_STEPS)"

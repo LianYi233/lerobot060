@@ -3,7 +3,11 @@
 import argparse
 import json
 
-from lerobot.utils.prompt_initialization import export_initial_prompt, read_initial_prompt
+from lerobot.utils.prompt_initialization import (
+    export_initial_prompt,
+    read_initial_prompt,
+    validate_export_request,
+)
 
 
 def main():
@@ -16,11 +20,19 @@ def main():
     check = commands.add_parser("check", help="Validate a transferred initialization before loading a model")
     check.add_argument("path")
     check.add_argument("--tokens", type=int, required=True)
+    destination = commands.add_parser("check-export", help="Preflight an initialization-only training run")
+    destination.add_argument("output")
+    destination.add_argument("--seed", type=int, required=True)
+    destination.add_argument("--tokens", type=int, required=True)
+    destination.add_argument("--reference")
     args = parser.parse_args()
     if args.command == "export":
         metadata = export_initial_prompt(args.run, args.output, args.expect_seed)
-    else:
+    elif args.command == "check":
         _, metadata = read_initial_prompt(args.path, args.tokens)
+    else:
+        reference = validate_export_request(args.output, args.reference, args.seed, args.tokens)
+        metadata = {"export_preflight": "ok", "historical_reference_supplied": reference is not None}
     print(json.dumps(metadata, indent=2, ensure_ascii=False))
 
 

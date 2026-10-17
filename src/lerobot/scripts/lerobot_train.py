@@ -594,7 +594,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     try:
         if (
-            cfg.prompt_rank.freq > 0 or cfg.vlm_prompt_init_path is not None
+            cfg.prompt_rank.freq > 0
+            or cfg.vlm_prompt_init_path is not None
+            or cfg.vlm_prompt_export_path is not None
         ) and accelerator.distributed_type not in (
             DistributedType.NO,
             DistributedType.MULTI_GPU,
@@ -645,7 +647,7 @@ def _train_single_stage(
         logging.info(pformat(cfg.to_dict()))
 
     # Initialize wandb only on main process
-    if cfg.wandb.enable and cfg.wandb.project and is_main_process:
+    if cfg.wandb.enable and cfg.wandb.project and is_main_process and cfg.vlm_prompt_export_path is None:
         wandb_logger = WandBLogger(cfg)
     else:
         wandb_logger = None
@@ -708,6 +710,13 @@ def _train_single_stage(
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
         )
+
+    if cfg.vlm_prompt_export_path is not None:
+        from lerobot.utils.prompt_initialization import export_constructed_prompt
+
+        # Use exactly the normal seeded dataset/model construction above. No optimizer,
+        # DDP wrapping, rank diagnostics, training updates or full checkpoint writes follow.
+        return export_constructed_prompt(policy, cfg, accelerator)
 
     if cfg.vlm_prompt_init_path is not None and not cfg.resume:
         from lerobot.utils.prompt_initialization import apply_initial_prompt, save_import_record

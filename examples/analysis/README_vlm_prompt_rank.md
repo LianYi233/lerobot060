@@ -99,6 +99,75 @@ effect of the remaining training randomness conditional on this initialization;
 it does not identify Gaussian noise as the sole cause. If it remains poor, add the
 reverse swap (init0/train1) before attributing all failures to initialization.
 
+### Regenerate a missing step-zero prompt without training
+
+If both the original and `pi05-rank-recheck-*` step-zero snapshots are gone,
+`PROMPT_EXPORT_PATH` runs the normal seeded dataset/model construction and source
+weight loading, exports the actual initial VLM prompt, then exits. It does **not**
+create an optimizer, compute rank diagnostics, run training updates, save a full
+checkpoint, or start W&B. The original model and dataset must still be available;
+the deleted trained checkpoint and its `prompt_rank/manifest.json` are not needed.
+
+For token=8, seed0, using the same two-GPU setup as the training controls:
+
+```bash
+env -u PRETRAINED_PATH -u RUN_NAME -u VLM_PROMPT_TOKENS \
+    -u PROMPT_INIT_PATH -u PROMPT_EXPORT_REFERENCE \
+OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+LOG_ROOT=/root/autodl-tmp/logs/vlm-only \
+RUN_PREFIX=pi05-init-rebuild \
+PROMPT_EXPORT_PATH=/root/autodl-fs/wyn/prompt-inits/pi05-base-vlm8-init-seed0.safetensors \
+GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKEN_COUNTS="8" \
+bash examples/training/train_pi05_vlm_only_rank_sweep.sh 0 --wandb.enable=false
+```
+
+Only one source/token count is allowed per export. A pre-existing destination is
+never overwritten. Both ranks check identical prompt hashes; rank0 writes the
+portable file. Success logs `PROMPT_EXPORT ... seed=0 tokens=8 ... 0 optimizer updates`.
+The tensor payload is 64 KiB (8 × 2048 × float32), plus provenance metadata.
+The metadata labels this as `regenerated_training_initialization` and includes the
+source path, current configuration, versions, precision, and actual tensor SHA256.
+Although the ordinary launch configuration still says `steps=3000`, export mode
+returns before the first optimizer update. Normal training is unchanged when the
+export variables are unset.
+
+If the completed `init1/train0` token=8 run still has `prompt_init.json`, add this
+environment assignment to the export command (after the `env -u` options):
+
+```bash
+PROMPT_EXPORT_REFERENCE=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only/pi05-init1-train0-base-vlm8-seed0/prompt_init.json
+```
+
+This compares the regenerated tensor against `replaced_prompt_sha256`: the native
+seed0 prompt **before** that run imported seed1. It deliberately does not compare
+against `loaded_prompt_sha256`, which belongs to the imported seed1 prompt.
+Wrong training seed/token count or a hash mismatch stops the export. A matching
+hash is recorded as `historical_hash_verified=true`. Without this reference the
+new tensor is valid, but matching a seed number alone does not prove it equals the
+deleted historical initialization. Keep the original source weights, model
+configuration, software versions and precision to maximize reproducibility.
+
+Then train the missing init0/train1 experiment with the exported file:
+
+```bash
+env -u PRETRAINED_PATH -u RUN_NAME -u VLM_PROMPT_TOKENS \
+    -u PROMPT_EXPORT_PATH -u PROMPT_EXPORT_REFERENCE \
+OUTPUT_ROOT=/root/autodl-tmp/chkpt/2601-lerobot/vlm-only \
+LOG_ROOT=/root/autodl-tmp/logs/vlm-only \
+RUN_PREFIX=pi05-init0-train1 \
+PROMPT_INIT_PATH=/root/autodl-fs/wyn/prompt-inits/pi05-base-vlm8-init-seed0.safetensors \
+GPU_IDS=0,1 BATCH_SIZE=32 VLM_PROMPT_TOKEN_COUNTS="8" \
+RANK_FREQ=250 RANK_SAMPLES=16 RANK_OUTPUT_PROBES=4 \
+RANK_SEED=2026 RANK_TIMESTEPS='[0.2,0.5,0.8]' \
+bash examples/training/train_pi05_vlm_only_rank_sweep.sh 1 \
+  --wandb.enable=true --wandb.project=prompt-learning \
+  --wandb.mode=online --wandb.disable_artifact=true
+```
+
+This second command really trains 3000 steps and saves only the final full model;
+the first command only regenerates its initialization. Training seed1 still
+controls noise, time sampling, data order and other training randomness together.
+
 ## What is being measured
 
 For fixed observations `x_i`, Gaussian noise `epsilon_i`, and normalized recorded

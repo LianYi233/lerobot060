@@ -9,6 +9,8 @@ Two GPUs (GPU_IDS=0,1), batch 32 per GPU; 3000 updates; only final full checkpoi
 Run names: pi05-base-vlm{1,2,4,8,16,32}-seed1. Existing runs are never overwritten.
 Same inputs/output roots and W&B settings as train_pi05_vlm_only_token_sweep.sh.
 PROMPT_INIT_PATH imports a portable step-zero prompt; select its single token count.
+PROMPT_EXPORT_PATH exports a fresh initial prompt and exits BEFORE optimizer/probes/updates.
+PROMPT_EXPORT_REFERENCE optionally checks an earlier swap's pre-import hash in prompt_init.json.
 The positional SEED still controls data order, flow noise/time and other training randomness.
 
 Fixed-probe diagnostics: step 0, every 250 updates, and the final step.

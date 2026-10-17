@@ -22,6 +22,8 @@ to override inputs. GPU_IDS, BATCH_SIZE, MAIN_PROCESS_PORT and DRY_RUN are suppo
 Extra arguments follow train_pi05_vlm_only.sh, e.g. --wandb.* or --policy.optimizer_lr.
 FLOW_STEPS and SAVE_ONLY_FINAL are fixed here. Use the single-run script to change them.
 RUN_NAME, VLM_PROMPT_TOKENS and PRETRAINED_PATH must be unset for this launcher.
+PROMPT_EXPORT_PATH exports initial prompt only, then exits (select exactly one source/token count).
+PROMPT_EXPORT_REFERENCE optionally checks a previous swap's prompt_init.json before export.
 
 All selected runs preflight before any training starts. Stop on the first failure.
 Existing outputs are never overwritten or silently skipped. Select remaining sources
@@ -47,6 +49,9 @@ for key in RUN_NAME VLM_PROMPT_TOKENS PRETRAINED_PATH; do
 done
 read -r -a TOKEN_COUNTS <<< "${VLM_PROMPT_TOKEN_COUNTS-8 16 32 64}"
 if (( ${#TOKEN_COUNTS[@]} == 0 )); then echo "VLM_PROMPT_TOKEN_COUNTS cannot be empty" >&2; exit 2; fi
+if [[ -n "${PROMPT_EXPORT_PATH:-}" ]] && (( ${#SOURCES[@]} * ${#TOKEN_COUNTS[@]} != 1 )); then
+  echo "PROMPT_EXPORT_PATH requires exactly one source and one token count" >&2; exit 2
+fi
 declare -A SEEN_COUNTS=()
 for count in "${TOKEN_COUNTS[@]}"; do
   if [[ ! "$count" =~ ^[1-9][0-9]*$ ]]; then echo "Invalid VLM token count: $count" >&2; exit 2; fi
@@ -81,7 +86,11 @@ done
 echo "All selected runs passed preflight; output=$OUTPUT_ROOT"
 for source in "${SOURCES[@]}"; do
   for count in "${TOKEN_COUNTS[@]}"; do
-    echo "Starting source=$source VLM=$count (3000 steps, final checkpoint only)"
+    if [[ -n "${PROMPT_EXPORT_PATH:-}" ]]; then
+      echo "Starting initialization export: source=$source VLM=$count seed=$SEED (0 updates)"
+    else
+      echo "Starting source=$source VLM=$count (3000 steps, final checkpoint only)"
+    fi
     if run_one "$source" "$count" "$DRY_RUN"; then
       echo "Completed source=$source VLM=$count dry_run=$DRY_RUN"
     else

@@ -98,6 +98,10 @@ class TrainPipelineConfig(HubMixin):
     # Import an exact step-zero VLM prompt AFTER normal seeded model construction/loading.
     # All other training RNG streams retain `seed`. Ignored on resume; saved weights take precedence.
     vlm_prompt_init_path: str | None = None
+    # Export the normally constructed step-zero prompt, then exit BEFORE any optimizer/probes/updates.
+    vlm_prompt_export_path: str | None = None
+    # Optional prompt_init.json from an earlier swap: verify its replaced (pre-import) prompt hash.
+    vlm_prompt_export_reference: str | None = None
     # Set to True to use deterministic cuDNN algorithms for reproducibility.
     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
     cudnn_deterministic: bool = False
@@ -243,6 +247,37 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.vlm_prompt_export_reference is not None and self.vlm_prompt_export_path is None:
+            raise ValueError("vlm_prompt_export_reference requires vlm_prompt_export_path")
+        if self.vlm_prompt_export_path is not None:
+            if (
+                self.is_reward_model_training
+                or active_cfg.type != "pi05"
+                or not getattr(active_cfg, "vlm_prompt_only", False)
+                or self.resume
+                or self.vlm_prompt_init_path is not None
+                or self.peft is not None
+                or active_cfg.use_peft
+                or active_cfg.compile_model
+                or type(self.seed) is not int
+                or not 0 <= self.seed < 2**32
+                or self.env_eval_freq != 0
+                or getattr(active_cfg, "training_stage", None) != "flow"
+                or getattr(active_cfg, "next_action_pretrain_steps", 0) != 0
+                or getattr(active_cfg, "next_action_bridge_steps", 0) != 0
+            ):
+                raise ValueError(
+                    "vlm_prompt_export_path requires fresh seeded native PI05 VLM-only flow, "
+                    "without prompt import, compile, PEFT, priming, bridge or online evaluation"
+                )
+            from lerobot.utils.prompt_initialization import validate_export_request
+
+            validate_export_request(
+                self.vlm_prompt_export_path,
+                self.vlm_prompt_export_reference,
+                self.seed,
+                active_cfg.num_vlm_prompt_tokens,
+            )
         if self.vlm_prompt_init_path is not None:
             if (
                 self.is_reward_model_training

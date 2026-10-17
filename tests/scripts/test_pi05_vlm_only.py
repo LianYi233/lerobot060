@@ -421,6 +421,53 @@ class VLMOnlyTest(unittest.TestCase):
         self.assertNotEqual(bad.returncode, 0)
         self.assertNotIn("Starting source=", bad.stdout)
 
+    def test_rank_sweep_initialization_export_controls_and_preflight(self):
+        output = self.work / "shared inits/seed0-vlm8.safetensors"
+        reference = self.work / "old swap.json"
+        reference.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_step": 0,
+                    "source_training_seed": 1,
+                    "training_seed": 0,
+                    "num_vlm_prompt_tokens": 8,
+                    "replaced_prompt_sha256": "a" * 64,
+                }
+            )
+        )
+        settings = {
+            "VLM_PROMPT_TOKEN_COUNTS": "8",
+            "RUN_PREFIX": "pi05-init-rebuild",
+            "PROMPT_EXPORT_PATH": str(output),
+            "PROMPT_EXPORT_REFERENCE": str(reference),
+        }
+        result = self.run_script(RANK_SWEEP, "0", **settings)
+        (command,) = self.commands(result)
+        args = dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
+        self.assertEqual(args["seed"], "0")
+        self.assertEqual(args["policy.num_vlm_prompt_tokens"], "8")
+        self.assertEqual(args["vlm_prompt_export_path"], str(output))
+        self.assertEqual(args["vlm_prompt_export_reference"], str(reference))
+        self.assertEqual(args["policy.compile_model"], "false")
+        self.assertIn("0 updates", result.stdout)
+        self.assertNotIn("Starting source=", result.stdout)
+        self.assertFalse(output.exists())
+        self.assertFalse((self.work / "training").exists())
+        for overrides in (
+            {"VLM_PROMPT_TOKEN_COUNTS": "2 8"},
+            {"PROMPT_INIT_PATH": "/seed1.safetensors"},
+            {"PROMPT_EXPORT_REFERENCE": str(self.work / "absent.json")},
+        ):
+            bad = self.run_script(RANK_SWEEP, "0", **{**settings, **overrides})
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertNotIn("Starting initialization export", bad.stdout)
+        output.parent.mkdir()
+        output.write_text("existing initialization")
+        bad = self.run_script(RANK_SWEEP, "0", **settings)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual(output.read_text(), "existing initialization")
+
     def test_token_sweep_selects_remaining_runs_and_rejects_ambiguous_settings(self):
         (command,) = self.commands(
             self.run_script(

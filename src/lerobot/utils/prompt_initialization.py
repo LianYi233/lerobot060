@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -151,3 +152,119 @@ def save_import_record(policy, record: dict, output_dir: str | Path, training_se
     with (output_dir / "prompt_init.json").open("x") as handle:
         json.dump(record, handle, indent=2, ensure_ascii=False, allow_nan=False)
         handle.write("\n")
+
+
+def validate_export_request(output, reference, seed, tokens):
+    """Check an export destination and optional historical PRE-import hash before loading a model."""
+    destination = Path(output)
+    if destination.suffix != ".safetensors":
+        raise ValueError("Prompt export must use a .safetensors filename")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Prompt export already exists: {destination}")
+    if type(seed) is not int or not 0 <= seed < 2**32 or type(tokens) is not int or tokens < 1:
+        raise ValueError("Expected a seed in [0, 2**32) and a positive token count")
+    if reference is None:
+        return None
+    record = json.loads(Path(reference).read_text())
+    digest = record.get("replaced_prompt_sha256")
+    if (
+        record.get("schema_version") != 1
+        or record.get("source_step") != 0
+        or type(record.get("training_seed")) is not int
+        or record["training_seed"] != seed
+        or record.get("num_vlm_prompt_tokens") != tokens
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise ValueError("Reference must be prompt_init.json from a swap with matching TRAINING seed/tokens")
+    return record
+
+
+def constructed_prompt_packet(policy, cfg):
+    """Package the actual initialized tensor; never approximate construction with a standalone randn."""
+    import torch
+
+    if (
+        cfg.resume
+        or cfg.vlm_prompt_init_path is not None
+        or not getattr(policy.config, "vlm_prompt_only", False)
+        or getattr(policy.config, "num_prompt_tokens", None) != 0
+    ):
+        raise ValueError("Export requires fresh VLM-only initialization without resume or prompt import")
+    parameter = policy.model.vlm_prompt_tokens.weight
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    if len(trainable) != 1 or trainable[0] is not parameter:
+        raise ValueError("Only the VLM prompt may be trainable when exporting initialization")
+    tokens = policy.config.num_vlm_prompt_tokens
+    record = validate_export_request(
+        cfg.vlm_prompt_export_path, cfg.vlm_prompt_export_reference, cfg.seed, tokens
+    )
+    prompt = parameter.detach().float().cpu().numpy().copy()
+    validate_array(prompt, tokens)
+    digest = prompt_hash(prompt)
+    if record is not None and digest != record["replaced_prompt_sha256"]:
+        raise ValueError(
+            "Regenerated prompt does not match the historical pre-import initialization: "
+            f"expected {record['replaced_prompt_sha256']}, got {digest}. "
+            "No export was written; check source weights, code, precision and package versions."
+        )
+    metadata = {
+        "schema_version": 1,
+        "source_step": 0,
+        "source_kind": "regenerated_training_initialization",
+        "source_run": str(cfg.output_dir),
+        "source_training_seed": cfg.seed,
+        "source_prompt_init_path": None,
+        "source_pretrained_path": str(policy.config.pretrained_path),
+        "source_forward_precision": policy.config.dtype,
+        "source_prompt_dtype": str(parameter.dtype),
+        "source_train_config": cfg.to_dict(),
+        "torch_version": str(torch.__version__),
+        "numpy_version": np.__version__,
+        "num_vlm_prompt_tokens": tokens,
+        "prompt_sha256": digest,
+        "historical_hash_verified": record is not None,
+    }
+    if record is not None:
+        metadata.update(
+            reference_path=str(Path(cfg.vlm_prompt_export_reference).resolve()),
+            reference_sha256=hashlib.sha256(Path(cfg.vlm_prompt_export_reference).read_bytes()).hexdigest(),
+            reference_replaced_prompt_sha256=record["replaced_prompt_sha256"],
+        )
+    return prompt, metadata
+
+
+def export_constructed_prompt(policy, cfg, accelerator):
+    """All ranks verify identical tensors; only rank zero writes, and all ranks exit together."""
+    import logging
+
+    import torch
+
+    from lerobot.utils.prompt_rank import collective_call
+
+    prompt, metadata = collective_call(accelerator, lambda: constructed_prompt_packet(policy, cfg))
+    digest = torch.tensor(
+        list(bytes.fromhex(metadata["prompt_sha256"])), device=accelerator.device, dtype=torch.uint8
+    )
+    digests = accelerator.gather(digest).reshape(accelerator.num_processes, -1)
+    if not (digests == digests[0]).all().item():
+        raise ValueError("Constructed prompt initialization differs across DDP ranks; no export was written")
+    collective_call(
+        accelerator,
+        lambda: (
+            write_prompt(cfg.vlm_prompt_export_path, prompt, metadata)
+            if accelerator.is_main_process
+            else None
+        ),
+    )
+    if accelerator.is_main_process:
+        logging.info(
+            "PROMPT_EXPORT path=%s seed=%s tokens=%s sha256=%s historical_hash_verified=%s; "
+            "initialization only, 0 optimizer updates, no full checkpoint",
+            cfg.vlm_prompt_export_path,
+            cfg.seed,
+            metadata["num_vlm_prompt_tokens"],
+            metadata["prompt_sha256"],
+            metadata["historical_hash_verified"],
+        )
+    return metadata
