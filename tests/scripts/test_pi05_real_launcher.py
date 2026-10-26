@@ -24,6 +24,7 @@ DROID = ROOT / "examples/training/train_piper_droid.sh"
 DROID_LR = ROOT / "examples/training/train_piper_droid_lr.sh"
 CAPACITY = ROOT / "examples/training/train_piper_capacity.sh"
 PROMPT_ONLY = ROOT / "examples/training/train_piper_prompt_only.sh"
+ACTION_HEAD = ROOT / "examples/training/train_piper_action_head.sh"
 SPEC = importlib.util.spec_from_file_location("real_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -772,6 +773,65 @@ class RealLauncherTest(unittest.TestCase):
         self.assertEqual((len(outputs), len(jobs), len(ports)), (4, 4, 4))
         self.assertFalse((self.work / "prompt output").exists())
         self.assertFalse((self.work / "prompt log").exists())
+
+    def test_full_action_head_history_launch_and_lr_overrides(self):
+        for extra, history, peak, floor, scale in (
+            ({}, 20, "0.0001", "0.00001", "0.1"),
+            ({"GRIPPER_HISTORY_STEPS": "0", "PROMPT_LR": "0.00005",
+              "PROMPT_FINAL_LR": "0.000005", "ACTION_EXPERT_LR_SCALE": "0.2"},
+             0, "0.00005", "0.000005", "0.2"),
+        ):
+            with self.subTest(history=history):
+                result = self.run_autodl(
+                    "1", "128", "0", script=ACTION_HEAD,
+                    PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+                    OUTPUT_ROOT=str(self.work / "head output"), LOG_ROOT=str(self.work / "head log"),
+                    GPU_IDS="2,3", NUM_PROCESSES="1", MAIN_PROCESS_PORT="30428",
+                    EXPERT_LAST_N_LAYERS="4", FIT_EPISODES="[0]", CHUNK_SIZE="50", **extra,
+                )
+                (command,) = self.command_args(result)
+                for arg in (
+                    "--policy.train_action_head=true", "--policy.train_action_projections=true",
+                    "--policy.train_action_expert_last_n_layers=0", "--policy.cabo_enabled=false",
+                    "--policy.use_peft=false", "--policy.next_action_pretrain_steps=0",
+                    "--policy.next_action_bridge_steps=0", "--policy.num_vlm_prompt_tokens=128",
+                    "--policy.num_prompt_tokens=128", f"--policy.piper_gripper_history_steps={history}",
+                    f"--policy.optimizer_lr={peak}", f"--policy.scheduler_decay_lr={floor}",
+                    f"--policy.action_expert_lr_scale={scale}", "--batch_size=32",
+                    "--steps=12000", "--save_steps=[6000,9000,12000]", "--policy.chunk_size=16",
+                    "--dataset.eval_split=0.1", "--piper_eval.freq=500", "--piper_eval.samples=128",
+                    "--policy.gradient_checkpointing=true", "--policy.compile_model=false",
+                    "--num_processes=2", "--multi_gpu", "CUDA_VISIBLE_DEVICES=2,3",
+                    "--main_process_port=30428",
+                    f"--policy.pretrained_path={self.work / 'models/pi05_base'}",
+                ):
+                    self.assertIn(arg, command)
+                self.assertFalse(any(arg.startswith("--dataset.episodes=") for arg in command))
+                output = next(arg for arg in command if arg.startswith("--output_dir="))
+                self.assertIn(f"full-action-head-t128-b32-history{history}", output)
+                keys = [arg.split("=", 1)[0] for arg in command if arg.startswith("--")]
+                self.assertEqual(len(keys), len(set(keys)))
+        self.assertFalse((self.work / "head output").exists())
+        self.assertFalse((self.work / "head log").exists())
+
+    def test_full_action_head_rejects_bad_lr_and_preserves_existing_run(self):
+        for extra in ({"ACTION_EXPERT_LR_SCALE": "nan"}, {"ACTION_EXPERT_LR_SCALE": "2"},
+                      {"PROMPT_LR": "0"}, {"GRIPPER_HISTORY_STEPS": "19"}):
+            result = self.run_autodl(
+                "1", "128", "0", script=ACTION_HEAD,
+                PRETRAINED_PATH=str(self.work / "models/pi05_base"), **extra,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Launching:", result.stdout)
+        run = (self.work / "head output/full-action-head-t128-b32-history20"
+               / f"pi05-may-{MODULE.TASKS['1']}-dual_prompt_only-seed0")
+        self.touch(run / "keep.txt")
+        result = self.run_autodl(
+            "1", "128", "0", script=ACTION_HEAD, OUTPUT_ROOT=str(self.work / "head output"),
+            PRETRAINED_PATH=str(self.work / "models/pi05_base"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((run / "keep.txt").is_file())
 
     def test_prompt_only_control_batch_lr_and_budget_overrides(self):
         outputs = []

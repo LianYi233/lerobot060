@@ -858,6 +858,8 @@ def _train_single_stage(
             "action_prompt": 0,
             "action_projection": 0,
             "action_expert_blocks": 0,
+            "action_expert_norm": 0,
+            "action_time_mlp": 0,
             "other": 0,
         }
         logging.info("========== Trainable parameter report ==========")
@@ -874,6 +876,10 @@ def _train_single_stage(
                 _category = "action_projection"
             elif "gemma_expert.model.layers." in _name:
                 _category = "action_expert_blocks"
+            elif "gemma_expert.model.norm." in _name:
+                _category = "action_expert_norm"
+            elif any(part in _name.split(".") for part in ("time_mlp_in", "time_mlp_out")):
+                _category = "action_time_mlp"
             else:
                 _category = "other"
             _parameter_counts[_category] += _count
@@ -1076,6 +1082,8 @@ def _train_single_stage(
             {
                 "training_stage": str(active_cfg.training_stage),
                 "train_action_projections": getattr(active_cfg, "train_action_projections", False),
+                "train_action_head": getattr(active_cfg, "train_action_head", False),
+                "piper_gripper_history_steps": getattr(active_cfg, "piper_gripper_history_steps", 0),
                 "train_action_expert_last_n_layers": getattr(
                     active_cfg, "train_action_expert_last_n_layers", 0
                 ),

@@ -30,6 +30,10 @@ action loss。它只读取自身；action prompt 和 action 查询可以读取�
 
 冻结的 action 投影并非专门为状态/历史向量预训练，因此这种复用是否有效需要实验验证。
 
+需要扩大动作侧可训练容量时，使用独立的
+[完整 action head 实验](README_ACTION_HEAD.md)：保留 history20，解冻 action expert、投影、
+时间 MLP 和 final norm。原 prompt-only 启动器的冻结规则不变。
+
 ## 训练与部署的数据约定
 
 - 训练仅取同一 episode 中当前帧之前的 `action[..., gripper_index]`，不含当前或未来标签。

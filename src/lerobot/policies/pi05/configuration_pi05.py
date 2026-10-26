@@ -64,6 +64,10 @@ class PI05Config(PreTrainedConfig):
     # Explicit Piper capacity experiment; 0 preserves every existing prompt-only checkpoint.
     # Unfreeze only the last N action transformer blocks, not the VLM or time/final-norm maps.
     train_action_expert_last_n_layers: int = 0
+    # Full continuous-action head: every expert block, final adaptive norm, time MLPs,
+    # and action input/output maps. VLM/vision and the unused expert LM head stay frozen.
+    # Explicit opt-in; last-N mode must be 0 to avoid ambiguous checkpoint metadata.
+    train_action_head: bool = False
     action_expert_lr_scale: float = 0.1
 
     # Opt-in Piper experiment. Refit state/action statistics on the selected training split.
@@ -217,7 +221,10 @@ class PI05Config(PreTrainedConfig):
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
         self.train_expert_only = True
-        if type(self.piper_gripper_history_steps) is not int or self.piper_gripper_history_steps not in (0, 20):
+        if type(self.piper_gripper_history_steps) is not int or self.piper_gripper_history_steps not in (
+            0,
+            20,
+        ):
             raise ValueError("piper_gripper_history_steps must be 0 (off) or 20")
         if self.piper_gripper_history_steps and (
             not self.piper_train_normalization
@@ -243,6 +250,16 @@ class PI05Config(PreTrainedConfig):
             raise ValueError("train_action_expert_last_n_layers must be an integer between 0 and 18")
         if not math.isfinite(self.action_expert_lr_scale) or not 0 < self.action_expert_lr_scale <= 1:
             raise ValueError("action_expert_lr_scale must be finite and in (0, 1]")
+        if self.train_action_head and (
+            self.train_action_expert_last_n_layers != 0
+            or not self.train_action_projections
+            or self.cabo_enabled
+            or self.use_peft
+        ):
+            raise ValueError(
+                "train_action_head requires train_action_projections=True, "
+                "train_action_expert_last_n_layers=0, cabo_enabled=False and use_peft=False"
+            )
         if self.train_action_expert_last_n_layers and (
             self.cabo_enabled or self.use_peft or not self.train_action_projections
         ):

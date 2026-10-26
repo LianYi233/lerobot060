@@ -236,7 +236,9 @@ class PiperActionEvaluator:
             manifest["sampling"] = options.sampling
         if getattr(policy_config, "piper_gripper_history_steps", 0):
             manifest["gripper_history"] = "20 recorded past actions t-20..t-1; initial measured state padding"
-            manifest["history_evaluation"] = "teacher-forced recorded past actions, not closed-loop predictions"
+            manifest["history_evaluation"] = (
+                "teacher-forced recorded past actions, not closed-loop predictions"
+            )
         if getattr(policy_config, "piper_train_normalization", False):
             manifest["action_representation"] = (
                 "relative_joints_absolute_gripper" if policy_config.use_relative_actions else "absolute"
@@ -387,13 +389,20 @@ class ActionParameterMonitor:
             name: list(getattr(policy.model, name).parameters())
             for name in ("vlm_prompt_tokens", "prompt_tokens", "action_in_proj", "action_out_proj")
         }
-        if getattr(getattr(policy, "config", None), "train_action_expert_last_n_layers", 0):
+        full_head = getattr(getattr(policy, "config", None), "train_action_head", False)
+        if full_head or getattr(getattr(policy, "config", None), "train_action_expert_last_n_layers", 0):
             self.groups["action_expert_blocks"] = [
                 parameter
                 for block in policy.model.trainable_expert_blocks()
                 for parameter in block.parameters()
                 if parameter.requires_grad
             ]
+        if full_head:
+            for name in ("time_mlp_in", "time_mlp_out"):
+                self.groups[name] = list(getattr(policy.model, name).parameters())
+            self.groups["action_expert_norm"] = list(
+                policy.model.paligemma_with_expert.gemma_expert.model.norm.parameters()
+            )
 
     def before_step(self):
         import torch

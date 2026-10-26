@@ -239,7 +239,9 @@ class TrainPipelineConfig(HubMixin):
         if getattr(active_cfg, "piper_train_normalization", False) and (
             self.dataset.streaming or self.rename_map or self.peft is not None
         ):
-            raise ValueError("Piper train normalization requires a non-streaming dataset without renames/PEFT")
+            raise ValueError(
+                "Piper train normalization requires a non-streaming dataset without renames/PEFT"
+            )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "
@@ -247,8 +249,8 @@ class TrainPipelineConfig(HubMixin):
             )
         if (
             getattr(active_cfg, "train_action_expert_last_n_layers", 0)
-            and not self.use_policy_training_preset
-        ):
+            or getattr(active_cfg, "train_action_head", False)
+        ) and not self.use_policy_training_preset:
             raise ValueError("Action expert LR groups require use_policy_training_preset=True")
 
         if self.piper_eval.enabled:

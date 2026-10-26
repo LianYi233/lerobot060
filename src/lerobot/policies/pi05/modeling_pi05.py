@@ -812,7 +812,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self._freeze_backbones()
 
     def _freeze_backbones(self) -> None:
-        """Enforce the explicit prompt / projection / last-expert-block partition.
+        """Enforce the explicit prompt / projection / expert adaptation partition.
 
         Preserve PEFT's active modules_to_save selection: its original prompt copies must stay
         frozen. Autograd remains enabled through both backbones to reach the input prompts.
@@ -823,6 +823,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             trainable_modules.extend([self.action_in_proj, self.action_out_proj])
         expert_blocks = self.trainable_expert_blocks()
         trainable_modules.extend(expert_blocks)
+        if getattr(self.config, "train_action_head", False):
+            trainable_modules.extend(self.trainable_action_head_modules())
         for module in trainable_modules:
             modules_to_save = getattr(module, "modules_to_save", None)
             if modules_to_save is None:
@@ -849,8 +851,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.eval()
         for block in expert_blocks:
             block.train(self.training)
+        if getattr(self.config, "train_action_head", False):
+            self.paligemma_with_expert.gemma_expert.model.train(self.training)
+
+    def trainable_action_head_modules(self) -> list[nn.Module]:
+        """Modules used by continuous-action prediction; never the unused text LM head."""
+        return [
+            self.paligemma_with_expert.gemma_expert.model,
+            self.action_in_proj,
+            self.action_out_proj,
+            self.time_mlp_in,
+            self.time_mlp_out,
+        ]
 
     def trainable_expert_blocks(self) -> list[nn.Module]:
+        if getattr(self.config, "train_action_head", False):
+            return list(self.paligemma_with_expert.gemma_expert.model.layers)
         count = getattr(self.config, "train_action_expert_last_n_layers", 0)
         if count == 0:
             return []
@@ -1765,6 +1781,19 @@ class PI05Policy(PreTrainedPolicy):
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
                 raise ValueError("PI05 training requires trainable prompts or explicit action projections")
+            if getattr(self.config, "train_action_head", False):
+                head = _unique_trainable_parameters(self.model.trainable_action_head_modules())
+                head_ids = {id(parameter) for parameter in head}
+                prompts = [p for p in parameters if id(p) not in head_ids]
+                groups = [{"params": prompts, "name": "prompts"}] if prompts else []
+                groups.append(
+                    {
+                        "params": head,
+                        "name": "action_head",
+                        "lr": self.config.optimizer_lr * self.config.action_expert_lr_scale,
+                    }
+                )
+                return groups
             if getattr(self.config, "train_action_expert_last_n_layers", 0):
                 expert = _unique_trainable_parameters(self.model.trainable_expert_blocks())
                 expert_ids = {id(parameter) for parameter in expert}

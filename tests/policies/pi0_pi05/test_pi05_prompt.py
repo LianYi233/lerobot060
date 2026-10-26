@@ -200,6 +200,135 @@ def test_projection_adaptation_rejects_prompt_only_cabo_and_peft():
         policy.wrap_with_peft()
 
 
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_full_action_head_history_gradients_updates_and_reload(gradient_checkpointing, tmp_path):
+    from lerobot.utils.piper_gripper_history import CONTEXT_KEY
+    from lerobot.utils.piper_training_eval import ActionParameterMonitor
+
+    cfg = _config(
+        train_action_head=True,
+        train_action_projections=True,
+        cabo_enabled=False,
+        max_action_dim=32,
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+        piper_gripper_history_steps=20,
+        piper_train_normalization=True,
+        next_action_pretrain_steps=0,
+        next_action_bridge_steps=0,
+        gradient_checkpointing=gradient_checkpointing,
+        optimizer_lr=1e-3,
+    )
+    policy = PI05Policy(cfg)
+    # eval()/train(), including external unfreezing, must preserve the exact partition.
+    policy.requires_grad_(True)
+    policy.eval().train()
+    head_prefixes = (
+        "model.paligemma_with_expert.gemma_expert.model.layers.",
+        "model.paligemma_with_expert.gemma_expert.model.norm.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+        "model.time_mlp_in.",
+        "model.time_mlp_out.",
+    )
+    for name, parameter in policy.named_parameters():
+        assert parameter.requires_grad == (name in _PROMPT_KEYS or name.startswith(head_prefixes)), name
+    backbone = policy.model.paligemma_with_expert
+    assert not backbone.paligemma.training
+    assert backbone.gemma_expert.model.training
+    before = {name: tensor.clone() for name, tensor in policy.state_dict().items()}
+    optimizer = torch.optim.AdamW(policy.get_optim_params(), lr=cfg.optimizer_lr, weight_decay=0)
+    assert [g["name"] for g in optimizer.param_groups] == ["prompts", "action_head"]
+    assert {id(p) for p in optimizer.param_groups[0]["params"]} == {
+        id(p) for name, p in policy.named_parameters() if name in _PROMPT_KEYS
+    }
+    grouped = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    assert len(grouped) == len(set(grouped))
+    assert set(grouped) == {id(p) for p in policy.parameters() if p.requires_grad}
+    scheduler = cfg.get_scheduler_preset().build(optimizer, 3000)
+    assert optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    inputs = _inputs()
+    policy._preprocess_images = lambda _: (inputs["images"], inputs["img_masks"])
+    context = torch.randn(2, 32)
+    context[:, 27:] = 0
+    batch = {
+        ACTION: torch.randn(2, _HORIZON, 7),
+        "action_is_pad": torch.zeros(2, _HORIZON, dtype=torch.bool),
+        OBS_LANGUAGE_TOKENS: inputs["tokens"],
+        OBS_LANGUAGE_ATTENTION_MASK: inputs["masks"],
+        CONTEXT_KEY: context,
+    }
+    loss, _ = policy(batch)
+    loss.backward()
+    # Fresh tiny AdaRMS weights start at zero (no downloaded base weights here).
+    # One update opens their time-conditioning path; check time-MLP gradients on step two.
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    loss, _ = policy(batch)
+    loss.backward()
+    for name, parameter in policy.named_parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        else:
+            assert parameter.grad is None, name
+    monitor = ActionParameterMonitor(policy)
+    monitor.before_step()
+    for group in ("action_expert_blocks", "action_expert_norm", "time_mlp_in", "time_mlp_out"):
+        assert monitor.metrics[f"action_update/{group}/grad_rms"] > 0
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    after = policy.state_dict()
+    for prefix in head_prefixes:
+        assert any(not torch.equal(before[n], after[n]) for n in after if n.startswith(prefix)), prefix
+    for name, parameter in policy.named_parameters():
+        if not parameter.requires_grad:
+            torch.testing.assert_close(before[name], after[name], atol=0, rtol=0)
+    policy.eval()
+    noise = torch.randn(2, _HORIZON, 32)
+    predicted = policy.predict_action_chunk(batch, noise=noise, num_steps=2)
+    assert predicted.shape == (2, _HORIZON, 7) and torch.isfinite(predicted).all()
+    directory = tmp_path / "checkpoint"
+    _save_checkpoint(directory, policy)
+    cfg.save_pretrained(directory)
+    loaded_cfg = PreTrainedConfig.from_pretrained(directory, local_files_only=True)
+    assert loaded_cfg.train_action_head and loaded_cfg.piper_gripper_history_steps == 20
+    reloaded = PI05Policy.from_pretrained(directory, config=loaded_cfg, strict=True).eval()
+    reloaded._preprocess_images = policy._preprocess_images
+    torch.testing.assert_close(
+        reloaded.predict_action_chunk(batch, noise=noise, num_steps=2), predicted, atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"train_action_projections": False},
+        {"cabo_enabled": True},
+        {"use_peft": True},
+        {"train_action_expert_last_n_layers": 18},
+    ],
+)
+def test_full_action_head_rejects_conflicting_modes(options):
+    base = {"train_action_head": True, "train_action_projections": True, "cabo_enabled": False}
+    base.update(options)
+    with pytest.raises(ValueError, match="train_action_head"):
+        _config(**base)
+
+
+def test_old_config_defaults_to_frozen_action_head(tmp_path):
+    import json
+
+    cfg = _config()
+    cfg.save_pretrained(tmp_path)
+    path = tmp_path / "config.json"
+    old = json.loads(path.read_text())
+    old.pop("train_action_head")
+    path.write_text(json.dumps(old))
+    loaded = PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
+    assert not loaded.train_action_head
+    assert {name for name, p in PI05Policy(loaded).named_parameters() if p.requires_grad} == _PROMPT_KEYS
+
+
 @pytest.mark.parametrize("phase", ["action_only", "bridge", "flow"])
 def test_last_expert_block_adaptation_updates_and_reloads(phase, monkeypatch, tmp_path):
     cfg = _config(
