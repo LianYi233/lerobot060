@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TRAIN_LAUNCHER = ROOT / "examples/training/train_pi05_revision_4000.sh"
 EVAL_LAUNCHER = ROOT / "run_eval_pi05_revision_4000.sh"
+MULTI_LAUNCHER = ROOT / "examples/training/launch_pi05_revision_4gpu.sh"
 
 
 class Revision4000LauncherTest(unittest.TestCase):
@@ -63,11 +64,12 @@ class Revision4000LauncherTest(unittest.TestCase):
 
     def test_every_variant_has_exactly_4000_total_updates(self):
         cases = (
-            ("direct_dual", 4000, 0, 0, "true"),
-            ("dual_prompt_only", 4000, 0, 0, "false"),
-            ("full_reference", 3000, 1000, 250, "true"),
+            ("direct_dual", 4000, 0, 0, "true", "0.0"),
+            ("dual_prompt_only", 4000, 0, 0, "false", "0.0"),
+            ("full_reference", 3000, 1000, 250, "true", "0.0"),
+            ("action_flow_warmup", 3000, 1000, 250, "true", "1.0"),
         )
-        for variant, flow, pretrain, bridge, cabo in cases:
+        for variant, flow, pretrain, bridge, cabo, full_mask_probability in cases:
             with self.subTest(variant=variant):
                 cmd, stdout = self.dry_run_args(variant)
                 for arg in (
@@ -75,6 +77,7 @@ class Revision4000LauncherTest(unittest.TestCase):
                     f"--policy.next_action_pretrain_steps={pretrain}",
                     f"--policy.next_action_bridge_steps={bridge}",
                     f"--policy.cabo_enabled={cabo}",
+                    f"--policy.next_action_full_mask_probability={full_mask_probability}",
                     "--policy.num_prompt_tokens=16",
                     "--policy.num_vlm_prompt_tokens=16",
                     "--save_freq=1000",
@@ -98,6 +101,7 @@ class Revision4000LauncherTest(unittest.TestCase):
             "--steps=3000",
             "--policy.next_action_pretrain_steps=1000",
             "--policy.next_action_bridge_steps=250",
+            "--policy.next_action_full_mask_probability=1.0",
             "--policy.cabo_enabled=false",
             "--policy.num_prompt_tokens=32",
             "--seed=999",
@@ -131,7 +135,11 @@ class Revision4000LauncherTest(unittest.TestCase):
     def test_eval_resolves_correct_cumulative_checkpoint_without_starting_gpu(self):
         # Intentionally use missing checkpoint directories: the existing eval
         # script must print its selected path and exit before importing torch.
-        for variant, checkpoint in (("direct_dual", "004000"), ("full_reference", "003000")):
+        for variant, checkpoint in (
+            ("direct_dual", "004000"),
+            ("full_reference", "003000"),
+            ("action_flow_warmup", "003000"),
+        ):
             with self.subTest(variant=variant):
                 result = subprocess.run(
                     ["bash", str(EVAL_LAUNCHER), variant, "libero_10", "1"],
@@ -155,6 +163,36 @@ class Revision4000LauncherTest(unittest.TestCase):
                 )
                 self.assertIn(str(expected), result.stdout)
                 self.assertIn("ERROR: checkpoint not found", result.stdout)
+
+    def test_four_gpu_launcher_schedules_only_remaining_three_by_default(self):
+        result = subprocess.run(
+            ["bash", str(MULTI_LAUNCHER), "others", "0"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GPU 1: dual_prompt_only", result.stdout)
+        self.assertIn("GPU 2: full_reference", result.stdout)
+        self.assertIn("GPU 3: action_flow_warmup", result.stdout)
+        self.assertNotIn("GPU 0: direct_dual", result.stdout)
+        for gpu in (1, 2, 3):
+            self.assertIn(f"CUDA_VISIBLE_DEVICES={gpu}", result.stdout)
+        self.assertFalse((self.work / "checkpoints").exists())
+        self.assertFalse((self.work / "logs").exists())
+
+    def test_four_gpu_preflight_refuses_existing_checkpoints(self):
+        (self.work / "checkpoints" / "pi05-revision-full_reference-seed0-total4000").mkdir(parents=True)
+        result = subprocess.run(
+            ["bash", str(MULTI_LAUNCHER), "others", "0"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Output already exists", result.stderr)
 
 
 if __name__ == "__main__":

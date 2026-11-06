@@ -10,6 +10,7 @@ Variants:
   no_bridge         1000 inpainting + 0 bridge + 3000 flow, dual prompts, CABO
   direct_dual       0 pretraining + 3000 flow, dual prompts, CABO
   dual_prompt_only  0 pretraining + 3000 flow, dual prompts, CABO off
+  action_flow_warmup 750 full-mask action-only flow + 250 bridge + 3000 flow, dual prompts, CABO
   vlm_only          0 pretraining + 3000 flow, VLM prompt only, CABO off
   action_only       0 pretraining + 3000 flow, action prompt only, CABO off
   no_cabo           750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO off
@@ -46,6 +47,7 @@ ACTION_PROMPT_TOKENS=16
 CABO_ENABLED=true
 PRETRAIN_STEPS=1000
 BRIDGE_STEPS=250
+FULL_MASK_PROBABILITY=0.0
 FLOW_STEPS_OVERRIDE="${FLOW_STEPS:-}"
 FLOW_STEPS_DEFAULT=3000
 SAVE_FREQ_DEFAULT=3000
@@ -67,6 +69,11 @@ case "${VARIANT}" in
     PRETRAIN_STEPS=0
     BRIDGE_STEPS=0
     CABO_ENABLED=false
+    ;;
+  action_flow_warmup)
+    # All valid action positions are masked, so Stage 1 has no visible action
+    # context: unconditional action-only flow matching on the same demos.
+    FULL_MASK_PROBABILITY=1.0
     ;;
   vlm_only)
     PRETRAIN_STEPS=0
@@ -162,6 +169,7 @@ TRAIN_ARGS=(
   --policy.next_action_pretrain_steps="${PRETRAIN_STEPS}"
   --policy.next_action_bridge_steps="${BRIDGE_STEPS}"
   --policy.next_action_masked_steps="${MASKED_STEPS}"
+  --policy.next_action_full_mask_probability="${FULL_MASK_PROBABILITY}"
   --policy.ntk_save_stage_snapshots="${NTK_SAVE_STAGE_SNAPSHOTS}"
   --policy.cabo_enabled="${CABO_ENABLED}"
   --policy.cabo_prompt_update_ratio="${CABO_RATIO}"
@@ -185,7 +193,7 @@ if (( NUM_PROCESSES > 1 )); then
 fi
 
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
-echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
+echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED} full_mask_probability=${FULL_MASK_PROBABILITY}"
 echo "output=${OUTPUT_DIR}"
 echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
 if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then

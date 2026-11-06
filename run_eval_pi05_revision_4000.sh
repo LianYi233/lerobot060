@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: bash run_eval_pi05_revision_4000.sh VARIANT [all|no10|SUITE] [SEED]
 
-VARIANT: direct_dual, dual_prompt_only, full_reference
+VARIANT: direct_dual, dual_prompt_only, full_reference, action_flow_warmup
 Default suites: all four standard LIBERO suites; default seed: 0.
 Direct variants evaluate flow checkpoint 004000, and full_reference evaluates
 flow checkpoint 003000. Both represent 4,000 total optimizer updates.
@@ -33,7 +33,7 @@ fi
 
 case "$VARIANT" in
   direct_dual|dual_prompt_only) STEP=4000 ;;
-  full_reference) STEP=3000 ;;
+  full_reference|action_flow_warmup) STEP=3000 ;;
   *)
     echo "Unknown revision variant: $VARIANT" >&2
     usage >&2
@@ -42,8 +42,8 @@ case "$VARIANT" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT:-/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000}}"
-export BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-fs/wyn/eval/2601-lerobot/revision-4000}"
+export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT:-/root/autodl-tmp/wyn/chkpt/2601-lerobot/revision-4000}}"
+export BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-tmp/wyn/eval/2601-lerobot/revision-4000}"
 export RUN_NAME_OVERRIDE="pi05-revision-${VARIANT}-seed${SEED}-total4000"
 export EVAL_STEP="$STEP"
 

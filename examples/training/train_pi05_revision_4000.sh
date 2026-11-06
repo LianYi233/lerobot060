@@ -12,6 +12,7 @@ Variants (each uses exactly 4,000 cumulative optimizer updates):
   direct_dual       0 SAP + 0 bridge + 4000 flow, dual prompts, CPC on
   dual_prompt_only  0 SAP + 0 bridge + 4000 flow, dual prompts, CPC off
   full_reference    750 SAP + 250 bridge + 3000 flow, dual prompts, CPC on
+  action_flow_warmup 750 full-mask action flow + 250 bridge + 3000 flow, CPC on
 
 The formal flow checkpoints are 004000 for direct_dual/dual_prompt_only,
 and 003000 for full_reference (both represent 4,000 total updates).
@@ -46,7 +47,7 @@ case "$VARIANT" in
     PRETRAIN_UPDATES=0
     BRIDGE_UPDATES=0
     ;;
-  full_reference)
+  full_reference|action_flow_warmup)
     FLOW_UPDATES=3000
     PRETRAIN_UPDATES=1000
     BRIDGE_UPDATES=250
@@ -67,6 +68,7 @@ for arg in "$@"; do
     --policy.training_stage|--policy.training_stage=*|\
     --policy.next_action_pretrain_steps|--policy.next_action_pretrain_steps=*|\
     --policy.next_action_bridge_steps|--policy.next_action_bridge_steps=*|\
+    --policy.next_action_full_mask_probability|--policy.next_action_full_mask_probability=*|\
     --policy.cabo_enabled|--policy.cabo_enabled=*|\
     --policy.num_prompt_tokens|--policy.num_prompt_tokens=*|\
     --policy.num_vlm_prompt_tokens|--policy.num_vlm_prompt_tokens=*)
@@ -88,8 +90,8 @@ export RUN_NAME="pi05-revision-${VARIANT}-seed${SEED}-total4000"
 export DATASET_ROOT="${DATASET_ROOT:-/root/autodl-fs/datasets/libero}"
 export PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-fs/ckpt/pi05_libero_base}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-/root/autodl-fs/ckpt/google/paligemma-3b-pt-224}"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000}"
-export LOG_ROOT="${LOG_ROOT:-/root/autodl-fs/wyn/logs/revision-4000}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/wyn/chkpt/2601-lerobot/revision-4000}"
+export LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/wyn/logs/revision-4000}"
 export SAVE_FREQ=1000
 # Stage snapshots are diagnostic only; disable their extra I/O for all groups.
 export NTK_SAVE_STAGE_SNAPSHOTS=false
@@ -98,5 +100,9 @@ printf 'revision-4000: variant=%s seed=%s SAP=%d bridge=%d flow=%d total=%d CPC=
   "$VARIANT" "$SEED" "$((PRETRAIN_UPDATES - BRIDGE_UPDATES))" "$BRIDGE_UPDATES" \
   "$FLOW_UPDATES" "$TOTAL_UPDATES" \
   "$(if [[ "$VARIANT" == dual_prompt_only ]]; then echo false; else echo true; fi)"
+
+if [[ "$VARIANT" == action_flow_warmup ]]; then
+  echo "revision-4000: action-only Stage 1 uses full-mask flow matching (no visible action context), not SAP inpainting"
+fi
 
 exec bash "$SCRIPT_DIR/train_pi05_prompt_ablation.sh" "$VARIANT" "$SEED" "$@"
