@@ -42,8 +42,8 @@ case "$VARIANT" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/revision-4000}}"
-export BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-tmp/eval/2601-lerobot/revision-4000}"
+export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT:-/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000}}"
+export BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-fs/wyn/eval/2601-lerobot/revision-4000}"
 export RUN_NAME_OVERRIDE="pi05-revision-${VARIANT}-seed${SEED}-total4000"
 export EVAL_STEP="$STEP"
 

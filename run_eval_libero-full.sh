@@ -60,7 +60,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 unset MUJOCO_EGL_DEVICE_ID || true
-export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-/home/wyn/.libero}"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${HOME}/.libero}"
 export PYTHONUNBUFFERED=1
 
 CKPT_ROOT="${CKPT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"

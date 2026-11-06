@@ -17,8 +17,9 @@ The formal flow checkpoints are 004000 for direct_dual/dual_prompt_only,
 and 003000 for full_reference (both represent 4,000 total updates).
 The default checkpoint/log roots are isolated under revision-4000.
 
-Override DATASET_ROOT, PRETRAINED_PATH, TOKENIZER_PATH and other shared
-environment settings as needed. DRY_RUN=true prints the underlying command;
+Defaults for DATASET_ROOT and PRETRAINED_PATH use the user's /root/autodl-fs
+mount. Override TOKENIZER_PATH if the tokenizer has also moved, and override
+other shared environment settings as needed. DRY_RUN=true prints the command;
 the source launcher still checks that the three input directories exist.
 EOF
 }
@@ -84,8 +85,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export FLOW_STEPS="$FLOW_UPDATES"
 export RUN_NAME="pi05-revision-${VARIANT}-seed${SEED}-total4000"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/revision-4000}"
-export LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/logs/revision-4000}"
+export DATASET_ROOT="${DATASET_ROOT:-/root/autodl-fs/datasets/libero}"
+export PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-fs/ckpt/pi05_libero_base}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000}"
+export LOG_ROOT="${LOG_ROOT:-/root/autodl-fs/wyn/logs/revision-4000}"
 export SAVE_FREQ=1000
 # Stage snapshots are diagnostic only; disable their extra I/O for all groups.
 export NTK_SAVE_STAGE_SNAPSHOTS=false

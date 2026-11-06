@@ -19,16 +19,22 @@ uses the **four** LIBERO suites and identical evaluation seeds and episodes.
 
 ## Training
 
-Checkout the `revision` branch, activate the same LeRobot environment used for
-the original experiment, and set paths to the **same** standard LIBERO dataset,
-π0.5 starting checkpoint, and tokenizer for all variants. For example:
+Checkout the `revision` branch and activate the same LeRobot environment used
+for the original experiment. The current defaults are:
+
+| Variable | Default path |
+| --- | --- |
+| `DATASET_ROOT` | `/root/autodl-fs/datasets/libero` |
+| `PRETRAINED_PATH` | `/root/autodl-fs/ckpt/pi05_libero_base` |
+| `OUTPUT_ROOT` | `/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000` |
+| `LOG_ROOT` | `/root/autodl-fs/wyn/logs/revision-4000` |
+
+The tokenizer path **has not been confirmed**: the underlying launcher still
+defaults to `/root/autodl-tmp/models/google/paligemma-3b-pt-224`. If yours has
+moved, set `TOKENIZER_PATH` explicitly. For example:
 
 ```bash
-export DATASET_ROOT=/path/to/standard/libero
-export PRETRAINED_PATH=/path/to/pi05_libero_base
-export TOKENIZER_PATH=/path/to/paligemma-3b-pt-224
-export OUTPUT_ROOT=/path/to/checkpoints/revision-4000
-export LOG_ROOT=/path/to/logs/revision-4000
+export TOKENIZER_PATH=/actual/path/to/paligemma-3b-pt-224
 export GPU_IDS=0
 
 DRY_RUN=true bash examples/training/train_pi05_revision_4000.sh direct_dual 0
@@ -48,13 +54,14 @@ checkpoint, its score is not an apples-to-apples comparison.
 
 ## Evaluation
 
-Use the same `OUTPUT_ROOT` from training (or set `CKPT_ROOT` explicitly), and
-the same `EPISODES_PER_TASK`, environment seeds, and evaluation software for
-all three variants:
+Use the same checkpoint root as training (the default below, or set
+`CKPT_ROOT` to your overridden `OUTPUT_ROOT`), and the same
+`EPISODES_PER_TASK`, environment seeds, and evaluation software for all three
+variants:
 
 ```bash
-export CKPT_ROOT="$OUTPUT_ROOT"
-export BASE_OUTPUT=/path/to/eval/revision-4000
+export CKPT_ROOT=/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000
+export BASE_OUTPUT=/root/autodl-fs/wyn/eval/2601-lerobot/revision-4000
 export GPU_ID=0
 export EPISODES_PER_TASK=10
 
@@ -68,6 +75,15 @@ resume/progress logic, but selects checkpoint `004000` for the direct variants
 and `003000` for the staged method. Both correspond to **4,000 cumulative
 updates**, not 4,000 formal-flow updates for the staged method. Evaluation
 results are isolated under `BASE_OUTPUT` and labeled by variant/seed.
+
+LIBERO simulation assets are used at **evaluation**, not at training time.
+The assets on this server are at `/root/autodl-fs/wyn/libero-assets/`.
+Official LIBERO resolves assets from the `assets:` entry in
+`$LIBERO_CONFIG_PATH/config.yaml` (normally `~/.libero/config.yaml`); check
+that this YAML entry points to that directory before evaluating. Do **not**
+set `LIBERO_CONFIG_PATH` to the assets directory itself: it must name the
+directory containing `config.yaml`. Other YAML paths such as `bddl_files` and
+`init_states` must remain valid.
 
 ## Interpretation and limits
 
