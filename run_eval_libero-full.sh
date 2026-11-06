@@ -64,10 +64,18 @@ export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-/home/wyn/.libero}"
 export PYTHONUNBUFFERED=1
 
 CKPT_ROOT="${CKPT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"
+# RUN_NAME_OVERRIDE and EVAL_STEP allow evaluating a budget-matched revision
+# checkpoint without changing the original prompt-ablation naming convention.
+RUN_NAME="${RUN_NAME_OVERRIDE:-${RUN_NAME}}"
 # Explicit BASE_CKPT overrides automatic checkpoint discovery only.
 BASE_CKPT="${BASE_CKPT:-${CKPT_ROOT}/${RUN_NAME}/checkpoints}"
 BASE_OUTPUT="${BASE_OUTPUT:-/root/autodl-tmp/eval/2601-lerobot}"
-STEPS=(3000)
+EVAL_STEP="${EVAL_STEP:-3000}"
+if [[ ! "$EVAL_STEP" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EVAL_STEP must be a positive integer" >&2
+  exit 2
+fi
+STEPS=("$EVAL_STEP")
 mkdir -p "$BASE_OUTPUT"
 SUMMARY_LOG="$BASE_OUTPUT/eval_${RUN_NAME}-${SUITE_TAG}-summary.log"
 touch "$SUMMARY_LOG"
