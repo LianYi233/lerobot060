@@ -26,15 +26,14 @@ for the original experiment. The current defaults are:
 | --- | --- |
 | `DATASET_ROOT` | `/root/autodl-fs/datasets/libero` |
 | `PRETRAINED_PATH` | `/root/autodl-fs/ckpt/pi05_libero_base` |
+| `TOKENIZER_PATH` | `/root/autodl-fs/ckpt/google/paligemma-3b-pt-224` |
 | `OUTPUT_ROOT` | `/root/autodl-fs/wyn/chkpt/2601-lerobot/revision-4000` |
 | `LOG_ROOT` | `/root/autodl-fs/wyn/logs/revision-4000` |
 
-The tokenizer path **has not been confirmed**: the underlying launcher still
-defaults to `/root/autodl-tmp/models/google/paligemma-3b-pt-224`. If yours has
-moved, set `TOKENIZER_PATH` explicitly. For example:
+The revision launcher sets all three input paths automatically. You can still
+override any path with an environment variable if running on another server:
 
 ```bash
-export TOKENIZER_PATH=/actual/path/to/paligemma-3b-pt-224
 export GPU_IDS=0
 
 DRY_RUN=true bash examples/training/train_pi05_revision_4000.sh direct_dual 0

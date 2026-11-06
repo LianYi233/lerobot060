@@ -17,6 +17,12 @@ EVAL_LAUNCHER = ROOT / "run_eval_pi05_revision_4000.sh"
 
 
 class Revision4000LauncherTest(unittest.TestCase):
+    def test_default_tokenizer_path_is_on_autodl_fs(self):
+        self.assertIn(
+            'export TOKENIZER_PATH="${TOKENIZER_PATH:-/root/autodl-fs/ckpt/google/paligemma-3b-pt-224}"',
+            TRAIN_LAUNCHER.read_text(),
+        )
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pi05-revision-4000-")
         self.addCleanup(self.temp.cleanup)
