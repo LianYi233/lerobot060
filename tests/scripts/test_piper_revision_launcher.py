@@ -143,10 +143,13 @@ class PiperRevisionLauncherTests(unittest.TestCase):
         self.assertIn("Loss target: 1.000e-04", result.stdout)
         self.assertFalse((self.work / "runs").exists())
 
-    def test_long_default_dataset_matches_this_server(self):
+    def test_long_default_paths_match_this_server(self):
         args = types.SimpleNamespace(preset="reality-long", total_updates=None, checkpoints=None, run_group=None, group=None, tasks=None)
         env, group, tasks = MODULE.configure_preset(args, {})
-        self.assertEqual(MODULE.paths_from_env(env)["dataset"], Path("/root/autodl-fs/datasets/reality"))
+        paths = MODULE.paths_from_env(env)
+        self.assertEqual(paths["dataset"], Path("/root/autodl-fs/datasets/reality"))
+        self.assertEqual(paths["base"], Path("/root/autodl-fs/ckpt/pi05_base"))
+        self.assertEqual(paths["tokenizer"], Path("/root/autodl-fs/ckpt/google/paligemma-3b-pt-224"))
         self.assertEqual(group, "priming")
         self.assertEqual(tasks, "2,3,4,1")
 

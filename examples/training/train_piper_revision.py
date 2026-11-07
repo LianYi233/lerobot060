@@ -37,6 +37,7 @@ GROUPS = {
 }
 SCHEMA = "primingvla-piper-revision-v1"
 REALITY_DATASET_BASE = "/root/autodl-fs/datasets/reality"
+REALITY_CHECKPOINT_ROOT = Path("/root/autodl-fs/ckpt")
 LEGACY_SCHEDULER = {"warmup_steps": 1000, "decay_steps": 30000, "decay_lr": 1e-5}
 
 
@@ -175,6 +176,8 @@ def configure_preset(args, source_env):
         )
         env["RUN_GROUP"] = args.run_group or "reality-long-v1"
         env.setdefault("DATASET_BASE", REALITY_DATASET_BASE)
+        env.setdefault("PRETRAINED_PATH", str(REALITY_CHECKPOINT_ROOT / "pi05_base"))
+        env.setdefault("TOKENIZER_PATH", str(REALITY_CHECKPOINT_ROOT / "google/paligemma-3b-pt-224"))
         group = args.group or "priming"
         tasks = args.tasks if args.tasks is not None else "2,3,4,1"
         ignored = [name for name in ("TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "TASKS", "RUN_GROUP") if name in source_env]
@@ -590,7 +593,10 @@ def main(argv=None):
         raise ValueError("Set PRETRAINED_PATH explicitly to this server's original pi05_base or pi05_libero_base")
     check_original_base(paths["base"])
     if not (paths["tokenizer"] / "tokenizer_config.json").is_file() or not any((paths["tokenizer"] / name).is_file() for name in ("tokenizer.json", "tokenizer.model")):
-        raise ValueError(f"Incomplete local tokenizer: {paths['tokenizer']}")
+        raise ValueError(
+            f"Incomplete local tokenizer: {paths['tokenizer']}; set TOKENIZER_PATH to the local "
+            "paligemma-3b-pt-224 directory containing tokenizer_config.json and tokenizer.json or tokenizer.model"
+        )
     split = float(env.get("EVAL_SPLIT", "0.1"))
     if not math.isfinite(split) or not 0 < split < 0.5:
         raise ValueError("EVAL_SPLIT must be in (0, 0.5); validation episodes are required")
@@ -645,7 +651,7 @@ def main(argv=None):
                 job["signature"] = fingerprint({"common": common, "job": job})
                 jobs.append(job)
     print(f"Piper reviewer protocol: {len(jobs)} runs, ONE GPU {gpu}, sequential; batch={common['batch_size']}; 16+16 prompts=49,152 parameters", flush=True)
-    print(f"Preset: {args.preset}\nDataset root: {paths['dataset']}\nTask order: {' -> '.join(tasks)}\nOutput: {paths['output']}\nInputs: {common['inputs']}\nCumulative checkpoint budgets: {common['cumulative_checkpoints']}", flush=True)
+    print(f"Preset: {args.preset}\nDataset root: {paths['dataset']}\nTraining base: {paths['base']}\nTokenizer: {paths['tokenizer']}\nTask order: {' -> '.join(tasks)}\nOutput: {paths['output']}\nInputs: {common['inputs']}\nCumulative checkpoint budgets: {common['cumulative_checkpoints']}", flush=True)
     print(f"Adaptation schedule: {common['adaptation_schedule']}\nLoss target: {loss_target:.3e} over at least {common['loss_monitor']['window_updates']} logged adaptation updates; monitor only, no early stopping", flush=True)
     space_check(paths, common, max(job["recipe"]["preparation_updates"] for job in jobs), enforce=False)
     if dry:

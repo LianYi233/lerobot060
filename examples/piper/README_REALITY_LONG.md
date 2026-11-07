@@ -37,14 +37,14 @@ DRY_RUN=false bash examples/training/train_piper_revision_long.sh
 
 ## 2. 在另一台 AutoDL 上运行
 
-在已安装本分支训练依赖的 Python 3.12+ 环境中，进入 `piper` 分支仓库根目录。下面两项模型路径必须替换成**这台 AutoDL 上真实存在的路径**；数据路径已按当前要求设置。
+在已安装本分支训练依赖的 Python 3.12+ 环境中，进入 `piper` 分支仓库根目录。长训练入口已内置当前 AutoDL 的默认路径：原始底座 `/root/autodl-fs/ckpt/pi05_base`，tokenizer `/root/autodl-fs/ckpt/google/paligemma-3b-pt-224`。下面显式写出同一配置；如需更换位置，可用 `export PRETRAINED_PATH=...` 和 `export TOKENIZER_PATH=...` 覆盖，入口不会覆盖已设置的环境变量。通用审稿入口仍要求显式指定 `PRETRAINED_PATH`。
 
 ```bash
 # 当前目录应为 lerobot060 的 piper 分支仓库根目录。
 export WORK_ROOT=/root/autodl-tmp/piper-revision
 export DATASET_BASE=/root/autodl-fs/datasets/reality
-export PRETRAINED_PATH=/path/to/original-pi05-base
-export TOKENIZER_PATH=/path/to/local-tokenizer
+export PRETRAINED_PATH=/root/autodl-fs/ckpt/pi05_base
+export TOKENIZER_PATH=/root/autodl-fs/ckpt/google/paligemma-3b-pt-224
 export GPU_ID=0
 export BATCH_SIZE=8
 export LOSS_TARGET=0.0001
@@ -60,7 +60,9 @@ DRY_RUN=true bash examples/training/train_piper_revision_long.sh
 DRY_RUN=false bash examples/training/train_piper_revision_long.sh
 ```
 
-`PRETRAINED_PATH` 应包含 `config.json`、`model.safetensors`、两个 policy processor 配置等原始底座文件；不能指向已有 prompt、已适配 action head/history 的模型，或下面说明的 `storage_base`。`TOKENIZER_PATH` 应包含本地 tokenizer 配置及 tokenizer 文件。本文没有假定另一台服务器已经把这些文件放在某个目录。
+`PRETRAINED_PATH` 应包含 `config.json`、`model.safetensors`、两个 policy processor 配置等原始底座文件；不能指向已有 prompt、已适配 action head/history 的模型，或下面说明的 `storage_base`。`TOKENIZER_PATH` 应包含本地 tokenizer 配置及 tokenizer 文件。预检会验证指定路径和所需文件，不自动扫描其他目录或联网下载。
+
+另一份底座 `/root/autodl-fs/ckpt/pi05_libero_base` 可通过 `export PRETRAINED_PATH=/root/autodl-fs/ckpt/pi05_libero_base` 选择，但必须使用新的 `--run-group`（例如 `reality-long-libero-v1`）；同一实验组内所有比较方法固定使用同一份底座。两种底座需按相同预算和评估协议比较，不能预先保证哪一种的真机成功率更高。
 
 默认输出为：
 
