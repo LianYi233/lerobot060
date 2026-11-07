@@ -13,10 +13,12 @@ import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples/training/train_piper_revision.sh"
 LONG_LAUNCHER = ROOT / "examples/training/train_piper_revision_long.sh"
+PARALLEL_LAUNCHER = ROOT / "examples/training/train_piper_revision_parallel.sh"
 SPEC = importlib.util.spec_from_file_location("piper_revision_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -66,7 +68,7 @@ class PiperRevisionLauncherTests(unittest.TestCase):
             (dataset / "meta/info.json").write_text(json.dumps(info))
             (dataset / "meta/stats.json").write_text(json.dumps({key: {"q01": [0] * 7, "q99": [1] * 7} for key in ("action", "observation.state")}))
         self.env = dict(os.environ)
-        for key in ("OUTPUT_ROOT", "RUN_GROUP", "GPU_ID", "GPU_IDS", "TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "WORLD_SIZE", "EVAL_SPLIT", "NUM_PROCESSES", "BATCH_SIZE", "TASKS", "LOSS_TARGET", "LOSS_WINDOW_UPDATES"):
+        for key in ("OUTPUT_ROOT", "RUN_GROUP", "GPU_ID", "GPU_IDS", "TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "WORLD_SIZE", "EVAL_SPLIT", "NUM_PROCESSES", "BATCH_SIZE", "TASKS", "LOSS_TARGET", "LOSS_WINDOW_UPDATES", "KEEP_FULL_CHECKPOINTS"):
             self.env.pop(key, None)
         self.env.update(WORK_ROOT=str(self.work), PRETRAINED_PATH=str(self.base), DATASET_BASE=str(self.work / "data"), TOKENIZER_PATH=str(tokenizer), DRY_RUN="true", PYTHON=sys.executable)
 
@@ -75,6 +77,9 @@ class PiperRevisionLauncherTests(unittest.TestCase):
 
     def run_long_launcher(self, *args, **env):
         return subprocess.run(["bash", str(LONG_LAUNCHER), *args], env={**self.env, **env}, text=True, capture_output=True, check=False)
+
+    def run_parallel_launcher(self, *args, **env):
+        return subprocess.run(["bash", str(PARALLEL_LAUNCHER), *args], env={**self.env, **env}, text=True, capture_output=True, check=False)
 
     def commands(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -142,6 +147,72 @@ class PiperRevisionLauncherTests(unittest.TestCase):
             self.assertEqual(command["policy.cabo_enabled"], "true")
         self.assertIn("Loss target: 1.000e-04", result.stdout)
         self.assertFalse((self.work / "runs").exists())
+
+    def test_parallel_shell_changes_scheduling_without_changing_training_recipe(self):
+        serial = self.commands(self.run_long_launcher())
+        result = self.run_parallel_launcher()
+        parallel = self.commands(result)
+        self.assertEqual(len(parallel), 4)
+        for before, after in zip(serial, parallel, strict=True):
+            self.assertEqual(Path(after["output_dir"]).parent.name, "reality-parallel-v1")
+            self.assertEqual({key: val for key, val in before.items() if key != "output_dir"},
+                             {key: val for key, val in after.items() if key != "output_dir"})
+        self.assertIn("max concurrent runs=2", result.stdout)
+        self.assertIn("delay >= 180s", result.stdout)
+        self.assertIn("free GPU >= 30 GiB", result.stdout)
+        self.assertIn("2 run(s) peak+reserve", result.stdout)
+        self.assertFalse((self.work / "runs").exists())
+
+    def test_parallel_can_save_every_10000_cumulative_updates(self):
+        result = self.run_parallel_launcher("--checkpoints", "[10000,20000,30000,40000,50000]")
+        for command in self.commands(result):
+            self.assertEqual(json.loads(command["save_steps"]), [9000, 19000, 29000, 39000, 49000])
+            self.assertEqual(command["steps"], "49000")
+
+    def test_invalid_parallel_options_fail_before_any_training_output(self):
+        for args in (("--parallel-tasks", "3"), ("--stagger-seconds", "nan"), ("--stagger-seconds", "-1"), ("--min-free-gib", "inf"), ("--min-free-gib", "0")):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.run_parallel_launcher(*args).returncode, 0)
+                self.assertFalse((self.work / "runs").exists())
+        result = self.run_parallel_launcher(KEEP_FULL_CHECKPOINTS="true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("KEEP_FULL_CHECKPOINTS=false", result.stderr)
+
+    def test_checkpoint_size_estimate_expands_bf16_but_does_not_double_fp32(self):
+        for dtype, width in (("BF16", 2), ("F32", 4)):
+            with self.subTest(dtype=dtype):
+                base = self.work / dtype
+                base.mkdir()
+                header = json.dumps({"weight": {"dtype": dtype, "shape": [4], "data_offsets": [0, width * 4]}}).encode()
+                (base / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + bytes(width * 4))
+                self.assertEqual(MODULE.full_checkpoint_estimate(base), 8 + len(header) + 16 + 64 * 1024**2)
+
+    def test_joint_disk_guard_rejects_space_that_each_single_job_would_accept(self):
+        paths = MODULE.paths_from_env(self.env)
+        common = {"cumulative_checkpoints": [10000, 30000, 50000], "reserve_gib": 30}
+        full = MODULE.full_checkpoint_estimate(paths["base"])
+        needed = 13 * full + 30 * MODULE.GIB
+        usage = types.SimpleNamespace(total=300 * MODULE.GIB, free=needed - 1)
+        with patch.object(MODULE.shutil, "disk_usage", return_value=usage), redirect_stdout(io.StringIO()):
+            MODULE.space_check(paths, common, 1000)
+            with self.assertRaisesRegex(ValueError, "Insufficient measured free space"):
+                MODULE.space_check(paths, common, 0, parallel_preparations=[1000, 1000])
+            usage.free = needed
+            accepted = MODULE.space_check(paths, common, 0, parallel_preparations=[1000, 1000])
+        self.assertEqual(accepted["estimated_required_bytes"], needed)
+        self.assertEqual(accepted["concurrent_runs"], 2)
+
+    def test_second_start_gate_requires_adaptation_log_and_completed_action_eval(self):
+        out = self.work / "ready"
+        out.mkdir()
+        job = {"output_dir": str(out)}
+        self.assertFalse(MODULE.adaptation_ready(job))
+        (out / "training_diagnostics.jsonl").write_text(json.dumps({"step": 50}) + "\n")
+        self.assertFalse(MODULE.adaptation_ready(job))
+        (out / "action_eval.jsonl").write_text('{"step":')
+        self.assertFalse(MODULE.adaptation_ready(job))
+        (out / "action_eval.jsonl").write_text(json.dumps({"step": 0, "action_val/h8/joint_mae_deg": 1.0}) + "\n")
+        self.assertTrue(MODULE.adaptation_ready(job))
 
     def test_long_default_paths_match_this_server(self):
         args = types.SimpleNamespace(preset="reality-long", total_updates=None, checkpoints=None, run_group=None, group=None, tasks=None)

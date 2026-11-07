@@ -17,6 +17,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -302,20 +303,50 @@ def existing_parent(path):
     return path
 
 
-def space_check(paths, common, prep, *, enforce=True):
-    # Conservative upper bound: a BF16 input may be saved as FP32, plus one packaging copy.
-    full_estimate = 2 * (paths["base"] / "model.safetensors").stat().st_size + 64 * 1024**2
-    copies = len(common["cumulative_checkpoints"]) + int(prep > 0) + 1
+def full_checkpoint_estimate(base):
+    """Bound FP32 saves from tensor shapes, without doubling an already-FP32 base."""
+    model = Path(base) / "model.safetensors"
+    with model.open("rb") as stream:
+        size = struct.unpack("<Q", stream.read(8))[0]
+        if not 2 <= size <= min(64 * 1024**2, model.stat().st_size - 8):
+            raise ValueError("Invalid base safetensors header length")
+        header = json.loads(stream.read(size))
+    total = 8 + size
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = tensor["data_offsets"]
+        original = end - start
+        floating = tensor["dtype"].startswith(("F", "BF"))
+        total += max(original, 4 * math.prod(tensor["shape"])) if floating else original
+    # Newly inserted prompts, safetensors header growth and small training artifacts.
+    return max(total, model.stat().st_size) + 64 * 1024**2
+
+
+def space_check(paths, common, prep, *, enforce=True, parallel_preparations=None):
+    full_estimate = full_checkpoint_estimate(paths["base"])
+    preparations = [prep] if parallel_preparations is None else list(parallel_preparations)
+    if not preparations:
+        raise ValueError("Disk planning requires at least one run")
+    counts = [len(common["cumulative_checkpoints"]) + int(value > 0) for value in preparations]
+    if parallel_preparations is None:
+        copies = counts[0] + 1
+        packing_scope = "prompt-only expected compact size"
+    else:
+        # Complete weights for all live runs, worst-case full-sized bundles for
+        # the one serialized packer, and an explicit shared-base copy allowance.
+        copies = sum(counts) + max(counts) + 1
+        packing_scope = "joint wave budget including full-sized delta bundles"
     required = copies * full_estimate + common["reserve_gib"] * GIB
     usage = shutil.disk_usage(existing_parent(paths["output"]))
-    print(f"Disk: free={usage.free / GIB:.1f} GiB / capacity={usage.total / GIB:.1f} GiB; conservative next-run peak+reserve={required / GIB:.1f} GiB", flush=True)
+    print(f"Disk: free={usage.free / GIB:.1f} GiB / capacity={usage.total / GIB:.1f} GiB; {len(preparations)} run(s) peak+reserve={required / GIB:.1f} GiB ({packing_scope})", flush=True)
     if enforce and usage.free < required:
-        raise ValueError("Insufficient measured free space for the next run; no checkpoint was removed")
-    return {"free_bytes": usage.free, "estimated_required_bytes": required}
+        raise ValueError("Insufficient measured free space for the planned run(s); reduce saved milestones or free space before starting")
+    return {"free_bytes": usage.free, "estimated_required_bytes": required, "full_model_estimate_bytes": full_estimate, "concurrent_runs": len(preparations), "packing_scope": packing_scope}
 
 
-def last_diagnostic(directory):
-    path = Path(directory) / "training_diagnostics.jsonl"
+def last_diagnostic(directory, filename="training_diagnostics.jsonl"):
+    path = Path(directory) / filename
     if not path.is_file():
         return None
     with path.open("rb") as stream:
@@ -327,6 +358,13 @@ def last_diagnostic(directory):
         except (ValueError, UnicodeDecodeError):
             pass
     return None
+
+
+def adaptation_ready(job):
+    """A completed adaptation log and action evaluation indicate startup passed."""
+    record = last_diagnostic(job["output_dir"])
+    evaluation = last_diagnostic(job["output_dir"], "action_eval.jsonl")
+    return isinstance(record, dict) and record.get("step", 0) > 0 and isinstance(evaluation, dict)
 
 
 def loss_report(job, common=None):
@@ -378,21 +416,24 @@ def progress(job, elapsed, queue_index, queue_size, common=None, log_stream=None
         log_stream.flush()
 
 
-def run_training(command, env, log, job, common, index, count):
+def run_training(command, env, log, job, common, index, count, stop_event=None):
     started = time.monotonic()
     with Path(log).open("xb") as output:
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             last_report = started
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Queue interrupted; stopping its owned training child and preserving files")
                 ready, _, _ = select.select([process.stdout], [], [], 1.0)
                 if ready:
                     data = os.read(process.stdout.fileno(), 65536)
                     if data:
                         output.write(data)
                         output.flush()
-                        sys.stdout.buffer.write(data)
-                        sys.stdout.buffer.flush()
+                        if common.get("execution", {}).get("parallel_tasks", 1) == 1:
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.buffer.flush()
                     elif process.poll() is not None:
                         break
                 if time.monotonic() - last_report >= 30:
@@ -550,6 +591,46 @@ def compact_run(job, paths, common, audit):
     return bundles
 
 
+def execute_job(job, index, count, *, paths, common, env, hardware, artifact_lock, stop_event):
+    """Train one independent policy; serialize only shared artifact finalization."""
+    job["hardware"] = hardware
+    job["disk_before"] = space_check(paths, common, job["recipe"]["preparation_updates"])
+    job["status"] = "running"
+    job["started_at"] = datetime.now(timezone.utc).isoformat()
+    job["command"] = build_command(job, common, paths)
+    job["common"] = common
+    record_path = paths["output"] / "records" / (job["run_name"] + ".json")
+    log = paths["output"] / "logs" / (job["run_name"] + ".log")
+    log.parent.mkdir(exist_ok=True)
+    write_json(record_path, job)
+    print(f"\n[QUEUE {index}/{count}] {job['run_name']}\nLog: {log}", flush=True)
+    try:
+        job["training_wall_seconds"] = run_training(job["command"], env, log, job, common, index, count, stop_event)
+        # Only this section can create/update the group's shared reconstruction base
+        # or its task contracts. Training of the other run can continue meanwhile.
+        with artifact_lock:
+            if stop_event.is_set():
+                raise RuntimeError("Queue interrupted before finalization; full checkpoints were preserved")
+            audit = audit_run(job)
+            lock_json_contract(paths["output"] / "task_protocols" / f"task{job['task_id']}-actual.json", {"split": audit["split"], "normalization": audit["normalization"]})
+            job["audit"] = audit
+            job["loss_summary"] = loss_report(job, common)
+            write_json(Path(job["output_dir"]) / "loss_summary.json", job["loss_summary"])
+            job["checkpoints"] = compact_run(job, paths, common, audit)
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            write_json(Path(job["output_dir"]) / "revision_manifest.json", job)
+            write_json(record_path, job)
+        report = job["loss_summary"]
+        print(f"DONE {job['run_name']} | training {job['training_wall_seconds'] / 3600:.2f} h | peak allocated {audit['peak_allocated_gpu_gib']:.2f} GiB | compact checkpoints verified | adaptation loss mean[{report['actual_window_updates']}]={format_loss(report['trailing_loss'])}; target<={report['target']:.3e}: {report['stable_target_met']}", flush=True)
+    except BaseException as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        write_json(record_path, job)
+        raise
+    return job
+
+
 def show_status(output):
     paths = list((output / "records").glob("*.json")) if (output / "records").is_dir() else []
     records = sorted(((read_json(path), path) for path in paths), key=lambda item: (item[0].get("started_at", ""), item[0]["run_name"]))
@@ -570,6 +651,9 @@ def main(argv=None):
     parser.add_argument("--total-updates", type=int, help="Cumulative updates per model, including preparation")
     parser.add_argument("--checkpoints", help="JSON list of cumulative update milestones; final is always included")
     parser.add_argument("--run-group", help="Separate output/protocol group; choose a new group when changing a recipe")
+    parser.add_argument("--parallel-tasks", type=int, choices=(1, 2), default=1, help="Independent runs sharing one GPU; default 1, at most 2 per wave")
+    parser.add_argument("--stagger-seconds", type=float, default=180, help="Minimum delay before the second run in each parallel wave")
+    parser.add_argument("--min-free-gib", type=float, default=30, help="Required device free memory before starting a run in parallel mode")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args(argv)
     env, group, ordered_tasks = configure_preset(args, os.environ)
@@ -583,6 +667,10 @@ def main(argv=None):
     if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError("Training seeds must be distinct non-negative integers")
     dry = env_bool(env, "DRY_RUN", False)
+    if not math.isfinite(args.stagger_seconds) or args.stagger_seconds < 0:
+        raise ValueError("--stagger-seconds must be finite and non-negative")
+    if not math.isfinite(args.min_free_gib) or args.min_free_gib <= 0:
+        raise ValueError("--min-free-gib must be finite and positive")
     total = env_int(env, "TOTAL_UPDATES", 4000, 1001)
     gpu = env.get("GPU_ID", env.get("GPU_IDS", "0"))
     if not re.fullmatch(r"\d+", gpu) or int(env.get("NUM_PROCESSES", "1")) != 1:
@@ -609,6 +697,10 @@ def main(argv=None):
         "adaptation_schedule": {"mode": "full_adaptation_cosine", "warmup_steps": 1000, "decay_lr": 1e-6}
         if args.preset == "reality-long" else {"mode": "legacy_cosine", **LEGACY_SCHEDULER},
         "loss_monitor": {"target": loss_target, "window_updates": env_int(env, "LOSS_WINDOW_UPDATES", 500), "early_stopping": False},
+        "execution": {"parallel_tasks": args.parallel_tasks, "stagger_seconds": args.stagger_seconds if args.parallel_tasks == 2 else 0,
+                      "min_free_gib": args.min_free_gib if args.parallel_tasks == 2 else None,
+                      "wave_barrier": "all runs fully finalized before the next wave",
+                      "training_wall_seconds_scope": "per-run process wall time; intervals overlap in parallel mode"},
         "base_path": str(paths["base"]), "base_config_sha256": sha256_file(paths["base"] / "config.json"),
         "base_sha256": "not_hashed_in_dry_run" if dry else sha256_file(paths["base"] / "model.safetensors"),
         "tokenizer_path": str(paths["tokenizer"]),
@@ -622,11 +714,14 @@ def main(argv=None):
     }
     if common["n_action_steps"] > 50:
         raise ValueError("N_ACTION_STEPS cannot exceed chunk size 50")
+    if args.parallel_tasks == 2 and common["keep_full"]:
+        raise ValueError("Parallel disk budgeting requires KEEP_FULL_CHECKPOINTS=false; verified bundles retain every saved model")
     code = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip()
     common["code_commit"] = code
     common["source_files_sha256"] = {
         str(path.relative_to(ROOT)): sha256_file(path)
-        for path in [Path(__file__), SCRIPT_DIR / "train_piper_revision_long.sh", ROOT / "examples/piper/revision_loss.py",
+        for path in [Path(__file__), SCRIPT_DIR / "train_piper_revision_long.sh", SCRIPT_DIR / "train_piper_revision_parallel.sh",
+                     SCRIPT_DIR / "piper_revision_parallel.py", ROOT / "examples/piper/revision_loss.py",
                      *sorted((ROOT / "src/lerobot/policies/pi05").glob("*.py")),
                      ROOT / "src/lerobot/scripts/lerobot_train.py", ROOT / "src/lerobot/datasets/factory.py",
                      ROOT / "src/lerobot/utils/piper_action_representation.py", ROOT / "src/lerobot/optim/cabo.py"]
@@ -650,10 +745,16 @@ def main(argv=None):
                     raise ValueError("The long preset requires more than 1000 adaptation updates after preparation")
                 job["signature"] = fingerprint({"common": common, "job": job})
                 jobs.append(job)
-    print(f"Piper reviewer protocol: {len(jobs)} runs, ONE GPU {gpu}, sequential; batch={common['batch_size']}; 16+16 prompts=49,152 parameters", flush=True)
+    print(f"Piper reviewer protocol: {len(jobs)} runs, ONE GPU {gpu}, max concurrent runs={args.parallel_tasks}; batch={common['batch_size']} per run; 16+16 prompts=49,152 parameters", flush=True)
     print(f"Preset: {args.preset}\nDataset root: {paths['dataset']}\nTraining base: {paths['base']}\nTokenizer: {paths['tokenizer']}\nTask order: {' -> '.join(tasks)}\nOutput: {paths['output']}\nInputs: {common['inputs']}\nCumulative checkpoint budgets: {common['cumulative_checkpoints']}", flush=True)
     print(f"Adaptation schedule: {common['adaptation_schedule']}\nLoss target: {loss_target:.3e} over at least {common['loss_monitor']['window_updates']} logged adaptation updates; monitor only, no early stopping", flush=True)
-    space_check(paths, common, max(job["recipe"]["preparation_updates"] for job in jobs), enforce=False)
+    if args.parallel_tasks == 2:
+        print(f"Parallel waves: {[ [job['run_name'] for job in jobs[start:start + 2]] for start in range(0, len(jobs), 2) ]}", flush=True)
+        print(f"Second run: delay >= {args.stagger_seconds:g}s, first adaptation log + action evaluation, free GPU >= {args.min_free_gib:g} GiB. Existing GPU training prevents a new parallel queue. Raw child output goes to each run's log; terminal shows per-run progress.", flush=True)
+        largest_wave = max((jobs[start:start + 2] for start in range(0, len(jobs), 2)), key=lambda wave: sum(len(common["cumulative_checkpoints"]) + bool(job["recipe"]["preparation_updates"]) for job in wave))
+        space_check(paths, common, 0, enforce=False, parallel_preparations=[job["recipe"]["preparation_updates"] for job in largest_wave])
+    else:
+        space_check(paths, common, max(job["recipe"]["preparation_updates"] for job in jobs), enforce=False)
     if dry:
         for job in jobs:
             print(f"\n{job['run_name']}: {json.dumps(job['recipe'])}")
@@ -700,41 +801,60 @@ def main(argv=None):
     for key, path in {"TMPDIR": paths["work"] / "tmp", "HF_HOME": paths["work"] / "cache/huggingface", "TORCHINDUCTOR_CACHE_DIR": paths["work"] / "cache/torchinductor", "TRITON_CACHE_DIR": paths["work"] / "cache/triton"}.items():
         env[key] = str(path)
         path.mkdir(parents=True, exist_ok=True)
-    hardware = check_training_gpu(env)
-    for index, job in enumerate(pending, 1):
-        job["hardware"] = hardware
-        job["disk_before"] = space_check(paths, common, job["recipe"]["preparation_updates"])
-        job["status"] = "running"
-        job["started_at"] = datetime.now(timezone.utc).isoformat()
-        job["command"] = build_command(job, common, paths)
-        job["common"] = common
-        record_path = paths["output"] / "records" / (job["run_name"] + ".json")
-        log = paths["output"] / "logs" / (job["run_name"] + ".log")
-        log.parent.mkdir(exist_ok=True)
-        write_json(record_path, job)
-        print(f"\n[QUEUE {index}/{len(pending)}] {job['run_name']}\nLog: {log}", flush=True)
-        try:
-            job["training_wall_seconds"] = run_training(job["command"], env, log, job, common, index, len(pending))
-            audit = audit_run(job)
-            lock_json_contract(paths["output"] / "task_protocols" / f"task{job['task_id']}-actual.json", {"split": audit["split"], "normalization": audit["normalization"]})
-            job["audit"] = audit
-            job["loss_summary"] = loss_report(job, common)
-            write_json(Path(job["output_dir"]) / "loss_summary.json", job["loss_summary"])
-            job["checkpoints"] = compact_run(job, paths, common, audit)
-            job["status"] = "completed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            write_json(Path(job["output_dir"]) / "revision_manifest.json", job)
-            write_json(record_path, job)
-            report = job["loss_summary"]
-            print(f"DONE {job['run_name']} | training {job['training_wall_seconds'] / 3600:.2f} h | peak allocated {audit['peak_allocated_gpu_gib']:.2f} GiB | compact checkpoints verified | adaptation loss mean[{report['actual_window_updates']}]={format_loss(report['trailing_loss'])}; target<={report['target']:.3e}: {report['stable_target_met']}", flush=True)
-        except BaseException as exc:
-            job["status"] = "failed"
-            job["error"] = str(exc)
-            write_json(record_path, job)
-            raise
-    show_status(paths["output"])
-    queue_lock.close()
-    return 0
+    gpu_queue_lock = None
+    stop_event = threading.Event()
+    artifact_lock = threading.Lock()
+    try:
+        if args.parallel_tasks == 2:
+            from piper_revision_parallel import gpu_snapshot, run_in_waves
+
+            # Different output groups on the same WORK_ROOT still share this GPU.
+            # The nvidia-smi check also catches older/non-cooperating launchers.
+            gpu_queue_lock = (paths["work"] / f".piper-gpu-{gpu}.lock").open("a+")
+            try:
+                fcntl.flock(gpu_queue_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("Another parallel queue already owns this GPU under WORK_ROOT") from exc
+            initial_gpu = gpu_snapshot(gpu)
+            if initial_gpu["pids"]:
+                raise ValueError("GPU already has compute processes; keep the existing training running. An old sequential queue cannot be hot-switched into this parallel queue.")
+        hardware = check_training_gpu(env)
+
+        def run_job(job, index, count):
+            return execute_job(job, index, count, paths=paths, common=common, env=env,
+                               hardware=hardware, artifact_lock=artifact_lock, stop_event=stop_event)
+
+        if args.parallel_tasks == 2:
+            pending_indices = {job["run_name"]: index for index, job in enumerate(pending, 1)}
+
+            def check_wave_space(wave):
+                report = space_check(paths, common, 0, parallel_preparations=[job["recipe"]["preparation_updates"] for job in wave])
+                for job in wave:
+                    job["wave_disk_budget"] = report
+
+            # Preserve the original wave boundaries even when a verified completed
+            # run is skipped: T3 finishes before T4/T1 if T2 is already completed.
+            for start in range(0, len(jobs), 2):
+                wave = [job for job in jobs[start:start + 2] if job["run_name"] in pending_indices]
+                if not wave:
+                    continue
+                run_in_waves(
+                    wave, lambda job, index, count: run_job(job, pending_indices[job["run_name"]], len(pending)),
+                    gpu=gpu, stagger_seconds=args.stagger_seconds, min_free_gib=args.min_free_gib,
+                    check_wave_space=check_wave_space, first_ready=adaptation_ready, cancel_event=stop_event,
+                )
+        else:
+            for index, job in enumerate(pending, 1):
+                run_job(job, index, len(pending))
+        show_status(paths["output"])
+        return 0
+    except BaseException:
+        stop_event.set()
+        raise
+    finally:
+        if gpu_queue_lock is not None:
+            gpu_queue_lock.close()
+        queue_lock.close()
 
 
 if __name__ == "__main__":
