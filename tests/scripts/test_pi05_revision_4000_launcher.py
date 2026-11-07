@@ -67,6 +67,7 @@ class Revision4000LauncherTest(unittest.TestCase):
             ("direct_dual", 4000, 0, 0, "true", "0.0"),
             ("dual_prompt_only", 4000, 0, 0, "false", "0.0"),
             ("full_reference", 3000, 1000, 250, "true", "0.0"),
+            ("full_no_cpc", 3000, 1000, 250, "false", "0.0"),
             ("action_flow_warmup", 3000, 1000, 250, "true", "1.0"),
         )
         for variant, flow, pretrain, bridge, cabo, full_mask_probability in cases:
@@ -80,7 +81,7 @@ class Revision4000LauncherTest(unittest.TestCase):
                     f"--policy.next_action_full_mask_probability={full_mask_probability}",
                     "--policy.num_prompt_tokens=16",
                     "--policy.num_vlm_prompt_tokens=16",
-                    "--save_freq=1000",
+                    f"--save_freq={flow}",
                     "--seed=0",
                 ):
                     self.assertIn(arg, cmd)
@@ -88,6 +89,15 @@ class Revision4000LauncherTest(unittest.TestCase):
                 self.assertIn(f"--output_dir={self.work / 'checkpoints' / f'pi05-revision-{variant}-seed0-total4000'}", cmd)
                 self.assertFalse((self.work / "checkpoints").exists())
                 self.assertFalse((self.work / "logs").exists())
+
+    def test_staged_no_cpc_dispatches_to_existing_no_cabo_implementation(self):
+        _, stdout = self.dry_run_args("full_no_cpc")
+        self.assertIn("variant=no_cabo", stdout)
+        self.assertIn("SAP=750 bridge=250 flow=3000 total=4000 CPC=false", stdout)
+
+    def test_checkpoint_cadence_can_be_opted_back_into(self):
+        cmd, _ = self.dry_run_args("direct_dual", SAVE_FREQ="1000")
+        self.assertIn("--save_freq=1000", cmd)
 
     def test_external_flow_override_cannot_break_matched_budget(self):
         for variant, expected_steps in (("direct_dual", 4000), ("full_reference", 3000)):
@@ -138,6 +148,7 @@ class Revision4000LauncherTest(unittest.TestCase):
         for variant, checkpoint in (
             ("direct_dual", "004000"),
             ("full_reference", "003000"),
+            ("full_no_cpc", "003000"),
             ("action_flow_warmup", "003000"),
         ):
             with self.subTest(variant=variant):
