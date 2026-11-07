@@ -1,5 +1,9 @@
 # Piper 真机部署（PI05 双 prompt）
 
+PrimingVLA 审稿补实验（单张 A800、300G 数据盘）使用
+[受控训练与存储说明](README_REVISION.md) 和 [配对闭环试验记录](README_REVISION_EVAL.md)。
+新入口为 `examples/training/train_piper_revision.sh`。
+
 `piper` 分支从 `prompt-ablation` 的 `51a94e697ae4a3a59b6996c484c68a3137c6594a`
 创建，保留完整的配置、模型、注意力、处理器和 CABO 实现。根目录
 `deploy_piper_vlaa.py` 使用此版本 PI05 的 flow 推理，支持双 prompt 和 prompt 消融配置。

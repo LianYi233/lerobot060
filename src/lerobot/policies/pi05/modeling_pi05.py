@@ -1777,7 +1777,7 @@ class PI05Policy(PreTrainedPolicy):
         self.model._freeze_vlm()
         if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
             raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
-        if not PI05Policy._is_cabo_active(self):
+        if not PI05Policy._is_cabo_active(self) and getattr(self.config, "action_prompt_lr_scale", 1.0) == 1.0:
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
                 raise ValueError("PI05 training requires trainable prompts or explicit action projections")
@@ -1816,8 +1816,8 @@ class PI05Policy(PreTrainedPolicy):
         ]
 
     def validate_optimizer_step_control(self, optimizer) -> None:
-        """Validate CABO's optimizer contract before the first training backward pass."""
-        if not PI05Policy._is_cabo_active(self):
+        """Validate CABO / fixed-action-LR groups before the first training backward pass."""
+        if not PI05Policy._is_cabo_active(self) and getattr(self.config, "action_prompt_lr_scale", 1.0) == 1.0:
             return
 
         adamw = require_adamw(optimizer)
@@ -1864,14 +1864,37 @@ class PI05Policy(PreTrainedPolicy):
         optimizer,
         accelerator,
     ) -> OptimizerStepControl:
-        """Limit action-prompt AdamW learning updates relative to the VLM prompts.
+        """Apply CPC or its fixed action-prompt learning-rate control.
 
         Action-only inpainting has no VLM reference and keeps its scheduled action-prompt LR.
         The bridge and formal flow compare current, weight-decay-free relative updates, retaining
         the VLM LR and verifying the attenuated action update in the parameter's native dtype.
+        The fixed-LR control uses the same temporary group scaling but a constant coefficient.
         """
         if not PI05Policy._is_cabo_active(self):
-            return OptimizerStepControl()
+            fixed_scale = float(getattr(self.config, "action_prompt_lr_scale", 1.0))
+            if fixed_scale == 1.0:
+                return OptimizerStepControl()
+            if getattr(self.config, "training_stage", "flow") == PI05TrainingStage.NEXT_ACTION and not getattr(
+                self, "_stage1_bridge_active", False
+            ):
+                return OptimizerStepControl(
+                    metrics={"fixed_lr/active": 0.0, "fixed_lr/action_only_bypass": 1.0}
+                )
+            adamw = require_adamw(optimizer)
+            vlm_group = get_named_param_group(adamw, CABO_VLM_PROMPT_GROUP)
+            action_group = get_named_param_group(adamw, CABO_ACTION_PROMPT_GROUP)
+            return OptimizerStepControl(
+                group_scales={CABO_ACTION_PROMPT_GROUP: fixed_scale},
+                metrics={
+                    "cabo/active": 0.0,
+                    "fixed_lr/active": 1.0,
+                    "fixed_lr/action_only_bypass": 0.0,
+                    "fixed_lr/action_prompt_scale": fixed_scale,
+                    "fixed_lr/effective_vlm_prompt_lr": float(vlm_group["lr"]),
+                    "fixed_lr/effective_action_prompt_lr": float(action_group["lr"]) * fixed_scale,
+                },
+            )
         if getattr(self.config, "training_stage", "flow") == PI05TrainingStage.NEXT_ACTION and not getattr(
             self, "_stage1_bridge_active", False
         ):

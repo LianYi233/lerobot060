@@ -182,6 +182,11 @@ class PI05Config(PreTrainedConfig):
     # Action-only inpainting bypasses CABO because the VLM prompt is not in its forward path.
     cabo_enabled: bool = True
     cabo_prompt_update_ratio: float = 2.0
+    # Fixed-LR control for CPC ablations. Stage-I action-only updates keep the scheduled LR;
+    # the bridge and formal flow multiply only the action-prompt group's LR by this value.
+    # Like CPC's temporary LR scaling, this also scales AdamW's decoupled weight-decay step.
+    # 1.0 preserves all existing optimizer grouping and behavior.
+    action_prompt_lr_scale: float = 1.0
 
     # Deprecated backbone/EMA settings retained for loading older configurations; these do not
     # affect prompt CABO, which uses the current VLM prompt update without an EMA or warmup.
@@ -362,6 +367,26 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 "CABO requires num_vlm_prompt_tokens > 0 and num_prompt_tokens > 0. "
                 "Set cabo_enabled=False for a single prompt bank or prompt-free inference."
+            )
+        if (
+            isinstance(self.action_prompt_lr_scale, bool)
+            or not math.isfinite(self.action_prompt_lr_scale)
+            or not 0 < self.action_prompt_lr_scale <= 1
+        ):
+            raise ValueError("action_prompt_lr_scale must be finite and in (0, 1]")
+        if self.action_prompt_lr_scale != 1.0 and (
+            self.cabo_enabled
+            or self.num_vlm_prompt_tokens == 0
+            or self.num_prompt_tokens == 0
+            or self.train_action_projections
+            or self.train_action_expert_last_n_layers
+            or self.train_action_head
+            or self.use_peft
+        ):
+            raise ValueError(
+                "action_prompt_lr_scale != 1 requires cabo_enabled=False, both prompt banks, "
+                "frozen action projections/expert/head and use_peft=False. "
+                "It is a fixed action-prompt LR control for prompt-only training."
             )
         if self.training_stage == "flow" and self.clip_action_head_by_vlm:
             raise ValueError(

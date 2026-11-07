@@ -147,8 +147,10 @@ def _prepare_policy_optimizer_step_control(
         )
 
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    cabo_active = getattr(getattr(unwrapped_policy, "config", None), "cabo_active", None)
-    if cabo_active is False:
+    policy_config = getattr(unwrapped_policy, "config", None)
+    cabo_active = getattr(policy_config, "cabo_active", None)
+    fixed_action_lr = getattr(policy_config, "action_prompt_lr_scale", 1.0) != 1.0
+    if cabo_active is False and not fixed_action_lr:
         return OptimizerStepControl()
     if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
         return OptimizerStepControl()
@@ -350,7 +352,12 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():
-        train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_allocated_gib = torch.cuda.max_memory_allocated() / (1024**3)
+        train_metrics.gpu_mem_gb = peak_allocated_gib
+        if output_dict is None:
+            output_dict = {}
+        # Keep the true maximum, not just AverageMeter's mean of per-step peaks.
+        output_dict["resources/step_peak_allocated_gpu_gib"] = peak_allocated_gib
     return train_metrics, output_dict
 
 
@@ -678,6 +685,23 @@ def _train_single_stage(
 
     piper_refit = getattr(active_cfg, "piper_train_normalization", False)
     piper_processor_stats = None
+    if piper_refit and is_main_process:
+        # Record the actual episode split, independently of training/inference seeds.
+        # This is provenance, not a second implementation of the dataset split rule.
+        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        split_record = {
+            "dataset_root": str(cfg.dataset.root),
+            "eval_split": cfg.dataset.eval_split,
+            "train_episodes": (
+                [int(ep) for ep in dataset.episodes]
+                if dataset.episodes is not None
+                else list(range(dataset.num_episodes))
+            ),
+            "eval_episodes": [int(ep) for ep in eval_dataset.episodes] if eval_dataset is not None else [],
+            "train_frames": dataset.num_frames,
+            "eval_frames": eval_dataset.num_frames if eval_dataset is not None else 0,
+        }
+        (Path(cfg.output_dir) / "dataset_split.json").write_text(json.dumps(split_record, indent=2) + "\n")
     if piper_refit and not cfg.resume:
         from lerobot.utils.piper_action_representation import fit_piper_train_normalization
 
@@ -845,7 +869,9 @@ def _train_single_stage(
                 ) from exc
             raise
 
-    if cfg.cabo_active and has_method(policy, "validate_optimizer_step_control"):
+    if (
+        cfg.cabo_active or getattr(cfg.policy, "action_prompt_lr_scale", 1.0) != 1.0
+    ) and has_method(policy, "validate_optimizer_step_control"):
         policy.validate_optimizer_step_control(optimizer)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -899,6 +925,24 @@ def _train_single_stage(
             100 * num_learnable_params / max(1, num_total_params),
         )
         logging.info("================================================")
+        if piper_refit:
+            (Path(cfg.output_dir) / "trainable_parameters.json").write_text(
+                json.dumps(
+                    {
+                        "training_stage": str(getattr(cfg.policy, "training_stage", "unknown")),
+                        "trainable_total": num_learnable_params,
+                        "all_parameters": num_total_params,
+                        "categories": _parameter_counts,
+                        "tensors": [
+                            {"name": name, "shape": list(parameter.shape), "numel": parameter.numel()}
+                            for name, parameter in policy.named_parameters()
+                            if parameter.requires_grad
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
