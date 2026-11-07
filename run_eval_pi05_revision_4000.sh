@@ -5,9 +5,9 @@ usage() {
   cat <<'EOF'
 Usage: bash run_eval_pi05_revision_4000.sh VARIANT [all|no10|SUITE] [SEED]
 
-VARIANT: direct_dual, dual_prompt_only, full_reference, action_flow_warmup
+VARIANT: direct_dual, dual_prompt_only, full_reference, full_no_cpc, action_flow_warmup
 Default suites: all four standard LIBERO suites; default seed: 0.
-Direct variants evaluate flow checkpoint 004000, and full_reference evaluates
+Direct variants evaluate flow checkpoint 004000, and staged variants evaluate
 flow checkpoint 003000. Both represent 4,000 total optimizer updates.
 
 Set CKPT_ROOT and BASE_OUTPUT to override the isolated revision-4000 roots;
@@ -33,7 +33,7 @@ fi
 
 case "$VARIANT" in
   direct_dual|dual_prompt_only) STEP=4000 ;;
-  full_reference|action_flow_warmup) STEP=3000 ;;
+  full_reference|full_no_cpc|action_flow_warmup) STEP=3000 ;;
   *)
     echo "Unknown revision variant: $VARIANT" >&2
     usage >&2
