@@ -1,16 +1,18 @@
 # Piper 真机部署（PI05 双 prompt）
 
+**当前 reality 四任务长训练**见 [单张 A800 长训练指南](README_REALITY_LONG.md)：数据根 `/root/autodl-fs/datasets/reality`，入口 `examples/training/train_piper_revision_long.sh`，默认每任务累计 50,000 步，顺序 **2 → 3 → 4 → 1**。
+
 PrimingVLA 审稿补实验（单张 A800、300G 数据盘）使用
 [受控训练与存储说明](README_REVISION.md) 和 [配对闭环试验记录](README_REVISION_EVAL.md)。
-新入口为 `examples/training/train_piper_revision.sh`。
+审稿对照入口为 `examples/training/train_piper_revision.sh`。
 
 `piper` 分支从 `prompt-ablation` 的 `51a94e697ae4a3a59b6996c484c68a3137c6594a`
 创建，保留完整的配置、模型、注意力、处理器和 CABO 实现。根目录
 `deploy_piper_vlaa.py` 使用此版本 PI05 的 flow 推理，支持双 prompt 和 prompt 消融配置。
 `deploy_piper_wyn.py` 是兼容入口，转发到同一实现；两者的参数和源码选择完全一致。
 
-在 AutoDL 重新训练四个任务，使用 `examples/training/train_piper_autodl.sh`，
-路径、参数和模型传回方式见 [四任务训练说明](README_TRAIN_AUTODL.md)。
+旧 AutoDL 四任务入口 `examples/training/train_piper_autodl.sh` 的路径、参数和模型传回方式，
+见 [四任务训练说明](README_TRAIN_AUTODL.md)。当前 reality 长训练使用上面的独立入口。
 
 之前的 `lerobot.processor.core` 导入错误和 `num_vlm_prompt_tokens` 缺失说明部署机混用了
 不同版本源码。入口现在优先加载旁边的 `src/`，并核对配置来源及必要字段。不要继续向旧版

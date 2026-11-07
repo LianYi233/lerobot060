@@ -1,6 +1,7 @@
 """Exercise actual dispatch, budget accounting and safe export with local tiny fixtures."""
 
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -8,11 +9,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "examples/training/train_piper_revision.sh"
+LONG_LAUNCHER = ROOT / "examples/training/train_piper_revision_long.sh"
 SPEC = importlib.util.spec_from_file_location("piper_revision_launcher", LAUNCHER.with_suffix(".py"))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -62,12 +66,15 @@ class PiperRevisionLauncherTests(unittest.TestCase):
             (dataset / "meta/info.json").write_text(json.dumps(info))
             (dataset / "meta/stats.json").write_text(json.dumps({key: {"q01": [0] * 7, "q99": [1] * 7} for key in ("action", "observation.state")}))
         self.env = dict(os.environ)
-        for key in ("OUTPUT_ROOT", "RUN_GROUP", "GPU_ID", "GPU_IDS", "TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "WORLD_SIZE", "EVAL_SPLIT", "NUM_PROCESSES", "BATCH_SIZE", "TASKS"):
+        for key in ("OUTPUT_ROOT", "RUN_GROUP", "GPU_ID", "GPU_IDS", "TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "WORLD_SIZE", "EVAL_SPLIT", "NUM_PROCESSES", "BATCH_SIZE", "TASKS", "LOSS_TARGET", "LOSS_WINDOW_UPDATES"):
             self.env.pop(key, None)
         self.env.update(WORK_ROOT=str(self.work), PRETRAINED_PATH=str(self.base), DATASET_BASE=str(self.work / "data"), TOKENIZER_PATH=str(tokenizer), DRY_RUN="true", PYTHON=sys.executable)
 
     def run_launcher(self, *args, **env):
         return subprocess.run(["bash", str(LAUNCHER), *args], env={**self.env, **env}, text=True, capture_output=True, check=False)
+
+    def run_long_launcher(self, *args, **env):
+        return subprocess.run(["bash", str(LONG_LAUNCHER), *args], env={**self.env, **env}, text=True, capture_output=True, check=False)
 
     def commands(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -114,6 +121,120 @@ class PiperRevisionLauncherTests(unittest.TestCase):
             prep = int(command["policy.next_action_pretrain_steps"])
             self.assertEqual(int(command["steps"]) + prep, 12000)
             self.assertEqual([step + prep for step in json.loads(command["save_steps"])], [4000, 12000])
+
+    def test_long_preset_trains_four_independent_models_in_requested_order(self):
+        result = self.run_long_launcher()
+        commands = self.commands(result)
+        self.assertEqual(len(commands), 4)
+        self.assertEqual([Path(command["dataset.root"]).name for command in commands], [MODULE.TASKS[task] for task in ("2", "3", "4", "1")])
+        self.assertEqual(len({command["output_dir"] for command in commands}), 4)
+        for command in commands:
+            self.assertEqual(command["policy.pretrained_path"], str(self.base))
+            self.assertIn("-priming-seed0-total50000", command["job_name"])
+            self.assertEqual(Path(command["output_dir"]).parent.name, "reality-long-v1")
+            self.assertEqual(command["policy.next_action_pretrain_steps"], "1000")
+            self.assertEqual(command["policy.next_action_bridge_steps"], "250")
+            self.assertEqual(command["steps"], "49000")
+            self.assertEqual(json.loads(command["save_steps"]), [9000, 29000, 49000])
+            self.assertEqual(command["policy.scheduler_warmup_steps"], "1000")
+            self.assertEqual(command["policy.scheduler_decay_steps"], "49000")
+            self.assertEqual(float(command["policy.scheduler_decay_lr"]), 1e-6)
+            self.assertEqual(command["policy.cabo_enabled"], "true")
+        self.assertIn("Loss target: 1.000e-04", result.stdout)
+        self.assertFalse((self.work / "runs").exists())
+
+    def test_long_default_dataset_matches_this_server(self):
+        args = types.SimpleNamespace(preset="reality-long", total_updates=None, checkpoints=None, run_group=None, group=None, tasks=None)
+        env, group, tasks = MODULE.configure_preset(args, {})
+        self.assertEqual(MODULE.paths_from_env(env)["dataset"], Path("/root/autodl-fs/datasets/reality"))
+        self.assertEqual(group, "priming")
+        self.assertEqual(tasks, "2,3,4,1")
+
+    def test_long_preset_does_not_inherit_a_short_run_budget_or_old_task_order(self):
+        result = self.run_long_launcher(TOTAL_UPDATES="4000", CUMULATIVE_CHECKPOINTS="[3000,4000]", TASKS="1", RUN_GROUP="review-v1")
+        commands = self.commands(result)
+        self.assertEqual([Path(command["dataset.root"]).name for command in commands], [MODULE.TASKS[task] for task in ("2", "3", "4", "1")])
+        self.assertTrue(all(command["steps"] == "49000" for command in commands))
+        self.assertTrue(all(Path(command["output_dir"]).parent.name == "reality-long-v1" for command in commands))
+        self.assertIn("ignores exported", result.stdout)
+
+    def test_long_cli_can_change_budget_and_run_only_second_pair(self):
+        commands = self.commands(self.run_long_launcher("priming", "0", "--tasks", "4,1", "--total-updates", "80000", "--checkpoints", "[10000,40000,80000]", "--run-group", "reality-long-80k-v1"))
+        self.assertEqual([Path(command["dataset.root"]).name for command in commands], [MODULE.TASKS[task] for task in ("4", "1")])
+        for command in commands:
+            self.assertEqual(command["steps"], "79000")
+            self.assertEqual(command["policy.scheduler_decay_steps"], "79000")
+            self.assertEqual(json.loads(command["save_steps"]), [9000, 39000, 79000])
+            self.assertEqual(Path(command["output_dir"]).parent.name, "reality-long-80k-v1")
+
+    def test_long_ablation_methods_keep_total_budget_and_own_schedule_horizon(self):
+        commands = self.commands(self.run_long_launcher("core", "0", "--tasks", "2"))
+        self.assertEqual(len(commands), 4)
+        for command in commands:
+            self.assertEqual(int(command["steps"]) + int(command["policy.next_action_pretrain_steps"]), 50000)
+            self.assertEqual(command["policy.scheduler_decay_steps"], command["steps"])
+            self.assertEqual(float(command["policy.scheduler_decay_lr"]), 1e-6)
+
+    def test_loss_target_is_monitor_only_and_invalid_targets_fail(self):
+        commands = self.commands(self.run_long_launcher("--tasks", "2", LOSS_TARGET="0.00001", LOSS_WINDOW_UPDATES="1000"))
+        self.assertEqual(commands[0]["steps"], "49000")
+        for env in ({"LOSS_TARGET": "nan"}, {"LOSS_TARGET": "inf"}, {"LOSS_TARGET": "0"}, {"LOSS_WINDOW_UPDATES": "0"}):
+            with self.subTest(env=env):
+                result = self.run_long_launcher("--tasks", "2", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.work / "runs").exists())
+
+    def test_status_does_not_require_model_or_dataset_access(self):
+        result = self.run_long_launcher("--status", PRETRAINED_PATH="/missing/base", DATASET_BASE="/missing/data", TOKENIZER_PATH="/missing/tokenizer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reality-long-v1", result.stdout)
+
+    def test_loss_progress_keeps_preparation_separate_and_preserves_small_values(self):
+        out = self.work / "loss-progress"
+        job = {"output_dir": str(out), "run_name": "task2-priming-seed0-total50000", "recipe": MODULE.recipe("priming", 50000)}
+        prep = out.with_name(out.name + "_next_action_pretrain")
+        prep.mkdir()
+        (prep / "training_diagnostics.jsonl").write_text(json.dumps({"step": 1000, "window_updates": 1000, "train": {"loss": 1e-6}}) + "\n")
+        self.assertFalse(MODULE.loss_report(job)["stable_target_met"])
+        out.mkdir()
+        record = {"step": 500, "window_updates": 500, "training_stage": "flow", "train": {"loss": 0.0001, "update_s": 1.0, "dataloading_s": 0.1}}
+        (out / "training_diagnostics.jsonl").write_text(json.dumps(record) + "\n")
+        report = MODULE.loss_report(job)
+        self.assertTrue(report["stable_target_met"])
+        self.assertEqual(report["first_target_cumulative_update"], 1500)
+        self.assertEqual(report["last_cumulative_update"], 1500)
+        terminal, log = io.StringIO(), io.BytesIO()
+        with redirect_stdout(terminal):
+            MODULE.progress(job, 600, 1, 4, log_stream=log)
+        self.assertIn("1.000e-04", terminal.getvalue())
+        self.assertIn("mean[500 updates]", terminal.getvalue())
+        self.assertIn("cumulative 1500/50000", terminal.getvalue())
+        self.assertEqual(log.getvalue().decode(), terminal.getvalue())
+
+    def test_long_scheduler_is_audited_against_actual_saved_config(self):
+        # A command-line schedule is not sufficient evidence if the saved model differs.
+        out = self.work / "scheduler-audit"
+        out.mkdir()
+        job = {"output_dir": str(out), "recipe": MODULE.recipe("direct_cpc", 50000), "adaptation_scheduler": {"warmup_steps": 1000, "decay_steps": 50000, "decay_lr": 1e-6}}
+        MODULE.write_json(out / "trainable_parameters.json", {"trainable_total": 49152, "categories": {"vlm_prompt": 32768, "action_prompt": 16384}})
+        MODULE.write_json(out / "dataset_split.json", {"train_episodes": [0, 1], "eval_episodes": [2]})
+        MODULE.write_json(out / "piper_normalization.json", {"training_episodes": [0, 1]})
+        config = {
+            "training_stage": "flow", "num_vlm_prompt_tokens": 16, "num_prompt_tokens": 16,
+            "train_action_head": False, "train_action_projections": False,
+            "train_action_expert_last_n_layers": 0, "piper_gripper_history_steps": 0,
+            "piper_train_normalization": True, "use_relative_actions": False,
+            "cabo_enabled": True, "action_prompt_lr_scale": 1.0, "chunk_size": 50,
+            "scheduler_warmup_steps": 1000, "scheduler_decay_steps": 50000, "scheduler_decay_lr": 1e-6,
+        }
+        config_path = out / "checkpoints/050000/pretrained_model/config.json"
+        MODULE.write_json(config_path, config)
+        (out / "training_diagnostics.jsonl").write_text(json.dumps({"diagnostics_rank0": {"optimizer_step/skipped": {"mean": 0, "count": 50}}}) + "\n")
+        MODULE.audit_run(job)
+        config["scheduler_decay_steps"] = 30000
+        MODULE.write_json(config_path, config)
+        with self.assertRaisesRegex(ValueError, "Saved policy config"):
+            MODULE.audit_run(job)
 
     def test_invalid_protocols_fail_before_any_training_output(self):
         for env in ({"GPU_IDS": "0,1"}, {"NUM_PROCESSES": "2"}, {"EVAL_SPLIT": "0"}, {"TOTAL_UPDATES": "1000"}, {"CUMULATIVE_CHECKPOINTS": "[1000,4000]"}):

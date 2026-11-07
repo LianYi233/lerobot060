@@ -1,5 +1,7 @@
 # PrimingVLA 真机补实验：单张 A800、300G 数据盘
 
+> **当前 reality 数据的长训练请使用 [四任务长训练指南](README_REALITY_LONG.md)**：`train_piper_revision_long.sh` 默认按 **2 → 3 → 4 → 1** 为每个任务独立训练 `priming` 模型，累计 **50,000** 步。本文保留审稿受控实验的 **core / 4,000 步默认设置**；两种预算的结果分别记录。
+
 本入口针对审稿中的三个主要问题补充可比较的真机训练：提升是否来自额外更新次数、SAP 是否优于普通动作侧预热、CPC 是否只是较小的动作侧学习率。最终证据仍须来自固定协议下的闭环成功率；离线动作误差和训练完成本身不等于真机成功。
 
 入口为：
@@ -160,7 +162,7 @@ bash examples/training/train_piper_revision.sh --status
 tail -f "$OUTPUT_ROOT/logs/task1-priming-seed0-total4000.log"
 ```
 
-`--status` 的累计更新列是该 run 的**目标预算**；实际运行进度看启动终端或 `training_diagnostics.jsonl`。完成记录包含训练进程 wall-clock、训练 step 期间的最大 CUDA allocated 显存、参数审计、数据划分、归一化、源代码/模型身份和 checkpoint 摘要。该显存指标不包含模型初始化和离线验证，也不是 `nvidia-smi` 的总占用；压缩和完成后审计时间不包含在 `training_wall_seconds` 中。没有预先承诺一张 A800 需要多少小时，先以 T1 的实测吞吐安排剩余队列。
+`--status` 的累计更新列是该 run 的**目标预算**；实际运行进度看启动终端或 `training_diagnostics.jsonl`。状态表另有 `latest_adaptation_loss / trailing_mean / window_updates / target_met` 列，定义见 [长训练指南的 loss 监控说明](README_REALITY_LONG.md#3-如何判断-loss-是否接近-1e-4)。完成记录包含训练进程 wall-clock、训练 step 期间的最大 CUDA allocated 显存、参数审计、数据划分、归一化、源代码/模型身份和 checkpoint 摘要。该显存指标不包含模型初始化和离线验证，也不是 `nvidia-smi` 的总占用；压缩和完成后审计时间不包含在 `training_wall_seconds` 中。没有预先承诺一张 A800 需要多少小时，先以 T1 的实测吞吐安排剩余队列。
 
 **当前启动器不会自动恢复未完成的 run。** 中断或失败的目录、日志和 checkpoint 会保留；再次遇到该 run 会停止，避免覆盖或把部分训练误算为完成。需要先检查失败原因与保留状态，再明确安排恢复或使用新的 `RUN_GROUP`/`OUTPUT_ROOT` 重做。更改代码、数据、batch 或预算后，也不能继续混入已有输出组。
 

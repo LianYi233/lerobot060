@@ -36,6 +36,8 @@ GROUPS = {
     "all": (*CORE, "direct_no_cpc", "no_bridge", *LR_SWEEP),
 }
 SCHEMA = "primingvla-piper-revision-v1"
+REALITY_DATASET_BASE = "/root/autodl-fs/datasets/reality"
+LEGACY_SCHEDULER = {"warmup_steps": 1000, "decay_steps": 30000, "decay_lr": 1e-5}
 
 
 def read_json(path):
@@ -156,6 +158,39 @@ def milestones(env, total):
     return sorted(set([*value, total]))
 
 
+def configure_preset(args, source_env):
+    """Keep the published review recipe reproducible; opt in to longer task models.
+
+    Long-run budget/order/group are CLI-owned so exports from a previous short
+    experiment cannot silently turn this entry point back into a 4000-step run.
+    Explicit path overrides (DATASET_BASE, WORK_ROOT, OUTPUT_ROOT) remain useful
+    for local fixtures and other machines.
+    """
+    env = source_env.copy()
+    if args.preset == "reality-long":
+        total = args.total_updates if args.total_updates is not None else 50000
+        env["TOTAL_UPDATES"] = str(total)
+        env["CUMULATIVE_CHECKPOINTS"] = args.checkpoints if args.checkpoints is not None else json.dumps(
+            sorted({step for step in (10000, 30000, total) if 1000 < step <= total})
+        )
+        env["RUN_GROUP"] = args.run_group or "reality-long-v1"
+        env.setdefault("DATASET_BASE", REALITY_DATASET_BASE)
+        group = args.group or "priming"
+        tasks = args.tasks if args.tasks is not None else "2,3,4,1"
+        ignored = [name for name in ("TOTAL_UPDATES", "CUMULATIVE_CHECKPOINTS", "TASKS", "RUN_GROUP") if name in source_env]
+        if ignored:
+            print("Long preset uses CLI/defaults for budget, checkpoint order and run group; ignores exported "
+                  + ", ".join(ignored)
+                  + ". Override with --total-updates / --checkpoints / --tasks / --run-group.", flush=True)
+    else:
+        for key, value in (("TOTAL_UPDATES", args.total_updates), ("CUMULATIVE_CHECKPOINTS", args.checkpoints), ("RUN_GROUP", args.run_group)):
+            if value is not None:
+                env[key] = str(value)
+        group = args.group or "core"
+        tasks = args.tasks if args.tasks is not None else env.get("TASKS", "1,2,3,4")
+    return env, group, tasks
+
+
 def paths_from_env(env):
     work = Path(env.get("WORK_ROOT", "/root/autodl-tmp/piper-revision")).expanduser().resolve()
     group = env.get("RUN_GROUP", "review-v1")
@@ -215,6 +250,7 @@ def dataset_identity(dataset):
 
 def build_command(job, common, paths):
     r = job["recipe"]
+    scheduler = job.get("adaptation_scheduler", LEGACY_SCHEDULER)
     values = {
         "dataset.repo_id": "may-pick-and-place/" + TASKS[job["task_id"]],
         "dataset.root": str(paths["dataset"] / TASKS[job["task_id"]]),
@@ -238,8 +274,8 @@ def build_command(job, common, paths):
         "policy.cabo_prompt_update_ratio": 2.0, "policy.action_prompt_lr_scale": r["action_prompt_lr_scale"],
         "policy.optimizer_lr": 2.5e-5, "policy.optimizer_betas": [0.9, 0.95],
         "policy.optimizer_eps": 1e-8, "policy.optimizer_weight_decay": 0.01,
-        "policy.optimizer_grad_clip_norm": 0.0, "policy.scheduler_warmup_steps": 1000,
-        "policy.scheduler_decay_steps": 30000, "policy.scheduler_decay_lr": 1e-5,
+        "policy.optimizer_grad_clip_norm": 0.0, "policy.scheduler_warmup_steps": scheduler["warmup_steps"],
+        "policy.scheduler_decay_steps": scheduler["decay_steps"], "policy.scheduler_decay_lr": scheduler["decay_lr"],
         "policy.push_to_hub": False, "policy.normalization_mapping": {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"},
         "output_dir": job["output_dir"], "job_name": job["run_name"],
         "steps": r["flow_updates"], "batch_size": common["batch_size"], "seed": job["train_seed"],
@@ -290,7 +326,29 @@ def last_diagnostic(directory):
     return None
 
 
-def progress(job, elapsed, queue_index, queue_size):
+def loss_report(job, common=None):
+    helper_path = str(ROOT / "examples/piper")
+    if helper_path not in sys.path:
+        sys.path.insert(0, helper_path)
+    from revision_loss import summarize_loss
+
+    settings = (common or job.get("common", {})).get("loss_monitor", {})
+    report = summarize_loss(
+        Path(job["output_dir"]), target=settings.get("target", 1e-4),
+        window_updates=settings.get("window_updates", 500),
+    )
+    prep = job["recipe"]["preparation_updates"]
+    for source, destination in (("last_logged_step", "last_cumulative_update"), ("first_target_step", "first_target_cumulative_update")):
+        step = report.get(source)
+        report[destination] = step + prep if step is not None else None
+    return report
+
+
+def format_loss(value):
+    return f"{value:.3e}" if value is not None else "pending"
+
+
+def progress(job, elapsed, queue_index, queue_size, common=None, log_stream=None):
     out = Path(job["output_dir"])
     record = last_diagnostic(out)
     prep = job["recipe"]["preparation_updates"]
@@ -304,7 +362,17 @@ def progress(job, elapsed, queue_index, queue_size):
     timings = record.get("train", {}) if record else {}
     step_s = timings.get("update_s", 0) + timings.get("dataloading_s", 0)
     remaining = f"~{max(0, total - done) * step_s / 60:.1f} min (current-stage rate)" if step_s > 0 else "warming up"
-    print(f"\n[QUEUE {queue_index}/{queue_size}] {job['run_name']} | {stage} | cumulative {done}/{total} ({100 * done / total:.1f}%) | elapsed {elapsed / 60:.1f} min | ETA {remaining}", flush=True)
+    report = loss_report(job, common)
+    loss_text = (
+        f" | adaptation loss(last log)={format_loss(report['latest_logged_loss'])}"
+        f" | mean[{report['actual_window_updates']} updates]={format_loss(report['trailing_loss'])}"
+        f" | target<={report['target']:.3e}: {'met' if report['stable_target_met'] else 'not met / warming up'}"
+    )
+    message = f"\n[QUEUE {queue_index}/{queue_size}] {job['run_name']} | {stage} | cumulative {done}/{total} ({100 * done / total:.1f}%) | elapsed {elapsed / 60:.1f} min | ETA {remaining}{loss_text}"
+    print(message, flush=True)
+    if log_stream is not None:
+        log_stream.write((message + "\n").encode("utf-8"))
+        log_stream.flush()
 
 
 def run_training(command, env, log, job, common, index, count):
@@ -325,13 +393,14 @@ def run_training(command, env, log, job, common, index, count):
                     elif process.poll() is not None:
                         break
                 if time.monotonic() - last_report >= 30:
-                    progress(job, time.monotonic() - started, index, count)
+                    progress(job, time.monotonic() - started, index, count, common, output)
                     last_report = time.monotonic()
                     if shutil.disk_usage(Path(job["output_dir"]).parent).free < 5 * GIB:
                         raise RuntimeError("Free disk fell below 5 GiB; stopping this run and preserving its files")
             return_code = process.wait()
             if return_code:
                 raise RuntimeError(f"Training exited {return_code}; retained log: {log}")
+            progress(job, time.monotonic() - started, index, count, common, output)
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -375,6 +444,8 @@ def audit_run(job):
         "cabo_enabled": job["recipe"]["cpc"], "action_prompt_lr_scale": job["recipe"]["action_prompt_lr_scale"],
         "chunk_size": 50,
     }
+    if "adaptation_scheduler" in job:
+        expected.update({f"scheduler_{key}": value for key, value in job["adaptation_scheduler"].items()})
     if any(config.get(key) != value for key, value in expected.items()):
         raise ValueError("Saved policy config differs from the declared reviewer control")
     split = read_json(output / "dataset_split.json")
@@ -477,29 +548,34 @@ def compact_run(job, paths, common, audit):
 
 
 def show_status(output):
-    records = sorted((output / "records").glob("*.json")) if (output / "records").is_dir() else []
-    print("run\tstatus\tcumulative_updates\ttraining_hours\tmanifest")
-    for path in records:
-        record = read_json(path)
-        print(f"{record['run_name']}\t{record['status']}\t{record['recipe']['cumulative_updates']}\t{record.get('training_wall_seconds', 0) / 3600:.2f}\t{path}")
+    paths = list((output / "records").glob("*.json")) if (output / "records").is_dir() else []
+    records = sorted(((read_json(path), path) for path in paths), key=lambda item: (item[0].get("started_at", ""), item[0]["run_name"]))
+    print("run\tstatus\tcumulative_budget\tlatest_adaptation_loss\ttrailing_mean\twindow_updates\ttarget_met\ttraining_hours\tmanifest")
+    for record, path in records:
+        report = loss_report(record)
+        print(f"{record['run_name']}\t{record['status']}\t{record['recipe']['cumulative_updates']}\t{format_loss(report['latest_logged_loss'])}\t{format_loss(report['trailing_loss'])}\t{report['actual_window_updates']}\t{report['stable_target_met']}\t{record.get('training_wall_seconds', 0) / 3600:.2f}\t{path}")
     if not records:
         print(f"No recorded runs under {output}")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, epilog="See examples/piper/README_REVISION.md. Paths: WORK_ROOT, DATASET_BASE, PRETRAINED_PATH, TOKENIZER_PATH. DRY_RUN=true validates and prints only.")
-    parser.add_argument("group", nargs="?", default="core", help="core / extended / cpc_sweep / all, or comma-separated method names")
+    parser.add_argument("group", nargs="?", help="core / extended / cpc_sweep / all, or comma-separated method names; default core (review), priming (reality-long)")
     parser.add_argument("seeds", nargs="?", default="0", help="Independent training seeds, e.g. 0 or 0,1,2")
-    parser.add_argument("--tasks", default=os.environ.get("TASKS", "1,2,3,4"))
+    parser.add_argument("--preset", choices=("review", "reality-long"), default="review")
+    parser.add_argument("--tasks", help="Ordered task IDs; reality-long defaults to 2,3,4,1")
+    parser.add_argument("--total-updates", type=int, help="Cumulative updates per model, including preparation")
+    parser.add_argument("--checkpoints", help="JSON list of cumulative update milestones; final is always included")
+    parser.add_argument("--run-group", help="Separate output/protocol group; choose a new group when changing a recipe")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args(argv)
-    env = os.environ.copy()
+    env, group, ordered_tasks = configure_preset(args, os.environ)
     paths = paths_from_env(env)
     if args.status:
         show_status(paths["output"])
         return 0
-    methods = list(GROUPS[args.group]) if args.group in GROUPS else csv_values(args.group, GROUPS["all"])
-    tasks = csv_values(args.tasks, TASKS)
+    methods = list(GROUPS[group]) if group in GROUPS else csv_values(group, GROUPS["all"])
+    tasks = csv_values(ordered_tasks, TASKS)
     seeds = [int(seed) for seed in csv_values(args.seeds)]
     if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError("Training seeds must be distinct non-negative integers")
@@ -518,8 +594,15 @@ def main(argv=None):
     split = float(env.get("EVAL_SPLIT", "0.1"))
     if not math.isfinite(split) or not 0 < split < 0.5:
         raise ValueError("EVAL_SPLIT must be in (0, 0.5); validation episodes are required")
+    loss_target = float(env.get("LOSS_TARGET", "0.0001"))
+    if not math.isfinite(loss_target) or loss_target <= 0:
+        raise ValueError("LOSS_TARGET must be finite and positive; it monitors loss without early stopping")
     common = {
-        "schema": SCHEMA, "cumulative_updates": total, "cumulative_checkpoints": milestones(env, total),
+        "schema": SCHEMA, "preset": args.preset,
+        "cumulative_updates": total, "cumulative_checkpoints": milestones(env, total),
+        "adaptation_schedule": {"mode": "full_adaptation_cosine", "warmup_steps": 1000, "decay_lr": 1e-6}
+        if args.preset == "reality-long" else {"mode": "legacy_cosine", **LEGACY_SCHEDULER},
+        "loss_monitor": {"target": loss_target, "window_updates": env_int(env, "LOSS_WINDOW_UPDATES", 500), "early_stopping": False},
         "base_path": str(paths["base"]), "base_config_sha256": sha256_file(paths["base"] / "config.json"),
         "base_sha256": "not_hashed_in_dry_run" if dry else sha256_file(paths["base"] / "model.safetensors"),
         "tokenizer_path": str(paths["tokenizer"]),
@@ -537,7 +620,8 @@ def main(argv=None):
     common["code_commit"] = code
     common["source_files_sha256"] = {
         str(path.relative_to(ROOT)): sha256_file(path)
-        for path in [Path(__file__), *sorted((ROOT / "src/lerobot/policies/pi05").glob("*.py")),
+        for path in [Path(__file__), SCRIPT_DIR / "train_piper_revision_long.sh", ROOT / "examples/piper/revision_loss.py",
+                     *sorted((ROOT / "src/lerobot/policies/pi05").glob("*.py")),
                      ROOT / "src/lerobot/scripts/lerobot_train.py", ROOT / "src/lerobot/datasets/factory.py",
                      ROOT / "src/lerobot/utils/piper_action_representation.py", ROOT / "src/lerobot/optim/cabo.py"]
     }
@@ -553,10 +637,16 @@ def main(argv=None):
             for method in methods:
                 run = f"task{task}-{method}-seed{seed}-total{total}"
                 job = {"schema": SCHEMA, "run_name": run, "task_id": task, "method": method, "train_seed": seed, "recipe": recipe(method, total), "dataset": identities[task], "output_dir": str(paths["output"] / run)}
+                job["adaptation_scheduler"] = {
+                    "warmup_steps": 1000, "decay_steps": job["recipe"]["flow_updates"], "decay_lr": 1e-6,
+                } if args.preset == "reality-long" else dict(LEGACY_SCHEDULER)
+                if args.preset == "reality-long" and job["recipe"]["flow_updates"] <= 1000:
+                    raise ValueError("The long preset requires more than 1000 adaptation updates after preparation")
                 job["signature"] = fingerprint({"common": common, "job": job})
                 jobs.append(job)
     print(f"Piper reviewer protocol: {len(jobs)} runs, ONE GPU {gpu}, sequential; batch={common['batch_size']}; 16+16 prompts=49,152 parameters", flush=True)
-    print(f"Output: {paths['output']}\nInputs: {common['inputs']}\nCumulative checkpoint budgets: {common['cumulative_checkpoints']}", flush=True)
+    print(f"Preset: {args.preset}\nDataset root: {paths['dataset']}\nTask order: {' -> '.join(tasks)}\nOutput: {paths['output']}\nInputs: {common['inputs']}\nCumulative checkpoint budgets: {common['cumulative_checkpoints']}", flush=True)
+    print(f"Adaptation schedule: {common['adaptation_schedule']}\nLoss target: {loss_target:.3e} over at least {common['loss_monitor']['window_updates']} logged adaptation updates; monitor only, no early stopping", flush=True)
     space_check(paths, common, max(job["recipe"]["preparation_updates"] for job in jobs), enforce=False)
     if dry:
         for job in jobs:
@@ -622,12 +712,15 @@ def main(argv=None):
             audit = audit_run(job)
             lock_json_contract(paths["output"] / "task_protocols" / f"task{job['task_id']}-actual.json", {"split": audit["split"], "normalization": audit["normalization"]})
             job["audit"] = audit
+            job["loss_summary"] = loss_report(job, common)
+            write_json(Path(job["output_dir"]) / "loss_summary.json", job["loss_summary"])
             job["checkpoints"] = compact_run(job, paths, common, audit)
             job["status"] = "completed"
             job["completed_at"] = datetime.now(timezone.utc).isoformat()
             write_json(Path(job["output_dir"]) / "revision_manifest.json", job)
             write_json(record_path, job)
-            print(f"DONE {job['run_name']} | training {job['training_wall_seconds'] / 3600:.2f} h | peak allocated {audit['peak_allocated_gpu_gib']:.2f} GiB | compact checkpoints verified", flush=True)
+            report = job["loss_summary"]
+            print(f"DONE {job['run_name']} | training {job['training_wall_seconds'] / 3600:.2f} h | peak allocated {audit['peak_allocated_gpu_gib']:.2f} GiB | compact checkpoints verified | adaptation loss mean[{report['actual_window_updates']}]={format_loss(report['trailing_loss'])}; target<={report['target']:.3e}: {report['stable_target_met']}", flush=True)
         except BaseException as exc:
             job["status"] = "failed"
             job["error"] = str(exc)
