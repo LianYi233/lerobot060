@@ -192,9 +192,11 @@ def test_flow_inpainting_sampler_keeps_episode_tail_anchors(tmp_path):
     assert sampler.indices == list(range(78))
 
 
-def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_path):
+@pytest.mark.parametrize("preserve_cadence", [False, True])
+def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_path, preserve_cadence):
     cfg = _make_flow_config(tmp_path, next_action_pretrain_steps=1_200)
     cfg.save_freq = 137
+    cfg.preserve_pi05_flow_save_freq = preserve_cadence
     cfg.validate()
     accelerator = _FakeAccelerator()
 
@@ -212,7 +214,24 @@ def test_stage2_save_frequency_is_independent_of_stage1_length(monkeypatch, tmp_
 
     train_module._run_pi05_next_action_pretraining(cfg, accelerator)
 
-    assert cfg.save_freq == 3_000
+    assert cfg.save_freq == (137 if preserve_cadence else 3_000)
+
+
+def test_fixed_action_lr_survives_integrated_pretraining_config_and_requires_prompt_groups(tmp_path):
+    cfg = _make_flow_config(tmp_path, cabo_enabled=False, action_prompt_lr_scale=0.25)
+    cfg.validate()
+    pretrain_cfg = train_module._make_pi05_next_action_pretraining_config(cfg)
+
+    for stage_cfg in (cfg, pretrain_cfg):
+        assert stage_cfg.cabo_active is False
+        assert stage_cfg.optimizer_step_control_active is True
+        assert stage_cfg.policy.action_prompt_lr_scale == 0.25
+        assert stage_cfg.policy.num_vlm_prompt_tokens == stage_cfg.policy.num_prompt_tokens == 16
+    assert pretrain_cfg.steps == 1_000
+    assert train_module._pi05_stage1_bridge_start_step(pretrain_cfg) == 750
+    cfg.use_policy_training_preset = False
+    with pytest.raises(ValueError, match="use_policy_training_preset=True"):
+        cfg.validate()
 
 
 @pytest.mark.parametrize("cabo_enabled", [False, True])

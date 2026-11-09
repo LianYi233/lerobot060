@@ -80,6 +80,39 @@ class _PolicyWithInactiveOptimizerStepControl(_PolicyWithOptimizerStepControl):
         self.config = SimpleNamespace(cabo_active=False)
 
 
+class _PolicyWithFixedOptimizerStepControl(_PolicyWithOptimizerStepControl):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(cabo_active=False, optimizer_step_control_active=True)
+
+
+def test_fixed_optimizer_step_control_is_not_bypassed_when_cabo_is_off():
+    policy = _PolicyWithFixedOptimizerStepControl()
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [policy.vlm_weight], "name": "vlm"},
+            {"params": [policy.action_weight], "name": "action"},
+        ],
+        lr=0.1,
+        betas=(0.0, 0.0),
+        weight_decay=0.0,
+        foreach=False,
+    )
+    _, output_dict = update_policy(
+        train_metrics=SimpleNamespace(),
+        policy=policy,
+        batch=torch.tensor(1.0),
+        optimizer=optimizer,
+        grad_clip_norm=0.0,
+        accelerator=_FakeAccelerator(),
+    )
+    assert policy.control_calls == 1
+    assert policy.vlm_weight.item() == pytest.approx(-0.1)
+    assert policy.action_weight.item() == pytest.approx(-0.025)
+    assert optimizer.param_groups[0]["lr"] == optimizer.param_groups[1]["lr"] == 0.1
+    assert output_dict["cabo/action_scale"] == 0.25
+
+
 class _PolicyWithSkippingOptimizerStep(nn.Module):
     def __init__(self):
         super().__init__()

@@ -1674,6 +1674,20 @@ class PI05Policy(PreTrainedPolicy):
             return bool(cabo_active)
         return bool(getattr(self.config, "cabo_enabled", False))
 
+    def _fixed_action_prompt_lr_scale(self) -> float:
+        # Older checkpoints and lightweight policy stand-ins have no fixed-LR field.
+        scale = getattr(self.config, "action_prompt_lr_scale", 1.0)
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(scale)
+            or not 0.0 < scale <= 1.0
+        ):
+            raise ValueError(f"action_prompt_lr_scale must be finite and in (0, 1], got {scale}")
+        if scale != 1.0 and PI05Policy._is_cabo_active(self):
+            raise ValueError("Fixed action-prompt LR scaling requires cabo_enabled=False")
+        return float(scale)
+
     def _cabo_parameter_groups(
         self,
     ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
@@ -1712,7 +1726,8 @@ class PI05Policy(PreTrainedPolicy):
         self.model._freeze_vlm()
         if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
             raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
-        if not PI05Policy._is_cabo_active(self):
+        fixed_scale = PI05Policy._fixed_action_prompt_lr_scale(self)
+        if not PI05Policy._is_cabo_active(self) and fixed_scale == 1.0:
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
                 raise ValueError("PI05 training requires at least one non-empty trainable prompt bank")
@@ -1724,8 +1739,9 @@ class PI05Policy(PreTrainedPolicy):
         ]
 
     def validate_optimizer_step_control(self, optimizer) -> None:
-        """Validate CABO's optimizer contract before the first training backward pass."""
-        if not PI05Policy._is_cabo_active(self):
+        """Validate the common CABO/fixed-LR contract before the first backward pass."""
+        fixed_scale = PI05Policy._fixed_action_prompt_lr_scale(self)
+        if not PI05Policy._is_cabo_active(self) and fixed_scale == 1.0:
             return
 
         adamw = require_adamw(optimizer)
@@ -1742,7 +1758,7 @@ class PI05Policy(PreTrainedPolicy):
             group = get_named_param_group(adamw, name)
             # torch AdamW may automatically select foreach on CUDA when this is left as None. CABO's
             # candidate simulator follows the single-tensor implementation, so make that execution
-            # path explicit before the first optimizer step.
+            # path explicit before the first optimizer step, also for the fixed-LR control.
             if group.get("foreach") is None:
                 group["foreach"] = False
             if group.get("fused") is None:
@@ -1772,12 +1788,35 @@ class PI05Policy(PreTrainedPolicy):
         optimizer,
         accelerator,
     ) -> OptimizerStepControl:
-        """Limit action-prompt AdamW learning updates relative to the VLM prompts.
+        """Apply either fixed action-prompt LR scaling or the relative-update controller.
 
         Action-only inpainting has no VLM reference and keeps its scheduled action-prompt LR.
-        The bridge and formal flow compare current, weight-decay-free relative updates, retaining
-        the VLM LR and verifying the attenuated action update in the parameter's native dtype.
+        Both controls apply only to the bridge and formal flow. The fixed control scales the
+        action group's LR, including AdamW's decoupled decay, without modifying gradients or
+        the base LR scheduler. CABO instead compares current, weight-decay-free relative
+        updates, retaining the VLM LR and verifying the action update in its native dtype.
         """
+        fixed_scale = PI05Policy._fixed_action_prompt_lr_scale(self)
+        if fixed_scale < 1.0:
+            adamw = require_adamw(optimizer)
+            vlm_group = get_named_param_group(adamw, CABO_VLM_PROMPT_GROUP)
+            action_group = get_named_param_group(adamw, CABO_ACTION_PROMPT_GROUP)
+            action_only = getattr(self.config, "training_stage", "flow") == PI05TrainingStage.NEXT_ACTION
+            bypass = action_only and not getattr(self, "_stage1_bridge_active", False)
+            effective_scale = 1.0 if bypass else fixed_scale
+            return OptimizerStepControl(
+                group_scales={} if bypass else {CABO_ACTION_PROMPT_GROUP: fixed_scale},
+                metrics={
+                    "cabo/active": 0.0,
+                    "fixed_action_lr/active": float(not bypass),
+                    "fixed_action_lr/action_only_bypass": float(bypass),
+                    "fixed_action_lr/configured_scale": fixed_scale,
+                    "fixed_action_lr/vlm_prompt_scale": 1.0,
+                    "fixed_action_lr/action_prompt_scale": effective_scale,
+                    "fixed_action_lr/effective_vlm_prompt_lr": float(vlm_group["lr"]),
+                    "fixed_action_lr/effective_action_prompt_lr": float(action_group["lr"]) * effective_scale,
+                },
+            )
         if not PI05Policy._is_cabo_active(self):
             return OptimizerStepControl()
         if getattr(self.config, "training_stage", "flow") == PI05TrainingStage.NEXT_ACTION and not getattr(

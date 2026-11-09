@@ -146,8 +146,11 @@ def _prepare_policy_optimizer_step_control(
         )
 
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    cabo_active = getattr(getattr(unwrapped_policy, "config", None), "cabo_active", None)
-    if cabo_active is False:
+    policy_cfg = getattr(unwrapped_policy, "config", None)
+    control_active = getattr(
+        policy_cfg, "optimizer_step_control_active", getattr(policy_cfg, "cabo_active", None)
+    )
+    if control_active is False:
         return OptimizerStepControl()
     if not has_method(unwrapped_policy, "compute_optimizer_step_control"):
         return OptimizerStepControl()
@@ -543,9 +546,10 @@ def _run_pi05_next_action_pretraining(
     accelerator.free_memory()
     cfg.policy.pretrained_path = pretrained_model_dir
     cfg.policy.pretrained_revision = None
-    # Stage 1 keeps only its final transfer checkpoint. Once it succeeds, persist the formal
-    # observation-conditioned flow stage at a finer, fixed cadence (plus the existing final save).
-    cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
+    # Stage 1 always keeps its final transfer checkpoint. Revision launchers may
+    # opt in to their requested flow cadence instead of the historical override.
+    if not cfg.preserve_pi05_flow_save_freq:
+        cfg.save_freq = _PI05_STAGE2_SAVE_FREQ
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logging.info(
@@ -584,9 +588,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
-        if cfg.cabo_active and accelerator.distributed_type == DistributedType.FSDP:
+        if cfg.optimizer_step_control_active and accelerator.distributed_type == DistributedType.FSDP:
             raise NotImplementedError(
-                "PI0.5 CABO currently supports single-device and DDP training only; FSDP parameter "
+                "PI0.5 CABO/fixed action LR currently supports single-device and DDP training only; FSDP parameter "
                 "sharding is not yet supported."
             )
 
@@ -782,16 +786,16 @@ def _train_single_stage(
             )
         except ValueError as exc:
             incompatible_groups = "parameter group" in str(exc).lower() or "param_groups" in str(exc).lower()
-            if cfg.cabo_active and incompatible_groups:
+            if cfg.optimizer_step_control_active and incompatible_groups:
                 raise ValueError(
-                    "An incompatible optimizer checkpoint cannot be resumed with CABO enabled because "
-                    "CABO uses named VLM prompt and action prompt parameter groups. Start a "
+                    "An incompatible optimizer checkpoint cannot be resumed with CABO/fixed action LR enabled "
+                    "because this control uses named VLM prompt and action prompt parameter groups. Start a "
                     "new run from the checkpoint's model weights, or resume a checkpoint that was "
-                    "already trained with this CABO parameter-group layout."
+                    "already trained with this named parameter-group layout."
                 ) from exc
             raise
 
-    if cfg.cabo_active and has_method(policy, "validate_optimizer_step_control"):
+    if cfg.optimizer_step_control_active and has_method(policy, "validate_optimizer_step_control"):
         policy.validate_optimizer_step_control(optimizer)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -1058,6 +1062,18 @@ def _train_single_stage(
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
+                if output_dict and "fixed_action_lr/configured_scale" in output_dict:
+                    # Keep this ablation auditable even when W&B is disabled.
+                    logging.info(
+                        "FIXED_ACTION_LR step=%d configured=%.4g applied=%.4g "
+                        "sap_bypass=%d vlm_lr=%.6g action_lr=%.6g CPC=off",
+                        step,
+                        output_dict["fixed_action_lr/configured_scale"],
+                        output_dict["fixed_action_lr/action_prompt_scale"],
+                        int(output_dict["fixed_action_lr/action_only_bypass"]),
+                        output_dict["fixed_action_lr/effective_vlm_prompt_lr"],
+                        output_dict["fixed_action_lr/effective_action_prompt_lr"],
+                    )
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:

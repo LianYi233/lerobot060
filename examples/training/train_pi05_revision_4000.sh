@@ -14,6 +14,13 @@ Variants (each uses exactly 4,000 cumulative optimizer updates):
   full_reference    750 SAP + 250 bridge + 3000 flow, dual prompts, CPC on
   full_no_cpc       750 SAP + 250 bridge + 3000 flow, dual prompts, CPC off
   action_flow_warmup 750 full-mask action flow + 250 bridge + 3000 flow, CPC on
+  fixed_action_lr_050 750 SAP + 250 bridge + 3000 flow, CPC off, action LR x0.50
+  fixed_action_lr_025 750 SAP + 250 bridge + 3000 flow, CPC off, action LR x0.25
+  fixed_action_lr_010 750 SAP + 250 bridge + 3000 flow, CPC off, action LR x0.10
+
+Fixed action LR applies only to bridge and formal flow; the first 750 SAP
+updates and the VLM prompt LR are unchanged. These are fresh training runs,
+not continuations of a CPC-trained 001000 transfer checkpoint.
 
 The formal flow checkpoints are 004000 for direct_dual/dual_prompt_only,
 and 003000 for full_reference (both represent 4,000 total updates).
@@ -42,13 +49,20 @@ else
   shift "$#"
 fi
 
+ACTION_PROMPT_LR_SCALE=1.0
+case "$VARIANT" in
+  fixed_action_lr_050) ACTION_PROMPT_LR_SCALE=0.5 ;;
+  fixed_action_lr_025) ACTION_PROMPT_LR_SCALE=0.25 ;;
+  fixed_action_lr_010) ACTION_PROMPT_LR_SCALE=0.1 ;;
+esac
+
 case "$VARIANT" in
   direct_dual|dual_prompt_only)
     FLOW_UPDATES=4000
     PRETRAIN_UPDATES=0
     BRIDGE_UPDATES=0
     ;;
-  full_reference|full_no_cpc|action_flow_warmup)
+  full_reference|full_no_cpc|action_flow_warmup|fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010)
     FLOW_UPDATES=3000
     PRETRAIN_UPDATES=1000
     BRIDGE_UPDATES=250
@@ -71,6 +85,7 @@ for arg in "$@"; do
     --policy.next_action_bridge_steps|--policy.next_action_bridge_steps=*|\
     --policy.next_action_full_mask_probability|--policy.next_action_full_mask_probability=*|\
     --policy.cabo_enabled|--policy.cabo_enabled=*|\
+    --policy.action_prompt_lr_scale|--policy.action_prompt_lr_scale=*|\
     --policy.num_prompt_tokens|--policy.num_prompt_tokens=*|\
     --policy.num_vlm_prompt_tokens|--policy.num_vlm_prompt_tokens=*)
       echo "Protocol-defining CLI override is not allowed: $arg" >&2
@@ -105,14 +120,17 @@ export NTK_SAVE_STAGE_SNAPSHOTS=false
 printf 'revision-4000: variant=%s seed=%s SAP=%d bridge=%d flow=%d total=%d CPC=%s\n' \
   "$VARIANT" "$SEED" "$((PRETRAIN_UPDATES - BRIDGE_UPDATES))" "$BRIDGE_UPDATES" \
   "$FLOW_UPDATES" "$TOTAL_UPDATES" \
-  "$(if [[ "$VARIANT" == dual_prompt_only || "$VARIANT" == full_no_cpc ]]; then echo false; else echo true; fi)"
+  "$(if [[ "$VARIANT" == dual_prompt_only || "$VARIANT" == full_no_cpc || "$VARIANT" == fixed_action_lr_* ]]; then echo false; else echo true; fi)"
+printf 'revision-4000: action_prompt_lr_scale=%s (bridge/flow only; SAP unchanged)\n' "$ACTION_PROMPT_LR_SCALE"
 
 if [[ "$VARIANT" == action_flow_warmup ]]; then
   echo "revision-4000: action-only Stage 1 uses full-mask flow matching (no visible action context), not SAP inpainting"
 fi
 
 SOURCE_VARIANT="$VARIANT"
-if [[ "$VARIANT" == full_no_cpc ]]; then
+if [[ "$VARIANT" == full_no_cpc || "$VARIANT" == fixed_action_lr_* ]]; then
   SOURCE_VARIANT=no_cabo
 fi
-exec bash "$SCRIPT_DIR/train_pi05_prompt_ablation.sh" "$SOURCE_VARIANT" "$SEED" "$@"
+exec bash "$SCRIPT_DIR/train_pi05_prompt_ablation.sh" "$SOURCE_VARIANT" "$SEED" \
+  --policy.action_prompt_lr_scale="$ACTION_PROMPT_LR_SCALE" \
+  --preserve_pi05_flow_save_freq=true "$@"

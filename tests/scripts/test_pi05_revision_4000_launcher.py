@@ -3,9 +3,11 @@
 DRY_RUN exercises the actual shell dispatch without importing ML dependencies.
 """
 
+import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TRAIN_LAUNCHER = ROOT / "examples/training/train_pi05_revision_4000.sh"
 EVAL_LAUNCHER = ROOT / "run_eval_pi05_revision_4000.sh"
 MULTI_LAUNCHER = ROOT / "examples/training/launch_pi05_revision_4gpu.sh"
+SEQUENTIAL_LAUNCHER = ROOT / "run_eval_pi05_revision_4000_sequential.sh"
 
 
 class Revision4000LauncherTest(unittest.TestCase):
@@ -69,6 +72,9 @@ class Revision4000LauncherTest(unittest.TestCase):
             ("full_reference", 3000, 1000, 250, "true", "0.0"),
             ("full_no_cpc", 3000, 1000, 250, "false", "0.0"),
             ("action_flow_warmup", 3000, 1000, 250, "true", "1.0"),
+            ("fixed_action_lr_050", 3000, 1000, 250, "false", "0.0"),
+            ("fixed_action_lr_025", 3000, 1000, 250, "false", "0.0"),
+            ("fixed_action_lr_010", 3000, 1000, 250, "false", "0.0"),
         )
         for variant, flow, pretrain, bridge, cabo, full_mask_probability in cases:
             with self.subTest(variant=variant):
@@ -82,6 +88,7 @@ class Revision4000LauncherTest(unittest.TestCase):
                     "--policy.num_prompt_tokens=16",
                     "--policy.num_vlm_prompt_tokens=16",
                     f"--save_freq={flow}",
+                    "--preserve_pi05_flow_save_freq=true",
                     "--seed=0",
                 ):
                     self.assertIn(arg, cmd)
@@ -94,6 +101,30 @@ class Revision4000LauncherTest(unittest.TestCase):
         _, stdout = self.dry_run_args("full_no_cpc")
         self.assertIn("variant=no_cabo", stdout)
         self.assertIn("SAP=750 bridge=250 flow=3000 total=4000 CPC=false", stdout)
+
+    def test_fixed_action_lr_variants_dispatch_to_staged_no_cpc_with_unique_names(self):
+        for variant, scale in (
+            ("fixed_action_lr_050", "0.5"),
+            ("fixed_action_lr_025", "0.25"),
+            ("fixed_action_lr_010", "0.1"),
+        ):
+            with self.subTest(variant=variant):
+                cmd, stdout = self.dry_run_args(variant, "2", GPU_IDS="1")
+                self.assertIn(f"--policy.action_prompt_lr_scale={scale}", cmd)
+                self.assertIn("--policy.cabo_enabled=false", cmd)
+                self.assertIn("variant=no_cabo", stdout)
+                self.assertIn("SAP=750 bridge=250 flow=3000 total=4000 CPC=false", stdout)
+                self.assertIn("CUDA_VISIBLE_DEVICES=1", cmd)
+                self.assertIn(
+                    f"--output_dir={self.work / 'checkpoints' / f'pi05-revision-{variant}-seed2-total4000'}",
+                    cmd,
+                )
+
+    def test_non_fixed_variants_keep_default_action_lr_scale(self):
+        for variant in ("full_reference", "full_no_cpc", "direct_dual", "dual_prompt_only", "action_flow_warmup"):
+            with self.subTest(variant=variant):
+                cmd, _ = self.dry_run_args(variant)
+                self.assertIn("--policy.action_prompt_lr_scale=1.0", cmd)
 
     def test_checkpoint_cadence_can_be_opted_back_into(self):
         cmd, _ = self.dry_run_args("direct_dual", SAVE_FREQ="1000")
@@ -113,6 +144,7 @@ class Revision4000LauncherTest(unittest.TestCase):
             "--policy.next_action_bridge_steps=250",
             "--policy.next_action_full_mask_probability=1.0",
             "--policy.cabo_enabled=false",
+            "--policy.action_prompt_lr_scale=0.1",
             "--policy.num_prompt_tokens=32",
             "--seed=999",
         ):
@@ -150,6 +182,9 @@ class Revision4000LauncherTest(unittest.TestCase):
             ("full_reference", "003000"),
             ("full_no_cpc", "003000"),
             ("action_flow_warmup", "003000"),
+            ("fixed_action_lr_050", "003000"),
+            ("fixed_action_lr_025", "003000"),
+            ("fixed_action_lr_010", "003000"),
         ):
             with self.subTest(variant=variant):
                 result = subprocess.run(
@@ -174,6 +209,39 @@ class Revision4000LauncherTest(unittest.TestCase):
                 )
                 self.assertIn(str(expected), result.stdout)
                 self.assertIn("ERROR: checkpoint not found", result.stdout)
+
+    def test_fixed_action_lr_sequential_eval_reuses_complete_results_and_prints_only_suites(self):
+        variants = ("fixed_action_lr_050", "fixed_action_lr_025", "fixed_action_lr_010")
+        eval_root = self.work / "eval"
+        suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+        for variant in variants:
+            out = eval_root / (
+                f"libero060-all-pi05-revision-{variant}-seed0-total4000-003000-libero-all4-resume"
+            )
+            out.mkdir(parents=True)
+            (out / "eval_info.json").write_text(json.dumps({
+                "per_group": {suite: {"n_episodes": 100, "pc_success": 80.0} for suite in suites},
+                "overall": {"n_episodes": 400, "pc_success": 80.0},
+            }))
+        result = subprocess.run(
+            ["bash", str(SEQUENTIAL_LAUNCHER), "0", *variants],
+            env=dict(
+                self.env,
+                BASE_OUTPUT=str(eval_root),
+                EPISODES_PER_TASK="10",
+                GPU_ID="3",
+                PATH=f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("[RUN]", result.stdout)
+        self.assertNotIn(".mp4", result.stdout)
+        for variant in variants:
+            self.assertIn(f"[SKIP] {variant}", result.stdout)
+            self.assertTrue(any(line.split() == [variant, *(["80.00%"] * 5)] for line in result.stdout.splitlines()))
 
     def test_four_gpu_launcher_schedules_only_remaining_three_by_default(self):
         result = subprocess.run(

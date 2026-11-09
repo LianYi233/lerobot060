@@ -113,6 +113,9 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 10_000
+    # Opt in to retaining save_freq after integrated PI0.5 preparation. The legacy
+    # launcher otherwise resets the formal-flow cadence to its historical default.
+    preserve_pi05_flow_save_freq: bool = False
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -151,6 +154,11 @@ class TrainPipelineConfig(HubMixin):
         """Whether the active policy has CABO enabled for its current training stage."""
         active_cfg = self.trainable_config
         return bool(getattr(active_cfg, "cabo_active", getattr(active_cfg, "cabo_enabled", False)))
+
+    @property
+    def optimizer_step_control_active(self) -> bool:
+        """Whether named-group update control (adaptive or fixed) is configured."""
+        return bool(getattr(self.trainable_config, "optimizer_step_control_active", self.cabo_active))
 
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.
@@ -258,9 +266,9 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if self.cabo_active and not self.use_policy_training_preset:
+        if self.optimizer_step_control_active and not self.use_policy_training_preset:
             raise ValueError(
-                "PI0.5 CABO requires use_policy_training_preset=True so its named VLM prompt "
+                "PI0.5 CABO/fixed action LR requires use_policy_training_preset=True so its named VLM prompt "
                 "and action prompt optimizer groups are constructed correctly."
             )
 

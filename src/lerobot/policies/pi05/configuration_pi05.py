@@ -145,6 +145,11 @@ class PI05Config(PreTrainedConfig):
     optimizer_weight_decay: float = 0.01
     # Global clipping is disabled for PI05.
     optimizer_grad_clip_norm: float = 0.0
+    # Fixed-LR control for the CPC/CABO ablation. With CABO disabled, values below 1
+    # multiply only the action-prompt group's scheduled LR during the bridge and formal
+    # flow steps. Action-only SAP keeps its original LR. This scales AdamW's learning
+    # update and decoupled weight decay, not the gradients or the scheduler itself.
+    action_prompt_lr_scale: float = 1.0
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:
@@ -247,6 +252,29 @@ class PI05Config(PreTrainedConfig):
                 f"action_head_grad_clip_ratio must be greater than 0, got {self.action_head_grad_clip_ratio}"
             )
 
+        if (
+            isinstance(self.action_prompt_lr_scale, bool)
+            or not isinstance(self.action_prompt_lr_scale, (int, float))
+            or not math.isfinite(self.action_prompt_lr_scale)
+            or not 0.0 < self.action_prompt_lr_scale <= 1.0
+        ):
+            raise ValueError(
+                "action_prompt_lr_scale must be finite and in (0, 1], "
+                f"got {self.action_prompt_lr_scale}"
+            )
+        if self.cabo_enabled and self.action_prompt_lr_scale != 1.0:
+            raise ValueError(
+                "action_prompt_lr_scale != 1 requires cabo_enabled=False; "
+                "fixed action-prompt LR scaling and CPC/CABO are mutually exclusive."
+            )
+        if self.action_prompt_lr_scale < 1.0 and (
+            self.num_vlm_prompt_tokens == 0 or self.num_prompt_tokens == 0
+        ):
+            raise ValueError(
+                "Fixed action-prompt LR scaling requires num_vlm_prompt_tokens > 0 "
+                "and num_prompt_tokens > 0."
+            )
+
         for name, value in (
             ("cabo_expert_update_ratio", self.cabo_expert_update_ratio),
             ("cabo_projection_update_ratio", self.cabo_projection_update_ratio),
@@ -284,6 +312,11 @@ class PI05Config(PreTrainedConfig):
     def cabo_active(self) -> bool:
         """Whether the prompt update controller is enabled; action-only steps bypass it at runtime."""
         return self.cabo_enabled
+
+    @property
+    def optimizer_step_control_active(self) -> bool:
+        """Whether CABO or its fixed action-prompt LR control needs named optimizer groups."""
+        return self.cabo_active or self.action_prompt_lr_scale != 1.0
 
     @property
     def next_action_pretraining_active(self) -> bool:
