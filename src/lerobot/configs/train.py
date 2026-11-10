@@ -235,6 +235,16 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if (
+            getattr(active_cfg, "adaptation_mode", None) == "lora"
+            and self.peft is None
+            and not active_cfg.use_peft
+        ):
+            raise ValueError(
+                "PI05 adaptation_mode=lora requires a native PEFT adapter. For fresh training, pass "
+                "--peft.method_type=LORA --peft.r=16 --peft.lora_alpha=16; do not set policy.use_peft "
+                "until loading a saved adapter checkpoint."
+            )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

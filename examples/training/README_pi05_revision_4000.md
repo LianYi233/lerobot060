@@ -1,4 +1,10 @@
-# PrimingVLA revision: budget-matched 4,000-update control
+# PrimingVLA revision: budget-matched 4,000-update controls
+
+For the external prompt-free **PI0.5 + LoRA** baseline, see
+[`README_pi05_lora_baseline.md`](README_pi05_lora_baseline.md). Its variant is
+`lora_r16`: direct 4,000-update flow training, rank/alpha 16, no SAP/CPC/prompts,
+with the same initialization and data settings. Existing prompt controls and
+default multi-GPU schedules are unchanged.
 
 This is the first rebuttal experiment for the critique that the published
 `full_reference` uses 1,000 more optimizer updates than `direct_dual`.
@@ -77,9 +83,11 @@ Each job also writes its normal training log under `LOG_ROOT`. It selects one
 physical GPU per process via `CUDA_VISIBLE_DEVICES`, and isolates compiler
 caches. Do not run `all` when GPU 0 is already active.
 
-Runs use unique names (`pi05-revision-<variant>-seed<seed>-total4000`), write
-checkpoints every 1,000 formal-flow updates, and refuse to overwrite existing
-results. Stage/NTK diagnostic snapshots are disabled consistently to avoid
+Runs use unique names (`pi05-revision-<variant>-seed<seed>-total4000`) and refuse
+to overwrite existing results. Prompt controls now save only their final flow
+checkpoint by default; set `SAVE_FREQ=1000` to retain intermediate checkpoints.
+The external `lora_r16` baseline defaults to every 1,000 updates because it saves
+compact adapters. Stage/NTK diagnostic snapshots are disabled consistently to avoid
 extra disk I/O. Passing `FLOW_STEPS` or a protocol-defining CLI override cannot
 silently change the total 4,000-step budget. Use the same `BATCH_SIZE`,
 `PRETRAINED_PATH`, `DATASET_ROOT`, `TOKENIZER_PATH`, CUDA precision and optimizer

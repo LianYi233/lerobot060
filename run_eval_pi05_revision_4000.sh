@@ -6,10 +6,12 @@ usage() {
 Usage: bash run_eval_pi05_revision_4000.sh VARIANT [all|no10|SUITE] [SEED]
 
 VARIANT: direct_dual, dual_prompt_only, full_reference, full_no_cpc, action_flow_warmup
-         fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010
-Default suites: all four standard LIBERO suites; default seed: 0.
+         fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010, lora_r16
+Default suites: all four standard LIBERO suites; default training seed: 0.
+SEED selects the training run; the shared evaluation seed remains 1000.
 Direct variants evaluate flow checkpoint 004000, and staged variants evaluate
 flow checkpoint 003000. Both represent 4,000 total optimizer updates.
+LoRA evaluates its saved adapter at 004000 with the original local base.
 
 Set CKPT_ROOT and BASE_OUTPUT to override the isolated revision-4000 roots;
 GPU_ID, EPISODES_PER_TASK and the original evaluation protocol are unchanged.
@@ -33,7 +35,7 @@ if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then
 fi
 
 case "$VARIANT" in
-  direct_dual|dual_prompt_only) STEP=4000 ;;
+  direct_dual|dual_prompt_only|lora_r16) STEP=4000 ;;
   full_reference|full_no_cpc|action_flow_warmup|fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) STEP=3000 ;;
   *)
     echo "Unknown revision variant: $VARIANT" >&2

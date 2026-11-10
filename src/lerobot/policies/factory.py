@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
@@ -55,7 +56,7 @@ from .lingbot_va.configuration_lingbot_va import LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
-from .pi05.configuration_pi05 import PI05Config
+from .pi05.configuration_pi05 import PI05_LORA_TARGET_MODULES, PI05Config
 from .pretrained import PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
@@ -622,8 +623,22 @@ def make_policy(
         logging.info("Loading policy's PEFT adapter.")
 
         peft_pretrained_path = str(cfg.pretrained_path)
-        peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+        pi05_lora = cfg.type == "pi05" and getattr(cfg, "adaptation_mode", "prompt") == "lora"
+        peft_load_kwargs = {}
+        if pi05_lora:
+            # The matched-initialization baseline must never replace a missing local
+            # adapter/base with a similarly named Hub repository or cached revision.
+            adapter_path = Path(peft_pretrained_path).expanduser()
+            if not adapter_path.is_dir():
+                raise FileNotFoundError(
+                    f"PI05 LoRA adapter must be a local checkpoint directory: {adapter_path}"
+                )
+            peft_pretrained_path = str(adapter_path.resolve())
+            peft_load_kwargs["local_files_only"] = True
+        peft_config = PeftConfig.from_pretrained(peft_pretrained_path, **peft_load_kwargs)
         if cfg.type == "pi05":
+            if not pi05_lora and getattr(peft_config, "target_modules", None) == PI05_LORA_TARGET_MODULES:
+                raise ValueError("This PI05 LoRA adapter requires adaptation_mode='lora', not prompt mode")
             saved_modules = getattr(peft_config, "modules_to_save", None) or []
             for prompt_module, num_tokens, config_field in (
                 ("model.vlm_prompt_tokens", cfg.num_vlm_prompt_tokens, "num_vlm_prompt_tokens"),
@@ -649,12 +664,26 @@ def make_policy(
                 "the adapter was trained."
             )
 
+        if pi05_lora:
+            base_path = Path(kwargs["pretrained_name_or_path"]).expanduser()
+            if not base_path.is_dir() or not (base_path / "model.safetensors").is_file():
+                raise FileNotFoundError(
+                    "PI05 LoRA adapter requires its original local base checkpoint with model.safetensors: "
+                    f"{base_path}. Restore that base; the adapter does not contain its frozen weights."
+                )
+            kwargs["pretrained_name_or_path"] = str(base_path.resolve())
+            kwargs["local_files_only"] = True
+
         policy = policy_cls.from_pretrained(**kwargs)
+        if pi05_lora:
+            # Loading an adapter bypasses wrap_with_peft(), so validate its actual
+            # saved targets/settings before PEFT can attach incompatible modules.
+            policy._validate_peft_config(peft_config)
         policy = PeftModel.from_pretrained(
-            policy, peft_pretrained_path, config=peft_config, is_trainable=True
+            policy, peft_pretrained_path, config=peft_config, is_trainable=True, **peft_load_kwargs
         )
         if cfg.type == "pi05":
-            # Adapter loading bypasses PI05Policy.wrap_with_peft and may enable backbone adapters.
+            # Reapply the selected prompt-only or LoRA-only trainability contract.
             policy.get_base_model().model._freeze_backbones()
 
     else:

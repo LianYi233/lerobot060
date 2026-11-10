@@ -63,6 +63,7 @@ from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.io_utils import write_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -588,6 +589,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator = _make_training_accelerator(cfg, accelerator)
 
     try:
+        if (
+            getattr(cfg.policy, "adaptation_mode", None) == "lora"
+            and accelerator.distributed_type == DistributedType.FSDP
+        ):
+            raise NotImplementedError(
+                "The PI05 external LoRA baseline currently supports single-device and DDP training, "
+                "not FSDP. For matched independent seeds, run one process on each GPU."
+            )
         if cfg.optimizer_step_control_active and accelerator.distributed_type == DistributedType.FSDP:
             raise NotImplementedError(
                 "PI0.5 CABO/fixed action LR currently supports single-device and DDP training only; FSDP parameter "
@@ -803,7 +812,8 @@ def _train_single_stage(
 
     # TRAINABLE_PARAMETER_REPORT_V1
     if is_main_process:
-        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "other": 0}
+        _parameter_counts = {"vlm_prompt": 0, "action_prompt": 0, "lora_vlm": 0, "lora_action": 0, "other": 0}
+        _trainable_parameters = []
         logging.info("========== Trainable parameter report ==========")
         logging.info("Training stage: %s", getattr(cfg.policy, "training_stage", "unknown"))
         for _name, _parameter in policy.named_parameters():
@@ -814,9 +824,14 @@ def _train_single_stage(
                 _category = "vlm_prompt"
             elif "prompt_tokens" in _name.split("."):
                 _category = "action_prompt"
+            elif {"lora_A", "lora_B"}.intersection(_name.split(".")):
+                _category = "lora_action" if "gemma_expert" in _name.split(".") else "lora_vlm"
             else:
                 _category = "other"
             _parameter_counts[_category] += _count
+            _trainable_parameters.append(
+                {"name": _name, "shape": list(_parameter.shape), "numel": _count, "category": _category}
+            )
             logging.info(
                 "TRAINABLE %s | shape=%s | params=%s",
                 _name,
@@ -833,6 +848,35 @@ def _train_single_stage(
             100 * num_learnable_params / max(1, num_total_params),
         )
         logging.info("================================================")
+        if getattr(cfg.policy, "adaptation_mode", None) == "lora":
+            # Persist the actual adapter budget, not the much smaller prompt count.
+            # Checkpoints keep full training/PEFT/processor configs separately.
+            report_path = Path(cfg.output_dir) / "trainable_parameters.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                {
+                    "adaptation_mode": "lora",
+                    "trainable_total": num_learnable_params,
+                    "all_parameters": num_total_params,
+                    "counts": _parameter_counts,
+                    "parameters": _trainable_parameters,
+                    "base_model_paths": {
+                        name: str(adapter.base_model_name_or_path)
+                        for name, adapter in policy.peft_config.items()
+                    },
+                    "training_seed": cfg.seed,
+                    "total_updates": cfg.steps,
+                    "batch_size_per_process": cfg.batch_size,
+                    "num_processes": accelerator.num_processes,
+                    "effective_batch_size": cfg.batch_size * accelerator.num_processes,
+                    "dtype": cfg.policy.dtype,
+                    "mixed_precision": accelerator.mixed_precision,
+                    "dataset_root": str(cfg.dataset.root),
+                    "tokenizer_name": cfg.policy.tokenizer_name,
+                },
+                report_path,
+            )
+            logging.info("LoRA parameter/protocol report: %s", report_path)
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")

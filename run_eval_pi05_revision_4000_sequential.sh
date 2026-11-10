@@ -46,7 +46,7 @@ fi
 
 checkpoint_step() {
     case "$1" in
-        direct_dual|dual_prompt_only) echo 004000 ;;
+        direct_dual|dual_prompt_only|lora_r16) echo 004000 ;;
         full_reference|full_no_cpc|action_flow_warmup) echo 003000 ;;
         fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) echo 003000 ;;
         *) echo "Unknown revision variant: $1" >&2; return 2 ;;
@@ -153,6 +153,7 @@ root, seed = Path(sys.argv[1]), sys.argv[2]
 steps = {
     "direct_dual": "004000",
     "dual_prompt_only": "004000",
+    "lora_r16": "004000",
     "full_reference": "003000",
     "full_no_cpc": "003000",
     "action_flow_warmup": "003000",

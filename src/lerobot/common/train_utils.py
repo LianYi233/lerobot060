@@ -145,9 +145,11 @@ def save_checkpoint(
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy.save_pretrained(pretrained_dir, state_dict=model_state_dict)
     cfg.save_pretrained(pretrained_dir)
-    if cfg.peft is not None:
+    if cfg.peft is not None or getattr(getattr(policy, "config", None), "use_peft", False):
         # When using PEFT, policy.save_pretrained will only write the adapter weights + config, not the
         # policy config which we need for loading the model. In this case we'll write it ourselves.
+        # An adapter loaded from policy.pretrained_path can have cfg.peft=None; its saved policy
+        # config still marks use_peft=True. Reward/non-PEFT configs do not require this extra save.
         policy.config.save_pretrained(pretrained_dir)
     if preprocessor is not None:
         preprocessor.save_pretrained(pretrained_dir)

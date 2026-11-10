@@ -14,8 +14,9 @@ Variants:
   vlm_only          0 pretraining + 3000 flow, VLM prompt only, CABO off
   action_only       0 pretraining + 3000 flow, action prompt only, CABO off
   no_cabo           750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO off
+  lora_r16          4000 flow, standard LoRA on both transformers, no prompts/SAP/CPC
 
-All variants use 3000 flow updates by default. Set FLOW_STEPS to override this
+Prompt variants use 3000 flow updates by default. Set FLOW_STEPS to override this
 for a one-off run.
 full_reference automatically saves exact initialization and priming-end snapshots,
 and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000).
@@ -52,6 +53,8 @@ FLOW_STEPS_OVERRIDE="${FLOW_STEPS:-}"
 FLOW_STEPS_DEFAULT=3000
 SAVE_FREQ_DEFAULT=3000
 NTK_SNAPSHOTS_DEFAULT=false
+ADAPTATION_MODE=prompt
+PEFT_ARGS=()
 
 case "${VARIANT}" in
   full_reference)
@@ -89,6 +92,19 @@ case "${VARIANT}" in
     ;;
   no_cabo)
     CABO_ENABLED=false
+    ;;
+  lora_r16)
+    ADAPTATION_MODE=lora
+    VLM_PROMPT_TOKENS=0
+    ACTION_PROMPT_TOKENS=0
+    PRETRAIN_STEPS=0
+    BRIDGE_STEPS=0
+    CABO_ENABLED=false
+    FLOW_STEPS_DEFAULT=4000
+    SAVE_FREQ_DEFAULT=1000
+    # Leave policy.use_peft=false for the initial base load. Native PEFT sets it
+    # to true after wrapping, and saves true in the adapter's policy config.
+    PEFT_ARGS=(--peft.method_type=LORA --peft.r=16 --peft.lora_alpha=16)
     ;;
   *)
     echo "Unknown variant: ${VARIANT}" >&2
@@ -157,6 +173,7 @@ TRAIN_ARGS=(
   --dataset.root="${DATASET_ROOT}"
   --dataset.video_backend="${VIDEO_BACKEND}"
   --policy.type=pi05
+  --policy.adaptation_mode="${ADAPTATION_MODE}"
   --policy.training_stage=flow
   --policy.pretrained_path="${PRETRAINED_PATH}"
   --policy.tokenizer_name="${TOKENIZER_PATH}"
@@ -181,6 +198,7 @@ TRAIN_ARGS=(
   --seed="${SEED}"
   --save_checkpoint=true
   --save_freq="${SAVE_FREQ}"
+  "${PEFT_ARGS[@]}"
 )
 
 LAUNCH_ARGS=(
@@ -194,6 +212,7 @@ fi
 
 echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}"
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED} full_mask_probability=${FULL_MASK_PROBABILITY}"
+echo "adaptation_mode=${ADAPTATION_MODE} base=${PRETRAINED_PATH} effective_batch=$((BATCH_SIZE * NUM_PROCESSES))"
 echo "output=${OUTPUT_DIR}"
 echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
 if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then

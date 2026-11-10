@@ -18,6 +18,7 @@ import builtins
 import copy
 import logging
 import math
+import re
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -61,6 +62,7 @@ from lerobot.optim.cabo import (
 from lerobot.policies.pi05.attention_pi05 import pi05_attention_forward
 from lerobot.policies.pi05.configuration_pi05 import (
     DEFAULT_IMAGE_SIZE,
+    PI05_LORA_TARGET_MODULES,
     PI05Config,
     PI05TrainingObjective,
     PI05TrainingStage,
@@ -754,7 +756,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
-            train_expert_only=True,
+            train_expert_only=config.train_expert_only,
             attention_implementation=config.attention_implementation,
             separate_frozen_observations=config.separate_frozen_observations,
             num_vlm_prompt_tokens=config.num_vlm_prompt_tokens,
@@ -797,15 +799,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _freeze_vlm(self) -> None:
-        """Compatibility entry point for enforcing prompt-only training after adapter loading."""
+        """Compatibility entry point for enforcing the selected adaptation contract."""
         self._freeze_backbones()
 
     def _freeze_backbones(self) -> None:
-        """Freeze every parameter except the active VLM/expert prompt embeddings.
+        """Freeze base weights, retaining only the selected mode's active adapters/prompts.
 
         Preserve PEFT's active modules_to_save selection: its original prompt copies must stay
         frozen. Autograd remains enabled through both backbones to reach the input prompts.
         """
+        if getattr(getattr(self, "config", None), "adaptation_mode", "prompt") == "lora":
+            adapter_ids = set()
+            for name, module in self.named_modules():
+                if re.fullmatch(PI05_LORA_TARGET_MODULES, f"model.{name}") is None:
+                    continue
+                if getattr(module, "disable_adapters", False):
+                    continue
+                # PEFT owns active/inactive adapter selection and trainability. Keep only
+                # its already-enabled low-rank A/B matrices; never re-enable an inference
+                # adapter, inactive adapter, prompt, or the wrapped base Linear weights.
+                for adapter_name in getattr(module, "active_adapters", ()):
+                    for bank_name in ("lora_A", "lora_B"):
+                        bank = getattr(module, bank_name, {})
+                        if adapter_name in bank:
+                            adapter_ids.update(
+                                id(parameter)
+                                for parameter in bank[adapter_name].parameters()
+                                if parameter.requires_grad and parameter.numel() > 0
+                            )
+            for parameter in self.parameters():
+                if id(parameter) not in adapter_ids:
+                    parameter.requires_grad_(False)
+                    parameter.grad = None
+            # The transformer modules retain the train/eval mode selected by the caller.
+            # Forcing the whole VLM to eval would also disable its adapter dropout and
+            # interfere with checkpointing. The untouched vision encoder stays in eval.
+            self.paligemma_with_expert.paligemma.model.vision_tower.eval()
+            return
+
         prompt_ids = set()
         for module in (self.vlm_prompt_tokens, self.prompt_tokens):
             modules_to_save = getattr(module, "modules_to_save", None)
@@ -1724,6 +1755,14 @@ class PI05Policy(PreTrainedPolicy):
 
     def get_optim_params(self):
         self.model._freeze_vlm()
+        if getattr(self.config, "adaptation_mode", "prompt") == "lora":
+            parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+            if not parameters:
+                raise ValueError(
+                    "PI05 LoRA training requires non-empty active LoRA adapters. "
+                    "Wrap the pretrained policy with --peft.method_type=LORA before creating the optimizer."
+                )
+            return parameters
         if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
             raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
         fixed_scale = PI05Policy._fixed_action_prompt_lr_scale(self)
@@ -2297,7 +2336,16 @@ class PI05Policy(PreTrainedPolicy):
         return valid_count.sum(dtype=torch.float32) * action_dim
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Use PEFT to save both prompt banks without adding backbone adapters."""
+        """Select real transformer LoRA or the backward-compatible prompt-only adapter."""
+        if self.config.adaptation_mode == "lora":
+            return {
+                "target_modules": PI05_LORA_TARGET_MODULES,
+                "modules_to_save": [],
+                "r": 16,
+                "lora_alpha": 16,
+                "lora_dropout": 0.0,
+                "bias": "none",
+            }
         return {
             # PEFT's DUMMY_TARGET_MODULES sentinel permits a modules_to_save-only adapter.
             "target_modules": "dummy-target-modules",
@@ -2306,6 +2354,65 @@ class PI05Policy(PreTrainedPolicy):
 
     def _validate_peft_config(self, peft_config) -> None:
         super()._validate_peft_config(peft_config)
+        if self.config.adaptation_mode == "lora":
+            from peft import PeftType
+
+            if peft_config.peft_type != PeftType.LORA:
+                raise ValueError("PI05 LoRA adaptation requires peft.method_type=LORA")
+            if peft_config.target_modules != PI05_LORA_TARGET_MODULES:
+                raise ValueError(
+                    "PI05 LoRA requires its exact VLM/action transformer attention+MLP target regex; "
+                    "omit peft.target_modules to use the baseline target set."
+                )
+            if peft_config.modules_to_save:
+                raise ValueError(
+                    "PI05 LoRA cannot use modules_to_save/full_training_modules or learned prompts"
+                )
+            if (
+                isinstance(peft_config.r, bool)
+                or not isinstance(peft_config.r, int)
+                or peft_config.r <= 0
+                or isinstance(peft_config.lora_alpha, bool)
+                or not isinstance(peft_config.lora_alpha, (int, float))
+                or not math.isfinite(peft_config.lora_alpha)
+                or peft_config.lora_alpha <= 0
+            ):
+                raise ValueError("PI05 LoRA requires a positive integer rank and a finite positive alpha")
+            # Keep this an ordinary, base-preserving LoRA baseline, with no silent extra
+            # trainable parameters or per-layer changes hidden in an adapter config.
+            incompatible = []
+            for name, expected in (
+                ("bias", "none"),
+                ("lora_bias", False),
+                ("lora_dropout", 0.0),
+                ("use_dora", False),
+                ("use_rslora", False),
+                ("use_qalora", False),
+                ("fan_in_fan_out", False),
+            ):
+                if getattr(peft_config, name, expected) != expected:
+                    incompatible.append(name)
+            for name in (
+                "rank_pattern",
+                "alpha_pattern",
+                "exclude_modules",
+                "target_parameters",
+                "layers_to_transform",
+                "layers_pattern",
+                "layer_replication",
+                "trainable_token_indices",
+                "alora_invocation_tokens",
+            ):
+                if getattr(peft_config, name, None):
+                    incompatible.append(name)
+            if getattr(peft_config, "init_lora_weights", True) is not True:
+                incompatible.append("init_lora_weights")
+            if incompatible:
+                raise ValueError(
+                    "PI05 LoRA baseline requires standard zero-output-initialized LoRA without extra "
+                    f"adaptation settings; incompatible={sorted(incompatible)}"
+                )
+            return
         # Even custom adapter settings must save both prompt banks.
         modules_to_save = list(peft_config.modules_to_save or [])
         for name in ("model.vlm_prompt_tokens", "model.prompt_tokens"):
@@ -2315,6 +2422,8 @@ class PI05Policy(PreTrainedPolicy):
 
     def wrap_with_peft(self, peft_config=None, peft_cli_overrides: dict | None = None):
         policy = super().wrap_with_peft(peft_config, peft_cli_overrides)
-        # Freeze custom backbone/projection adapters as well; only active prompt copies train.
+        # Prompt mode freezes custom backbone adapters; LoRA mode preserves only active A/B.
         self.model._freeze_vlm()
+        if self.config.adaptation_mode == "lora":
+            self.get_optim_params()  # Fail immediately if no trainable adapter was actually attached.
         return policy

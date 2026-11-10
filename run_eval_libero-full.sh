@@ -7,7 +7,7 @@ usage() {
   echo "Usage: $0 VARIANT [all|no10|libero_spatial|libero_object|libero_goal|libero_10] [SEED]"
   echo "Example: $0 direct_dual no10 0"
   echo "VARIANT: full_reference, full_no_cpc, no_bridge, direct_dual, dual_prompt_only, action_flow_warmup, vlm_only, action_only, no_cabo"
-  echo "         fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010"
+  echo "         fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010, lora_r16"
   echo "Defaults: all suites, seed 0. STEPS remains configured below."
 }
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -24,9 +24,15 @@ SEED="${3:-0}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}"
 case "$VARIANT" in
   full_reference|full_no_cpc|no_bridge|direct_dual|dual_prompt_only|action_flow_warmup|vlm_only|action_only|no_cabo) ;;
-  fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) ;;
+  fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010|lora_r16) ;;
   *) echo "Unknown model variant: $VARIANT" >&2; usage >&2; exit 2 ;;
 esac
+if [[ "$VARIANT" == lora_r16 ]]; then
+  # The adapter depends on the original local base and its saved local tokenizer.
+  # A missing dependency must fail, not be substituted by a Hub download.
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+fi
 if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "SEED must be a non-negative integer without leading zeros" >&2
   exit 2
@@ -190,11 +196,34 @@ def atomic_json(path, data):
         if os.path.exists(temp):
             os.unlink(temp)
 
+def lora_base_manifest(model_path):
+    """Include the frozen external base without changing older full-model manifests."""
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        return {}
+    config = json.loads(config_path.read_text())
+    if config.get("type") != "pi05" or config.get("adaptation_mode", "prompt") != "lora":
+        return {}
+    adapter_config = json.loads((model_path / "adapter_config.json").read_text())
+    base_name = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_name, str) or not base_name:
+        raise RuntimeError("PI05 LoRA adapter has no saved original local base checkpoint")
+    base = Path(base_name).expanduser()
+    if not base.is_dir() or not (base / "model.safetensors").is_file():
+        raise RuntimeError(f"PI05 LoRA original local base is missing or incomplete: {base}")
+    base = base.resolve()
+    return {"peft_base": {
+        "path": str(base),
+        "files": [[name, (base / name).stat().st_size, (base / name).stat().st_mtime_ns]
+                  for name in ("config.json", "model.safetensors") if (base / name).is_file()],
+    }}
+
 manifest = {
     "version": 1, "arguments": sys.argv[1:],
     "model_files": [[str(p.relative_to(model)), p.stat().st_size, p.stat().st_mtime_ns]
                     for p in sorted(model.rglob("*")) if p.is_file()],
     "evaluator_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+    **lora_base_manifest(model),
     **attention_manifest,
 }
 manifest_file = output / "resume_manifest.json"

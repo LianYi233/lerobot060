@@ -27,6 +27,14 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 DEFAULT_IMAGE_SIZE = 224
 
+# Restrict the external LoRA baseline to the two language/action transformer stacks.
+# A suffix-only q_proj/v_proj rule would also adapt the frozen vision encoder.
+PI05_LORA_TARGET_MODULES = (
+    r"model\.paligemma_with_expert\."
+    r"(paligemma\.model\.language_model|gemma_expert\.model)\.layers\.\d+\."
+    r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))"
+)
+
 
 class PI05TrainingStage(StrEnum):
     """Training objectives supported by PI0.5."""
@@ -50,11 +58,16 @@ class PI05Config(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
     tokenizer_name: str = "google/paligemma-3b-pt-224"
 
-    # Only these two prompt banks train; the complete VLM and action path stay frozen.
+    # Prompt adaptation remains the backward-compatible default. The external LoRA
+    # baseline uses native PEFT adapters, ordinary observation-conditioned flow,
+    # and no prompts, SAP, bridge, CPC/CABO, or action-prompt LR controller.
+    adaptation_mode: str = "prompt"
+
+    # In prompt mode only these two banks train; the VLM and action path stay frozen.
     # VLM prompts follow the observation/language prefix, using the VLM embedding width.
     num_vlm_prompt_tokens: int = 16
     # Expert prompts precede action tokens, using the action expert embedding width.
-    # Either bank can be disabled for an ablation with CABO disabled. Both may be 0 for inference only.
+    # Either bank can be disabled with CABO disabled. Both are 0 for LoRA or prompt-free inference.
     num_prompt_tokens: int = 16
     prompt_init_std: float = 0.02
 
@@ -132,8 +145,8 @@ class PI05Config(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
-    # Legacy finetuning flags retained for checkpoint/CLI compatibility. PI05 always freezes the
-    # complete VLM, action expert, and projections; only the two prompt banks can train.
+    # Legacy finetuning flags retained for checkpoint/CLI compatibility. Base parameters
+    # remain frozen in both modes; LoRA requires autograd through the VLM transformer.
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
 
@@ -185,9 +198,37 @@ class PI05Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
+        if self.adaptation_mode not in ("prompt", "lora"):
+            raise ValueError(f"adaptation_mode must be 'prompt' or 'lora', got {self.adaptation_mode!r}")
+
+        if self.adaptation_mode == "lora":
+            expected = {
+                "training_stage": "flow",
+                "num_vlm_prompt_tokens": 0,
+                "num_prompt_tokens": 0,
+                "next_action_pretrain_steps": 0,
+                "next_action_bridge_steps": 0,
+                "cabo_enabled": False,
+                "action_prompt_lr_scale": 1.0,
+                "clip_action_head_by_vlm": False,
+            }
+            incompatible = [
+                f"{name}={getattr(self, name)!r} (requires {value!r})"
+                for name, value in expected.items()
+                if getattr(self, name) != value
+            ]
+            if incompatible:
+                raise ValueError(
+                    "PI05 LoRA baseline requires direct prompt-free flow: " + "; ".join(incompatible)
+                )
+            # The prompt-only optimization detaches the entire observation transformer.
+            # Leaving it enabled would silently prevent VLM LoRA from receiving gradients.
+            self.separate_frozen_observations = False
+
+        # Older prompt configs explicitly stored False. Loading them must never unfreeze
+        # base parameters. LoRA enables the VLM's autograd path, not its base weights.
         self.freeze_vision_encoder = True
-        self.train_expert_only = True
+        self.train_expert_only = self.adaptation_mode == "prompt"
 
         for name in ("num_vlm_prompt_tokens", "num_prompt_tokens"):
             value = getattr(self, name)
