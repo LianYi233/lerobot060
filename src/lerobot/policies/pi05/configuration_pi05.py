@@ -70,6 +70,14 @@ class PI05Config(PreTrainedConfig):
     train_action_head: bool = False
     action_expert_lr_scale: float = 0.1
 
+    # Opt-in partial fine-tuning from an existing, completed full checkpoint.
+    # All profiles retain the learned VLM/action prompts and freeze the vision tower.
+    # These switches change no state_dict tensor names, only trainable-parameter selection.
+    partial_ft_enabled: bool = False
+    train_vlm_last_n_layers: int = 0
+    action_projection_lr_scale: float = 0.4
+    vlm_lr_scale: float = 0.04
+
     # Opt-in Piper experiment. Refit state/action statistics on the selected training split.
     # Relative labels use q[t+k] - q[t] for six joints; gripper stays absolute.
     piper_train_normalization: bool = False
@@ -225,7 +233,43 @@ class PI05Config(PreTrainedConfig):
 
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True
-        self.train_expert_only = True
+        if type(self.partial_ft_enabled) is not bool:
+            raise ValueError("partial_ft_enabled must be a boolean")
+        if (
+            type(self.train_vlm_last_n_layers) is not int
+            or not 0 <= self.train_vlm_last_n_layers <= 18
+        ):
+            raise ValueError("train_vlm_last_n_layers must be an integer from 0 to 18")
+        for label, scale in (
+            ("action_projection_lr_scale", self.action_projection_lr_scale),
+            ("vlm_lr_scale", self.vlm_lr_scale),
+        ):
+            if not math.isfinite(scale) or not 0 < scale <= 1:
+                raise ValueError(f"{label} must be finite and in (0, 1]")
+        if self.train_vlm_last_n_layers and not self.partial_ft_enabled:
+            raise ValueError("Unfreezing VLM layers requires partial_ft_enabled=True")
+        if self.partial_ft_enabled:
+            if (
+                self.train_action_head
+                or self.train_action_expert_last_n_layers < 1
+                or not self.train_action_projections
+                or self.cabo_enabled
+                or self.use_peft
+                or self.action_prompt_lr_scale != 1.0
+                or self.next_action_pretrain_steps != 0
+                or self.next_action_bridge_steps != 0
+                or self.training_stage != "flow"
+            ):
+                raise ValueError(
+                    "partial_ft_enabled requires direct flow from an existing checkpoint, "
+                    "last-N expert blocks, action projections, cabo_enabled=False, "
+                    "use_peft=False and action_prompt_lr_scale=1"
+                )
+        # True uses the faster no-gradient observation-KV path; VLM adaptation must
+        # keep observed tokens in the differentiable joint attention path.
+        self.train_expert_only = self.train_vlm_last_n_layers == 0
+        if self.train_vlm_last_n_layers:
+            self.separate_frozen_observations = False
         if type(self.piper_gripper_history_steps) is not int or self.piper_gripper_history_steps not in (
             0,
             20,

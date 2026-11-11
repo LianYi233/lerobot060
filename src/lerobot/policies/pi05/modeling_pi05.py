@@ -765,7 +765,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
-            train_expert_only=True,
+            train_expert_only=not bool(config.train_vlm_last_n_layers),
             attention_implementation=config.attention_implementation,
             separate_frozen_observations=config.separate_frozen_observations,
             num_vlm_prompt_tokens=config.num_vlm_prompt_tokens,
@@ -823,6 +823,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             trainable_modules.extend([self.action_in_proj, self.action_out_proj])
         expert_blocks = self.trainable_expert_blocks()
         trainable_modules.extend(expert_blocks)
+        vlm_blocks = self.trainable_vlm_blocks()
+        trainable_modules.extend(vlm_blocks)
         if getattr(self.config, "train_action_head", False):
             trainable_modules.extend(self.trainable_action_head_modules())
         for module in trainable_modules:
@@ -851,6 +853,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.eval()
         for block in expert_blocks:
             block.train(self.training)
+        for block in vlm_blocks:
+            block.train(self.training)
         if getattr(self.config, "train_action_head", False):
             self.paligemma_with_expert.gemma_expert.model.train(self.training)
 
@@ -863,6 +867,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.time_mlp_in,
             self.time_mlp_out,
         ]
+
+    def trainable_vlm_blocks(self) -> list[nn.Module]:
+        count = getattr(self.config, "train_vlm_last_n_layers", 0)
+        if not count:
+            return []
+        layers = self.paligemma_with_expert.paligemma.model.language_model.layers
+        if count > len(layers):
+            raise ValueError(f"Requested {count} trainable VLM blocks but model has {len(layers)}")
+        return list(layers[-count:])
 
     def trainable_expert_blocks(self) -> list[nn.Module]:
         if getattr(self.config, "train_action_head", False):
@@ -1777,6 +1790,40 @@ class PI05Policy(PreTrainedPolicy):
         self.model._freeze_vlm()
         if self.config.training_stage == PI05TrainingStage.NEXT_ACTION and self.config.num_prompt_tokens == 0:
             raise ValueError("Action-only prompt training requires num_prompt_tokens > 0")
+        if getattr(self.config, "partial_ft_enabled", False):
+            if PI05Policy._is_cabo_active(self):
+                raise ValueError("Partial fine-tuning uses ordinary AdamW groups, not prompt CABO")
+            specs = [
+                ("prompts", [self.model.vlm_prompt_tokens, self.model.prompt_tokens], 1.0),
+                (
+                    "action_projections",
+                    [self.model.action_in_proj, self.model.action_out_proj],
+                    self.config.action_projection_lr_scale,
+                ),
+                ("action_expert_blocks", self.model.trainable_expert_blocks(), self.config.action_expert_lr_scale),
+                ("vlm_last_layers", self.model.trainable_vlm_blocks(), self.config.vlm_lr_scale),
+            ]
+            all_trainable = {id(p) for p in self.parameters() if p.requires_grad}
+            seen = set()
+            groups = []
+            for name, modules, scale in specs:
+                selected = _unique_trainable_parameters(modules)
+                ids = {id(p) for p in selected}
+                if ids & seen:
+                    raise ValueError(f"Duplicate trainable parameters in partial fine-tuning group {name}")
+                if name != "vlm_last_layers" and not selected:
+                    raise ValueError(f"Partial fine-tuning group {name} is empty")
+                if selected:
+                    groups.append(
+                        {"params": selected, "name": name, "lr": self.config.optimizer_lr * scale}
+                    )
+                seen.update(ids)
+            if seen != all_trainable:
+                raise ValueError(
+                    f"Partial fine-tuning has {len(all_trainable - seen)} ungrouped "
+                    f"and {len(seen - all_trainable)} unexpected trainable parameters"
+                )
+            return groups
         if not PI05Policy._is_cabo_active(self) and getattr(self.config, "action_prompt_lr_scale", 1.0) == 1.0:
             parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
             if not parameters:
