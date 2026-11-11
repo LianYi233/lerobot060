@@ -7,6 +7,7 @@ Usage: bash run_eval_pi05_revision_4000.sh VARIANT [all|no10|SUITE] [SEED]
 
 VARIANT: direct_dual, dual_prompt_only, full_reference, full_no_cpc, action_flow_warmup
          fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010
+         optim_carry_carry, optim_reset_carry, optim_carry_restart, optim_reset_restart
 Default suites: all four standard LIBERO suites; default seed: 0.
 Direct variants evaluate flow checkpoint 004000, and staged variants evaluate
 flow checkpoint 003000. Both represent 4,000 total optimizer updates.
@@ -34,7 +35,7 @@ fi
 
 case "$VARIANT" in
   direct_dual|dual_prompt_only) STEP=4000 ;;
-  full_reference|full_no_cpc|action_flow_warmup|fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) STEP=3000 ;;
+  full_reference|full_no_cpc|action_flow_warmup|fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010|optim_carry_carry|optim_reset_carry|optim_carry_restart|optim_reset_restart) STEP=3000 ;;
   *)
     echo "Unknown revision variant: $VARIANT" >&2
     usage >&2

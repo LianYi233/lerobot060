@@ -8,6 +8,7 @@ usage() {
   echo "Example: $0 direct_dual no10 0"
   echo "VARIANT: full_reference, full_no_cpc, no_bridge, direct_dual, dual_prompt_only, action_flow_warmup, vlm_only, action_only, no_cabo"
   echo "         fixed_action_lr_050, fixed_action_lr_025, fixed_action_lr_010"
+  echo "         optim_carry_carry, optim_reset_carry, optim_carry_restart, optim_reset_restart"
   echo "Defaults: all suites, seed 0. STEPS remains configured below."
 }
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -24,7 +25,8 @@ SEED="${3:-0}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}"
 case "$VARIANT" in
   full_reference|full_no_cpc|no_bridge|direct_dual|dual_prompt_only|action_flow_warmup|vlm_only|action_only|no_cabo) ;;
-  fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) ;;
+  fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010|\
+  optim_carry_carry|optim_reset_carry|optim_carry_restart|optim_reset_restart) ;;
   *) echo "Unknown model variant: $VARIANT" >&2; usage >&2; exit 2 ;;
 esac
 if [[ ! "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]; then

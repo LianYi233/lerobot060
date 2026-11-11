@@ -150,6 +150,10 @@ class PI05Config(PreTrainedConfig):
     # flow steps. Action-only SAP keeps its original LR. This scales AdamW's learning
     # update and decoupled weight decay, not the gradients or the scheduler itself.
     action_prompt_lr_scale: float = 1.0
+    # Reviewer P1 ablation: control whether AdamW moments and LR scheduler
+    # progress survive the Stage-II -> Stage-III optimizer boundary.
+    stage3_adamw_moments: str = "reset"  # reset | carry
+    stage3_lr_scheduler: str = "restart"  # restart | carry
 
     # Limit action-side gradient spikes relative to the VLM. The comparison is
     # made using the RMS gradient over all elements in each parameter group:
@@ -184,6 +188,11 @@ class PI05Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.stage3_adamw_moments not in ("reset", "carry"):
+            raise ValueError("stage3_adamw_moments must be 'reset' or 'carry'")
+        if self.stage3_lr_scheduler not in ("restart", "carry"):
+            raise ValueError("stage3_lr_scheduler must be 'restart' or 'carry'")
 
         # Older configs explicitly stored False. Loading them must never unfreeze either backbone.
         self.freeze_vision_encoder = True

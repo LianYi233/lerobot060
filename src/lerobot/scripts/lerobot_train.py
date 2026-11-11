@@ -56,13 +56,16 @@ from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
-from lerobot.optim.cabo import OptimizerStepControl, temporary_optimizer_group_lr_scales
+from lerobot.optim.cabo import CABO_GROUP_NAME, OptimizerStepControl, temporary_optimizer_group_lr_scales
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.optim.optimizers import load_optimizer_state
+from lerobot.optim.schedulers import load_scheduler_state
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR
+from lerobot.utils.constants import OPTIMIZER_PARAM_GROUPS, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.io_utils import load_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -348,6 +351,7 @@ def _pi05_next_action_pretraining_active(cfg: TrainPipelineConfig) -> bool:
     policy_cfg = cfg.policy
     return bool(
         not cfg.resume
+        and cfg.pi05_stage3_transfer_checkpoint is None
         and not cfg.is_reward_model_training
         and policy_cfg is not None
         and policy_cfg.type == "pi05"
@@ -359,7 +363,9 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     """Build an isolated frozen-VLM Stage 1 without mutating the formal flow config."""
     from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05TrainingStage
 
-    if not _pi05_next_action_pretraining_active(cfg) or not isinstance(cfg.policy, PI05Config):
+    if not (
+        _pi05_next_action_pretraining_active(cfg) or cfg.pi05_stage3_transfer_checkpoint is not None
+    ) or not isinstance(cfg.policy, PI05Config):
         raise ValueError("Integrated PI0.5 Stage 1 requires a non-resumed flow run")
     if cfg.output_dir is None:
         raise ValueError("output_dir must be resolved before building the PI0.5 pretraining stage")
@@ -559,6 +565,167 @@ def _run_pi05_next_action_pretraining(
     )
 
 
+def _pi05_stage3_transition_requested(cfg: TrainPipelineConfig) -> bool:
+    """Only non-default P1 carry modes require restoring Stage-II training state."""
+    policy_cfg = cfg.policy
+    return bool(
+        not cfg.resume
+        and policy_cfg is not None
+        and policy_cfg.type == "pi05"
+        and policy_cfg.training_stage == "flow"
+        and (
+            getattr(policy_cfg, "stage3_adamw_moments", "reset") == "carry"
+            or getattr(policy_cfg, "stage3_lr_scheduler", "restart") == "carry"
+        )
+    )
+
+
+def _restore_pi05_stage3_transition(
+    cfg: TrainPipelineConfig,
+    optimizer: Optimizer,
+    scheduler,
+    accelerator: "Accelerator",
+) -> tuple[Optimizer, Any]:
+    """Restore requested Stage-II AdamW moments and/or scheduler independently.
+
+    Stage III starts at its own update step zero and resets the dataloader RNG
+    to the shared training seed. The Stage-II 1000-step cosine schedule has
+    reached its terminal LR; carrying it means keeping that LR plateau, not
+    applying a step=1000 cursor to a new 3000-step schedule.
+    """
+    if not _pi05_stage3_transition_requested(cfg):
+        return optimizer, scheduler
+    if accelerator.num_processes != 1:
+        raise ValueError("PI0.5 optimizer-transition ablations require NUM_PROCESSES=1 per run")
+    if getattr(cfg.policy, "adaptation_mode", "prompt") != "prompt" or not cfg.policy.cabo_enabled:
+        raise ValueError("PI0.5 optimizer-transition ablations require prompt adaptation with CPC enabled")
+
+    stage1_cfg = _make_pi05_next_action_pretraining_config(cfg)
+    if cfg.optimizer != stage1_cfg.optimizer or cfg.scheduler != stage1_cfg.scheduler:
+        raise ValueError(
+            "Carry/reset ablations must use identical AdamW hyperparameters and scheduler "
+            "configuration in Stage II and Stage III; remove overrides before comparing them"
+        )
+    if cfg.pi05_stage3_transfer_checkpoint is None:
+        checkpoint_dir = get_step_checkpoint_dir(stage1_cfg.output_dir, stage1_cfg.steps, stage1_cfg.steps)
+    else:
+        checkpoint_dir = Path(cfg.pi05_stage3_transfer_checkpoint)
+    expected_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    if Path(cfg.policy.pretrained_path).resolve() != expected_model_dir.resolve():
+        raise ValueError(
+            "The transition source must match the selected Stage-II checkpoint, "
+            f"expected {expected_model_dir}; got {cfg.policy.pretrained_path}"
+        )
+    state_dir = checkpoint_dir / TRAINING_STATE_DIR
+    if not state_dir.is_dir():
+        raise FileNotFoundError(f"Stage-II training state is missing: {state_dir}")
+
+    # Both stages must enumerate the same two named prompt parameter groups;
+    # an order mismatch could attach the wrong AdamW moments to a prompt bank.
+    saved_groups = load_json(state_dir / OPTIMIZER_PARAM_GROUPS)
+    current_groups = optimizer.state_dict()["param_groups"]
+    if len(saved_groups) != len(current_groups):
+        raise ValueError("Stage-II/III optimizer parameter-group counts differ")
+    for saved_group, current_group in zip(saved_groups, current_groups, strict=True):
+        if len(saved_group["params"]) != len(current_group["params"]):
+            raise ValueError("Stage-II/III optimizer parameter counts differ")
+        if saved_group.get(CABO_GROUP_NAME) != current_group.get(CABO_GROUP_NAME):
+            raise ValueError("Stage-II/III named optimizer parameter groups differ")
+        for key in ("betas", "eps", "weight_decay"):
+            if saved_group.get(key) != current_group.get(key):
+                # JSON stores AdamW beta tuples as lists.
+                if key != "betas" or tuple(saved_group[key]) != tuple(current_group[key]):
+                    raise ValueError(f"Stage-II/III AdamW {key} differs")
+
+    reset_lrs = [group["lr"] for group in optimizer.param_groups]
+    if cfg.policy.stage3_adamw_moments == "carry":
+        optimizer = load_optimizer_state(optimizer, state_dir)
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                state = optimizer.state.get(param, {})
+                if not state or any(
+                    name not in state or state[name].shape != param.shape
+                    for name in ("exp_avg", "exp_avg_sq")
+                ):
+                    raise ValueError("Stage-II AdamW moments missing or incompatible with Stage-III prompts")
+
+    if cfg.policy.stage3_lr_scheduler == "carry":
+        # Recreate the original 1000-step scheduler closure before restoring
+        # its saved position. Otherwise its LR curve would change implicitly.
+        scheduler = stage1_cfg.scheduler.build(optimizer, stage1_cfg.steps)
+        scheduler = load_scheduler_state(scheduler, state_dir)
+        continued_lrs = scheduler.get_last_lr()
+        if len(continued_lrs) != len(optimizer.param_groups):
+            raise ValueError("Stage-II scheduler group count differs from Stage-III optimizer")
+        for group, lr in zip(optimizer.param_groups, continued_lrs, strict=True):
+            group["lr"] = lr
+    else:
+        # Loading AdamW moments also restores Stage-II LR. Keep the original
+        # freshly initialized Stage-III scheduler in the restart condition.
+        for group, lr in zip(optimizer.param_groups, reset_lrs, strict=True):
+            group["lr"] = lr
+
+    logging.info(
+        "PI05_OPTIMIZER_TRANSITION moments=%s scheduler=%s source=%s "
+        "stage1_updates=%d stage3_initial_lrs=%s scheduler_epoch=%s",
+        cfg.policy.stage3_adamw_moments,
+        cfg.policy.stage3_lr_scheduler,
+        state_dir,
+        stage1_cfg.steps,
+        [group["lr"] for group in optimizer.param_groups],
+        getattr(scheduler, "last_epoch", None),
+    )
+    return optimizer, scheduler
+
+
+def _validate_pi05_stage3_source(cfg: TrainPipelineConfig) -> None:
+    """Fail early when a shared Stage-II source differs from the requested P1 protocol."""
+    checkpoint_dir = Path(cfg.pi05_stage3_transfer_checkpoint)
+    pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    state_dir = checkpoint_dir / TRAINING_STATE_DIR
+    if cfg.resume or cfg.policy is None or cfg.policy.type != "pi05":
+        raise ValueError("Shared PI0.5 transition requires a fresh, non-resumed PI0.5 run")
+    if cfg.policy.training_stage != "flow" or cfg.policy.next_action_pretrain_steps <= 0:
+        raise ValueError("Shared PI0.5 transition requires a staged flow recipe with a nonzero prefix")
+    if getattr(cfg.policy, "adaptation_mode", "prompt") != "prompt" or not cfg.policy.cabo_enabled:
+        raise ValueError("Shared PI0.5 transition requires CPC-enabled prompt adaptation")
+    if Path(cfg.policy.pretrained_path).resolve() != pretrained_dir.resolve():
+        raise ValueError("Set PRETRAINED_PATH to the shared Stage-II checkpoint's pretrained_model directory")
+    if not pretrained_dir.is_dir() or not state_dir.is_dir():
+        raise FileNotFoundError(f"Incomplete shared Stage-II checkpoint: {checkpoint_dir}")
+    source_config = load_json(pretrained_dir / "train_config.json")
+    expected_values = (
+        ("seed", source_config.get("seed"), cfg.seed),
+        ("steps", source_config.get("steps"), cfg.policy.next_action_pretrain_steps),
+        ("batch_size", source_config.get("batch_size"), cfg.batch_size),
+        ("dataset repo_id", source_config.get("dataset", {}).get("repo_id"), cfg.dataset.repo_id),
+        (
+            "bridge_steps",
+            source_config.get("policy", {}).get("next_action_bridge_steps"),
+            cfg.policy.next_action_bridge_steps,
+        ),
+        (
+            "VLM prompt tokens",
+            source_config.get("policy", {}).get("num_vlm_prompt_tokens"),
+            cfg.policy.num_vlm_prompt_tokens,
+        ),
+        (
+            "action prompt tokens",
+            source_config.get("policy", {}).get("num_prompt_tokens"),
+            cfg.policy.num_prompt_tokens,
+        ),
+    )
+    for name, actual, expected in expected_values:
+        if actual != expected:
+            raise ValueError(f"Shared Stage-II {name} mismatch: checkpoint={actual!r}, run={expected!r}")
+    if source_config.get("policy", {}).get("training_stage") != "next_action":
+        raise ValueError("Shared checkpoint was not produced by Stage-II next_action training")
+    source_root = Path(source_config["dataset"]["root"]).resolve()
+    if source_root != Path(cfg.dataset.root).resolve():
+        raise ValueError(f"Shared Stage-II dataset differs: {source_root} vs {cfg.dataset.root}")
+    logging.info("Using shared PI0.5 Stage-II checkpoint: %s", checkpoint_dir)
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     """
@@ -594,8 +761,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "sharding is not yet supported."
             )
 
+        if cfg.pi05_stage1_only and cfg.pi05_stage3_transfer_checkpoint is not None:
+            raise ValueError("pi05_stage1_only and pi05_stage3_transfer_checkpoint are mutually exclusive")
+        if cfg.pi05_stage1_only and not _pi05_next_action_pretraining_active(cfg):
+            raise ValueError("pi05_stage1_only requires a fresh integrated PI0.5 flow run")
+        if cfg.pi05_stage3_transfer_checkpoint is not None:
+            _validate_pi05_stage3_source(cfg)
         if _pi05_next_action_pretraining_active(cfg):
             _run_pi05_next_action_pretraining(cfg, accelerator)
+            if cfg.pi05_stage1_only:
+                logging.info("PI0.5 shared optimizer-ablation prefix complete; stopping before Stage III")
+                return None
 
         return _train_single_stage(cfg, accelerator)
     finally:
@@ -758,6 +934,10 @@ def _train_single_stage(
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if _pi05_stage3_transition_requested(cfg):
+        optimizer, lr_scheduler = _restore_pi05_stage3_transition(
+            cfg, optimizer, lr_scheduler, accelerator
+        )
 
     # Create sample weighter if configured (e.g., for RA-BC training)
     sample_weighter = None

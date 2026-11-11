@@ -116,6 +116,10 @@ class TrainPipelineConfig(HubMixin):
     # Opt in to retaining save_freq after integrated PI0.5 preparation. The legacy
     # launcher otherwise resets the formal-flow cadence to its historical default.
     preserve_pi05_flow_save_freq: bool = False
+    # Build the 1,000-update SAP+Bridge prefix once, then train each of the four
+    # independent 3,000-update optimizer-state/scheduler-state P1 cells from it.
+    pi05_stage1_only: bool = False
+    pi05_stage3_transfer_checkpoint: Path | None = None
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None

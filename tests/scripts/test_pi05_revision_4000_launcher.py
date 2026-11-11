@@ -34,6 +34,17 @@ class Revision4000LauncherTest(unittest.TestCase):
 
         for dirname in ("dataset", "pretrained", "tokenizer"):
             (self.work / dirname).mkdir()
+        self.prefix = self.work / "shared_prefix" / "checkpoints" / "001000"
+        (self.prefix / "pretrained_model").mkdir(parents=True)
+        (self.prefix / "training_state").mkdir()
+        for relpath in (
+            "pretrained_model/train_config.json",
+            "pretrained_model/model.safetensors",
+            "training_state/optimizer_state.safetensors",
+            "training_state/optimizer_param_groups.json",
+            "training_state/scheduler_state.json",
+        ):
+            (self.prefix / relpath).touch()
 
         self.env = dict(
             os.environ,
@@ -45,6 +56,7 @@ class Revision4000LauncherTest(unittest.TestCase):
             DRY_RUN="true",
             GPU_IDS="0",
             NUM_PROCESSES="1",
+            PREFIX_CHECKPOINT_DIR=str(self.prefix),
         )
         for variable in ("RUN_NAME", "SAVE_FREQ", "NTK_SAVE_STAGE_SNAPSHOTS"):
             self.env.pop(variable, None)
@@ -75,6 +87,10 @@ class Revision4000LauncherTest(unittest.TestCase):
             ("fixed_action_lr_050", 3000, 1000, 250, "false", "0.0"),
             ("fixed_action_lr_025", 3000, 1000, 250, "false", "0.0"),
             ("fixed_action_lr_010", 3000, 1000, 250, "false", "0.0"),
+            ("optim_carry_carry", 3000, 1000, 250, "true", "0.0"),
+            ("optim_reset_carry", 3000, 1000, 250, "true", "0.0"),
+            ("optim_carry_restart", 3000, 1000, 250, "true", "0.0"),
+            ("optim_reset_restart", 3000, 1000, 250, "true", "0.0"),
         )
         for variant, flow, pretrain, bridge, cabo, full_mask_probability in cases:
             with self.subTest(variant=variant):
@@ -125,6 +141,52 @@ class Revision4000LauncherTest(unittest.TestCase):
             with self.subTest(variant=variant):
                 cmd, _ = self.dry_run_args(variant)
                 self.assertIn("--policy.action_prompt_lr_scale=1.0", cmd)
+
+    def test_optimizer_prefix_only_runs_stages_one_and_two(self):
+        cmd, output = self.dry_run_args("optim_prefix", "3", GPU_IDS="0")
+        self.assertIn("--pi05_stage1_only=true", cmd)
+        self.assertIn("--policy.next_action_pretrain_steps=1000", cmd)
+        self.assertIn("--policy.next_action_bridge_steps=250", cmd)
+        self.assertIn("-prefix1000", output)
+
+    def test_optimizer_transition_cells_use_same_prefix_and_distinct_states(self):
+        for variant, moments, scheduler in (
+            ("optim_carry_carry", "carry", "carry"),
+            ("optim_reset_carry", "reset", "carry"),
+            ("optim_carry_restart", "carry", "restart"),
+            ("optim_reset_restart", "reset", "restart"),
+        ):
+            with self.subTest(variant=variant):
+                cmd, output = self.dry_run_args(variant, "3", GPU_IDS="2")
+                self.assertIn(f"--policy.stage3_adamw_moments={moments}", cmd)
+                self.assertIn(f"--policy.stage3_lr_scheduler={scheduler}", cmd)
+                self.assertIn(f"--pi05_stage3_transfer_checkpoint={self.prefix}", cmd)
+                self.assertIn(f"--policy.pretrained_path={self.prefix / 'pretrained_model'}", cmd)
+                self.assertIn("--steps=3000", cmd)
+                self.assertIn("--seed=3", cmd)
+                self.assertIn("CUDA_VISIBLE_DEVICES=2", cmd)
+                self.assertIn("variant=full_reference", output)
+
+    def test_transition_rejects_missing_source_state(self):
+        result = self.run_train("optim_carry_carry", "3", PREFIX_CHECKPOINT_DIR="")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("require PREFIX_CHECKPOINT_DIR", result.stderr)
+        (self.prefix / "training_state/scheduler_state.json").unlink()
+        result = self.run_train("optim_reset_restart", "3")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Missing Stage-II state file", result.stderr)
+
+    def test_transition_rejects_multiple_processes(self):
+        result = self.run_train("optim_reset_carry", "3", NUM_PROCESSES="3")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("NUM_PROCESSES=1", result.stderr)
+
+    def test_transition_flags_cannot_be_overridden(self):
+        for arg in ("--policy.stage3_adamw_moments=reset", "--policy.stage3_lr_scheduler=restart"):
+            with self.subTest(arg=arg):
+                result = self.run_train("optim_carry_carry", "3", arg)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("Protocol-defining", result.stderr)
 
     def test_checkpoint_cadence_can_be_opted_back_into(self):
         cmd, _ = self.dry_run_args("direct_dual", SAVE_FREQ="1000")
@@ -185,6 +247,10 @@ class Revision4000LauncherTest(unittest.TestCase):
             ("fixed_action_lr_050", "003000"),
             ("fixed_action_lr_025", "003000"),
             ("fixed_action_lr_010", "003000"),
+            ("optim_carry_carry", "003000"),
+            ("optim_reset_carry", "003000"),
+            ("optim_carry_restart", "003000"),
+            ("optim_reset_restart", "003000"),
         ):
             with self.subTest(variant=variant):
                 result = subprocess.run(
