@@ -65,7 +65,7 @@ def test_full_action_head_allows_vlm_adaptation_but_not_last_n_mode(last):
     assert cfg.train_action_projections is True
     assert cfg.train_expert_only == (last == 0)
     assert cfg.separate_frozen_observations == (last == 0)
-    with pytest.raises(ValueError, match="train_action_expert_last_n_layers=0"):
+    with pytest.raises(ValueError, match="last-N=0"):
         PI05Config(
             partial_ft_enabled=True,
             train_action_head=True,
