@@ -50,6 +50,53 @@ nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
 df -h "$WORK_ROOT"
 ```
 
+### AutoDL A800 instead of the /data1 local server
+
+If the 50k checkpoint is already on AutoDL, do **not** transfer it to the local server.
+Use a separate worktree and restore the final model from its verified compact bundle:
+
+```bash
+cd /root/autodl-tmp/lerobot060-piper-reality
+git fetch origin piper-partial-ft
+git worktree add --detach /root/autodl-tmp/lerobot060-piper-partial-ft origin/piper-partial-ft
+cd /root/autodl-tmp/lerobot060-piper-partial-ft
+
+export WORK_ROOT=/root/autodl-tmp/piper-partial-ft-work
+export DATASET_BASE=/root/autodl-fs/datasets/reality
+export TOKENIZER_PATH=/root/autodl-fs/ckpt/google/paligemma-3b-pt-224
+export PRETRAINED_PATH=/root/autodl-tmp/piper-revision/materialized/task2-priming-seed0-total50000
+
+# Restore only if model.safetensors is not already present and output directory is absent.
+# Check free disk space first; materialization creates a full-sized model copy.
+df -h /root/autodl-tmp
+if [[ ! -f "$PRETRAINED_PATH/model.safetensors" ]]; then
+  if [[ -e "$PRETRAINED_PATH" ]]; then
+    echo "Existing incomplete model directory: $PRETRAINED_PATH" >&2
+    exit 1
+  fi
+  python examples/piper/revision_checkpoint.py materialize \
+    --bundle /root/autodl-tmp/piper-revision/runs/reality-parallel-v1/task2-priming-seed0-total50000/bundles/total-050000 \
+    --base /root/autodl-tmp/piper-revision/runs/reality-parallel-v1/storage_base \
+    --output "$PRETRAINED_PATH"
+fi
+
+# A800 has one visible card in many AutoDL containers; choose its actual index.
+nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+GPU_IDS=0 DRY_RUN=true \
+  bash examples/training/train_piper_partial_ft.sh action4
+
+# 200-step GPU smoke after DRY_RUN validates; no robot execution.
+GPU_IDS=0 FLOW_STEPS=200 WARMUP_STEPS=20 SAVE_STEPS='[100,200]' \
+  RUN_GROUP=smoke-action4-autodl DRY_RUN=false \
+  bash examples/training/train_piper_partial_ft.sh action4
+```
+
+Set `WORK_ROOT` to an actual writable AutoDL work disk, with sufficient space for
+full checkpoints. The new launcher detects AutoDL paths and opts out of the
+legacy /data1 path migration; other existing Piper launchers keep their original
+local-server behavior. Run one profile at a time on the single A800. After smoke,
+run `action4`, `dual2`, `dual4` sequentially with distinct `RUN_GROUP` names.
+
 Use the **same dataset identity and deterministic 10% episode split** as the original
 50k experiment; new processor stats are refitted from the training split. Copying the
 checkpoint alone but changing the dataset or split invalidates direct comparisons.

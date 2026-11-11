@@ -35,6 +35,11 @@ if (( $# > 1 )); then echo "Unexpected positional arguments: ${*:2}" >&2; exit 2
 
 export NUM_PROCESSES=1
 export WORK_ROOT="${WORK_ROOT:-/data1/wyn/piper-work}"
+# AutoDL checkpoints and datasets reside under /root/autodl-tmp and /root/autodl-fs.
+# The legacy local preset otherwise remaps /root/autodl-tmp paths to /data1.
+if [[ "$WORK_ROOT" == /root/autodl-tmp || "$WORK_ROOT" == /root/autodl-tmp/* ]]; then
+  export PIPER_RUNTIME_LAYOUT=autodl
+fi
 export BATCH_SIZE="${BATCH_SIZE:-1}"
 export DTYPE="${DTYPE:-bfloat16}"
 export MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
