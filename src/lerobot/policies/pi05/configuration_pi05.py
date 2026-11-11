@@ -71,6 +71,8 @@ class PI05Config(PreTrainedConfig):
     action_expert_lr_scale: float = 0.1
 
     # Opt-in partial fine-tuning from an existing, completed full checkpoint.
+    # Supports full continuous-action head OR last-N expert blocks, with VLM upper
+    # language layers optional. Vision tower, embeddings and unused expert LM head stay frozen.
     # All profiles retain the learned VLM/action prompts and freeze the vision tower.
     # These switches change no state_dict tensor names, only trainable-parameter selection.
     partial_ft_enabled: bool = False
@@ -249,9 +251,10 @@ class PI05Config(PreTrainedConfig):
         if self.train_vlm_last_n_layers and not self.partial_ft_enabled:
             raise ValueError("Unfreezing VLM layers requires partial_ft_enabled=True")
         if self.partial_ft_enabled:
+            full_head = self.train_action_head and self.train_action_expert_last_n_layers == 0
+            selected_blocks = not self.train_action_head and self.train_action_expert_last_n_layers > 0
             if (
-                self.train_action_head
-                or self.train_action_expert_last_n_layers < 1
+                not (full_head or selected_blocks)
                 or not self.train_action_projections
                 or self.cabo_enabled
                 or self.use_peft
@@ -262,8 +265,9 @@ class PI05Config(PreTrainedConfig):
             ):
                 raise ValueError(
                     "partial_ft_enabled requires direct flow from an existing checkpoint, "
-                    "last-N expert blocks, action projections, cabo_enabled=False, "
-                    "use_peft=False and action_prompt_lr_scale=1"
+                    "either full action head (last-N=0) or last-N expert blocks, "
+                    "action projections, cabo_enabled=False, use_peft=False "
+                    "and action_prompt_lr_scale=1"
                 )
         # True uses the faster no-gradient observation-KV path; VLM adaptation must
         # keep observed tokens in the differentiable joint attention path.

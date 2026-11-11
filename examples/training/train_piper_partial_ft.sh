@@ -5,24 +5,32 @@ set -euo pipefail
 
 usage() {
 cat <<'EOF'
-Usage: DRY_RUN=true GPU_IDS=1 bash examples/training/train_piper_partial_ft.sh action4|dual2|dual4
-       DRY_RUN=false GPU_IDS=1 bash examples/training/train_piper_partial_ft.sh action4|dual2|dual4
+Usage: DRY_RUN=true GPU_IDS=0 bash examples/training/train_piper_partial_ft.sh fullhead|fullhead_vlm2|fullhead_vlm4
+       DRY_RUN=false GPU_IDS=0 bash examples/training/train_piper_partial_ft.sh fullhead|fullhead_vlm2|fullhead_vlm4
+Also supported (original partial experiments): action4|dual2|dual4
 Required: DATASET_BASE, PRETRAINED_PATH (materialized task2 50k), TOKENIZER_PATH.
 Optional: WORK_ROOT=/data1/wyn/piper-work, FLOW_STEPS=10000, SAVE_STEPS='[1000,3000,5000,10000]',
           WARMUP_STEPS=500, BATCH_SIZE=1, RUN_GROUP=..., EVAL_SPLIT=0.1,
           ACTION_EVAL_FREQ=500, NUM_WORKERS=2.
-The three profiles use identical prompt banks, action projections and final 4 action
-expert layers. dual2/dual4 additionally train the last 2/4 VLM language layers.
+The original action4/dual2/dual4 profiles train the last 4 expert blocks;
+fullhead/fullhead_vlm2/fullhead_vlm4 train ALL expert blocks, final expert norm,
+action projections and time MLPs. *_vlm2/4 also train VLM's final 2/4 language
+layers. Vision tower, embeddings and unused expert LM head stay frozen.
 All are new model-weight initialization runs from 50k: NO SAP/Bridge or optimizer resume.
 This does NOT perform three-card data parallelism.
 EOF
 }
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; exit 0; fi
 PROFILE="${1:-}"
+FULL_ACTION_HEAD=false
+EXPERT_LAST=4
 case "$PROFILE" in
     action4) VLM_LAST=0 ;;
     dual2) VLM_LAST=2 ;;
     dual4) VLM_LAST=4 ;;
+    fullhead) VLM_LAST=0; FULL_ACTION_HEAD=true; EXPERT_LAST=0 ;;
+    fullhead_vlm2) VLM_LAST=2; FULL_ACTION_HEAD=true; EXPERT_LAST=0 ;;
+    fullhead_vlm4) VLM_LAST=4; FULL_ACTION_HEAD=true; EXPERT_LAST=0 ;;
     *) usage >&2; exit 2 ;;
 esac
 if (( $# > 1 )); then echo "Unexpected positional arguments: ${*:2}" >&2; exit 2; fi
@@ -103,7 +111,7 @@ with safe_open(str(p / "model.safetensors"), framework="pt", device="cpu") as f:
 print(f"Source policy validated (learned 16+16 prompts): {p}")
 PY
 
-echo "Piper partial FT profile=$PROFILE GPU=$GPU_IDS VLM_last=$VLM_LAST expert_last=4"
+echo "Piper partial FT profile=$PROFILE GPU=$GPU_IDS VLM_last=$VLM_LAST full_action_head=$FULL_ACTION_HEAD expert_last=$EXPERT_LAST"
 echo "Initialization: $PRETRAINED_PATH; flow updates=$FLOW_STEPS, no SAP/Bridge"
 echo "Output group: $RUN_GROUP; LR base=2.5e-5, projections/expert=1e-5, VLM=1e-6"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,8 +119,8 @@ exec bash "$SCRIPT_DIR/train_piper_autodl.sh" 2 dual_prompt_only 0 \
   --policy.partial_ft_enabled=true \
   "--policy.train_vlm_last_n_layers=$VLM_LAST" \
   --policy.train_action_projections=true \
-  --policy.train_action_expert_last_n_layers=4 \
-  --policy.train_action_head=false \
+  "--policy.train_action_expert_last_n_layers=$EXPERT_LAST" \
+  "--policy.train_action_head=$FULL_ACTION_HEAD" \
   --policy.action_projection_lr_scale=0.4 \
   --policy.action_expert_lr_scale=0.4 \
   --policy.vlm_lr_scale=0.04 \

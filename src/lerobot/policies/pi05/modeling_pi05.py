@@ -861,9 +861,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def trainable_action_head_modules(self) -> list[nn.Module]:
         """Modules used by continuous-action prediction; never the unused text LM head."""
         return [
-            self.paligemma_with_expert.gemma_expert.model,
+            *self.trainable_action_core_modules(),
             self.action_in_proj,
             self.action_out_proj,
+        ]
+
+    def trainable_action_core_modules(self) -> list[nn.Module]:
+        """All expert Transformer blocks + final norm + temporal MLPs.
+
+        Action projections are grouped separately so their learning rate is
+        explicit and no parameter appears twice in a full-head optimizer.
+        """
+        return [
+            self.paligemma_with_expert.gemma_expert.model,
             self.time_mlp_in,
             self.time_mlp_out,
         ]
@@ -1800,7 +1810,13 @@ class PI05Policy(PreTrainedPolicy):
                     [self.model.action_in_proj, self.model.action_out_proj],
                     self.config.action_projection_lr_scale,
                 ),
-                ("action_expert_blocks", self.model.trainable_expert_blocks(), self.config.action_expert_lr_scale),
+                (
+                    "action_head_core" if self.config.train_action_head else "action_expert_blocks",
+                    self.model.trainable_action_core_modules()
+                    if self.config.train_action_head
+                    else self.model.trainable_expert_blocks(),
+                    self.config.action_expert_lr_scale,
+                ),
                 ("vlm_last_layers", self.model.trainable_vlm_blocks(), self.config.vlm_lr_scale),
             ]
             all_trainable = {id(p) for p in self.parameters() if p.requires_grad}

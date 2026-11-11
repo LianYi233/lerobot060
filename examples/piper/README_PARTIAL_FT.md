@@ -175,3 +175,56 @@ started solely because offline loss decreases.
 
 **Validation scope:** code-level grouping checks and launcher preflight;
 GPU-dependent memory/gradient and robot execution have not been run by ChatGPT.
+
+## Full Action Head + VLM partial fine-tuning (single A800, recommended)
+
+The `fullhead_vlm2` and `fullhead_vlm4` profiles unfreeze **every** Gemma Action
+Expert Transformer layer, final expert norm, action input/output projections, and
+the two time-conditioning MLPs, while also unfreezing the final 2/4 PaliGemma
+language-model layers. Both learned prompt banks stay trainable. Vision tower,
+language embeddings and unused expert LM head stay frozen. Unlike the older
+`dual2` profile, this is the **full continuous-action head** rather than the last 4
+expert blocks. `cabo_enabled=false`; ordinary differential-LR AdamW is used.
+
+The optimizer contains disjoint groups:
+prompts = 2.5e-5, action projections = 1e-5, all action expert core + time MLPs
+= 1e-5, selected VLM language layers = 1e-6. A fail-closed check verifies every
+configured trainable tensor belongs to exactly one group and no selected parameter
+is unexpectedly frozen. `train_action_head=true` requires `train_action_expert_last_n_layers=0`.
+
+On AutoDL (after exporting `WORK_ROOT`, `DATASET_BASE`, `TOKENIZER_PATH`,
+and `PRETRAINED_PATH` in the previous section):
+
+```bash
+# Free GPU, BF16, microbatch=1. Short smoke first; no motor control.
+GPU_IDS=0 FLOW_STEPS=200 WARMUP_STEPS=20 SAVE_STEPS='[100,200]' \
+  RUN_GROUP=smoke-task2-fullhead-vlm2-autodl DRY_RUN=true \
+  bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+
+# After checking dry run, repeat with DRY_RUN=false.
+GPU_IDS=0 FLOW_STEPS=200 WARMUP_STEPS=20 SAVE_STEPS='[100,200]' \
+  RUN_GROUP=smoke-task2-fullhead-vlm2-autodl DRY_RUN=false \
+  bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+
+# Only after actual GPU gradient/finite-loss/peak-memory verification:
+GPU_IDS=0 RUN_GROUP=task2-fullhead-vlm2-plus10k-autodl DRY_RUN=false \
+  bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+```
+
+`fullhead` (VLM frozen) serves as the essential full-action-head control;
+`fullhead_vlm4` is the deeper optional VLM capacity test. Use different
+`RUN_GROUP` names. Test each with the same 200-step smoke before allocating
+10k. A800 80GB is not a guarantee against OOM: BF16 and checkpointing are on,
+but full expert optimizer states + VLM gradients may require extra capacity.
+Default checkpoint updates are [1000,3000,5000,10000] **beyond** the source 50k;
+check disk space before runs.
+
+Verify `trainable_parameters.json`: action_expert_blocks > 0,
+action_expert_norm > 0, action_time_mlp > 0, action_projection > 0,
+vlm_language_blocks > 0 for `fullhead_vlm2`; no unexpected 'other' trainables.
+The run must also show finite gradients/parameters and updated VLM/Action weights
+in a saved smoke checkpoint. The code tests are CPU checks only, not a substitute
+for this GPU verification. For controlled mechanism claims, compare
+`fullhead` with `fullhead_vlm2` using the same 50k initialization and training
+budget, and add a matched Prompt-only continuation control.
+
