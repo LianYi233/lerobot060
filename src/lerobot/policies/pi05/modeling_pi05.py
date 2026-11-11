@@ -1808,7 +1808,18 @@ class PI05Policy(PreTrainedPolicy):
             groups = []
             for name, modules, scale in specs:
                 selected = _unique_trainable_parameters(modules)
-                ids = {id(p) for p in selected}
+                # Fail closed: a config claiming unfrozen layers must not silently
+                # fall back to prompt-only if a parent module froze their parameters.
+                expected = {id(p) for module in modules for p in module.parameters()}
+                selected_ids = {id(p) for p in selected}
+                if selected_ids != expected:
+                    raise ValueError(
+                        f"Partial FT group {name} has {len(expected - selected_ids)} "
+                        "unexpectedly frozen parameters; refusing to train"
+                    )
+                if name == "vlm_last_layers" and self.config.train_vlm_last_n_layers and not selected:
+                    raise ValueError("VLM layer unfreeze requested but no VLM parameters are trainable")
+                ids = selected_ids
                 if ids & seen:
                     raise ValueError(f"Duplicate trainable parameters in partial fine-tuning group {name}")
                 if name != "vlm_last_layers" and not selected:
