@@ -861,9 +861,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def trainable_action_head_modules(self) -> list[nn.Module]:
         """Modules used by continuous-action prediction; never the unused text LM head."""
         return [
-            *self.trainable_action_core_modules(),
+            self.paligemma_with_expert.gemma_expert.model,
             self.action_in_proj,
             self.action_out_proj,
+            self.time_mlp_in,
+            self.time_mlp_out,
         ]
 
     def trainable_action_core_modules(self) -> list[nn.Module]:
