@@ -5,6 +5,7 @@ Run: python -m pytest tests/scripts/test_piper_partial_ft.py -q
 """
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -182,6 +183,8 @@ def test_launcher_dry_run_has_no_training_and_correct_cli(fake_reality,profile,l
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     output = result.stdout
+    shell_line = next(line for line in output.splitlines() if line.startswith('env '))
+    tokens = set(shlex.split(shell_line))
     for token in (
         "--policy.partial_ft_enabled=true",
         f"--policy.train_vlm_last_n_layers={last}",
@@ -196,7 +199,7 @@ def test_launcher_dry_run_has_no_training_and_correct_cli(fake_reality,profile,l
         "--steps=1000",
         "--save_steps=[100,1000]",
     ):
-        assert token in output, (token, output)
+        assert token in tokens, (token, output)
     assert not (Path(fake_reality["WORK_ROOT"]) / "chkpt").exists()
 
 
