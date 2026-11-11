@@ -23,15 +23,15 @@ LAUNCHER = ROOT / "examples/training/train_piper_partial_ft.sh"
 TASK = "2-remove_the_cuboid_from_blue_plate"
 
 
-def make_config(vlm_layers):
+def make_config(vlm_layers, *, full_head=False):
     return PI05Config(
         partial_ft_enabled=True,
         train_vlm_last_n_layers=vlm_layers,
-        train_action_expert_last_n_layers=4,
+        train_action_expert_last_n_layers=0 if full_head else 4,
         train_action_projections=True,
         cabo_enabled=False,
         use_peft=False,
-        train_action_head=False,
+        train_action_head=full_head,
         next_action_pretrain_steps=0,
         next_action_bridge_steps=0,
     )
@@ -57,18 +57,44 @@ def test_vlm_trainability_cannot_be_enabled_without_opt_in():
         )
 
 
+@pytest.mark.parametrize("last", [0, 2, 4])
+def test_full_action_head_allows_vlm_adaptation_but_not_last_n_mode(last):
+    cfg = make_config(last, full_head=True)
+    assert cfg.train_action_head is True
+    assert cfg.train_action_expert_last_n_layers == 0
+    assert cfg.train_action_projections is True
+    assert cfg.train_expert_only == (last == 0)
+    assert cfg.separate_frozen_observations == (last == 0)
+    with pytest.raises(ValueError, match="train_action_expert_last_n_layers=0"):
+        PI05Config(
+            partial_ft_enabled=True,
+            train_action_head=True,
+            train_action_expert_last_n_layers=4,
+            train_action_projections=True,
+            cabo_enabled=False,
+            next_action_pretrain_steps=0,
+            next_action_bridge_steps=0,
+        )
+
+
 class FakeCore(torch.nn.Module):
     """Small stand-in for verifying exact optimizer grouping (NOT gradient quality)."""
 
-    def __init__(self, last):
+    def __init__(self, last, *, full_head=False):
         super().__init__()
         self.vlm_prompt_tokens = torch.nn.Embedding(16, 2)
         self.prompt_tokens = torch.nn.Embedding(16, 2)
         self.action_in_proj = torch.nn.Linear(2, 2)
         self.action_out_proj = torch.nn.Linear(2, 2)
         self.expert = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(4)])
+        self.expert_norm = torch.nn.Linear(2, 2)
+        self.time_mlp_in = torch.nn.Linear(2, 2)
+        self.time_mlp_out = torch.nn.Linear(2, 2)
         self.vlm = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(4)])
         self.last = last
+        self.full_head = full_head
+        for module in (self.expert_norm, self.time_mlp_in, self.time_mlp_out):
+            module.requires_grad_(full_head)
         for i, module in enumerate(self.vlm):
             module.requires_grad_(last > 0 and i >= 4 - last)
 
@@ -78,14 +104,18 @@ class FakeCore(torch.nn.Module):
     def trainable_expert_blocks(self):
         return list(self.expert)
 
+    def trainable_action_core_modules(self):
+        return [self.expert, self.expert_norm, self.time_mlp_in, self.time_mlp_out]
+
     def trainable_vlm_blocks(self):
         return list(self.vlm[-self.last:]) if self.last else []
 
 
 @pytest.mark.parametrize("last", [0, 2, 4])
-def test_optimizer_groups_exhaustive_disjoint_and_scaled(last):
-    model = FakeCore(last)
-    config = make_config(last)
+@pytest.mark.parametrize("full_head", [False, True])
+def test_optimizer_groups_exhaustive_disjoint_and_scaled(last, full_head):
+    model = FakeCore(last, full_head=full_head)
+    config = make_config(last, full_head=full_head)
     config.optimizer_lr = 2.5e-5
     config.action_projection_lr_scale = .4
     config.action_expert_lr_scale = .4
@@ -93,8 +123,10 @@ def test_optimizer_groups_exhaustive_disjoint_and_scaled(last):
     policy = SimpleNamespace(model=model, config=config, parameters=model.parameters)
     groups = PI05Policy.get_optim_params(policy)
     names = [group["name"] for group in groups]
-    assert names == (["prompts", "action_projections", "action_expert_blocks"] +
-                     (["vlm_last_layers"] if last else []))
+    assert names == ([
+        "prompts", "action_projections",
+        "action_head_core" if full_head else "action_expert_blocks",
+    ] + (["vlm_last_layers"] if last else []))
     actual = [id(param) for group in groups for param in group["params"]]
     expected = {id(param) for param in model.parameters() if param.requires_grad}
     assert len(actual) == len(set(actual))
@@ -172,8 +204,11 @@ def fake_reality(tmp_path):
     return env
 
 
-@pytest.mark.parametrize("profile,last", [("action4",0),("dual2",2),("dual4",4)])
-def test_launcher_dry_run_has_no_training_and_correct_cli(fake_reality,profile,last):
+@pytest.mark.parametrize("profile,last,full_head", [
+    ("action4", 0, False), ("dual2", 2, False), ("dual4", 4, False),
+    ("fullhead", 0, True), ("fullhead_vlm2", 2, True), ("fullhead_vlm4", 4, True),
+])
+def test_launcher_dry_run_has_no_training_and_correct_cli(fake_reality,profile,last,full_head):
     result = subprocess.run(
         ["bash", str(LAUNCHER), profile],
         env={**fake_reality, "RUN_GROUP": f"test-{profile}"},
@@ -188,7 +223,8 @@ def test_launcher_dry_run_has_no_training_and_correct_cli(fake_reality,profile,l
     for token in (
         "--policy.partial_ft_enabled=true",
         f"--policy.train_vlm_last_n_layers={last}",
-        "--policy.train_action_expert_last_n_layers=4",
+        f"--policy.train_action_expert_last_n_layers={0 if full_head else 4}",
+        f"--policy.train_action_head={'true' if full_head else 'false'}",
         "--policy.action_projection_lr_scale=0.4",
         "--policy.action_expert_lr_scale=0.4",
         "--policy.vlm_lr_scale=0.04",
