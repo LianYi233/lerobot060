@@ -309,6 +309,31 @@ class Revision4000LauncherTest(unittest.TestCase):
             self.assertIn(f"[SKIP] {variant}", result.stdout)
             self.assertTrue(any(line.split() == [variant, *(["80.00%"] * 5)] for line in result.stdout.splitlines()))
 
+    def test_optimizer_transition_sequential_eval_reuses_complete_results(self):
+        variants = ("optim_carry_carry", "optim_reset_carry", "optim_carry_restart", "optim_reset_restart")
+        eval_root = self.work / "eval"
+        suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+        for variant in variants:
+            out = eval_root / (
+                f"libero060-all-pi05-revision-{variant}-seed0-total4000-003000-libero-all4-resume"
+            )
+            out.mkdir(parents=True)
+            (out / "eval_info.json").write_text(json.dumps({
+                "per_group": {suite: {"n_episodes": 100, "pc_success": 75.0} for suite in suites},
+                "overall": {"n_episodes": 400, "pc_success": 75.0},
+            }))
+        result = subprocess.run(
+            ["bash", str(SEQUENTIAL_LAUNCHER), "0", *variants],
+            env=dict(self.env, BASE_OUTPUT=str(eval_root), EPISODES_PER_TASK="10", GPU_ID="3"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for variant in variants:
+            self.assertIn(f"[SKIP] {variant}", result.stdout)
+            self.assertTrue(any(line.split() == [variant, *(["75.00%"] * 5)] for line in result.stdout.splitlines()))
+
     def test_four_gpu_launcher_schedules_only_remaining_three_by_default(self):
         result = subprocess.run(
             ["bash", str(MULTI_LAUNCHER), "others", "0"],

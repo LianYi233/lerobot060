@@ -48,7 +48,8 @@ checkpoint_step() {
     case "$1" in
         direct_dual|dual_prompt_only) echo 004000 ;;
         full_reference|full_no_cpc|action_flow_warmup) echo 003000 ;;
-        fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010) echo 003000 ;;
+        fixed_action_lr_050|fixed_action_lr_025|fixed_action_lr_010|\
+        optim_carry_carry|optim_reset_carry|optim_carry_restart|optim_reset_restart) echo 003000 ;;
         *) echo "Unknown revision variant: $1" >&2; return 2 ;;
     esac
 }
@@ -159,6 +160,10 @@ steps = {
     "fixed_action_lr_050": "003000",
     "fixed_action_lr_025": "003000",
     "fixed_action_lr_010": "003000",
+    "optim_carry_carry": "003000",
+    "optim_reset_carry": "003000",
+    "optim_carry_restart": "003000",
+    "optim_reset_restart": "003000",
 }
 suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 header = ("Model", "Spatial", "Object", "Goal", "LIBERO-10", "Overall")
