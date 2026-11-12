@@ -140,8 +140,52 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     num_decay_steps: int
     peak_lr: float
     decay_lr: float
+    # Optional LR restart for continuing a completed training run without discarding
+    # AdamW moments. No behavioral change unless restart_at_step is specified.
+    restart_at_step: int | None = None
+    restart_warmup_steps: int = 0
+    restart_peak_ratio: float = 0.5
 
     def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        if self.restart_at_step is not None:
+            if (
+                isinstance(self.restart_at_step, bool)
+                or not isinstance(self.restart_at_step, int)
+                or self.restart_at_step < 0
+                or self.restart_at_step >= num_training_steps
+            ):
+                raise ValueError("restart_at_step must be in [0, num_training_steps)")
+            if (
+                isinstance(self.restart_warmup_steps, bool)
+                or not isinstance(self.restart_warmup_steps, int)
+                or self.restart_warmup_steps < 0
+                or self.restart_warmup_steps >= num_training_steps - self.restart_at_step
+            ):
+                raise ValueError("restart_warmup_steps must fit inside remaining updates")
+            if not (math.isfinite(self.peak_lr) and self.peak_lr > 0):
+                raise ValueError("peak_lr must be positive and finite")
+            if not (math.isfinite(self.decay_lr) and 0 < self.decay_lr <= self.peak_lr):
+                raise ValueError("decay_lr must be in (0, peak_lr]")
+            floor_ratio = self.decay_lr / self.peak_lr
+            peak_ratio = self.restart_peak_ratio
+            if not math.isfinite(peak_ratio) or not floor_ratio <= peak_ratio <= 1:
+                raise ValueError("restart_peak_ratio must be in [decay_lr/peak_lr, 1]")
+            start = self.restart_at_step
+            warmup = self.restart_warmup_steps
+            anneal_steps = num_training_steps - start - warmup
+
+            def lr_lambda(current_step: int) -> float:
+                # Keep the already-completed LR floor at the checkpoint boundary.
+                if current_step <= start:
+                    return floor_ratio
+                elapsed = current_step - start
+                if warmup and elapsed <= warmup:
+                    return floor_ratio + (peak_ratio - floor_ratio) * elapsed / warmup
+                progress = min(1.0, max(0.0, (elapsed - warmup) / anneal_steps))
+                return floor_ratio + 0.5 * (peak_ratio - floor_ratio) * (1 + math.cos(math.pi * progress))
+
+            return LambdaLR(optimizer, lr_lambda, -1)
+
         # Auto-scale scheduler parameters if training steps are shorter than configured decay steps
         actual_warmup_steps = self.num_warmup_steps
         actual_decay_steps = self.num_decay_steps
