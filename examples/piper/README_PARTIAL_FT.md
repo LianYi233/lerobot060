@@ -285,3 +285,71 @@ should report finite loss and J2/J3/gripper validation improvements. Do not
 use the robot during this offline training. If the source checkpoint has been
 compacted or its `training_state` files were discarded, this **cannot** preserve
 AdamW state; use a separate weights-only adaptation procedure instead.
+
+
+## Task 3 — tennis ball from yellow to blue plate (AutoDL A800)
+
+Use the **task3 Prompt-only 50k weights**, not task2's, as the starting point.
+The original 50k task3 model was compacted under the same
+`reality-parallel-v1` group. Restore it on AutoDL if a complete materialized
+checkpoint is not already available. Verify free disk space first.
+
+```bash
+cd /root/autodl-tmp/lerobot060-piper-partial-ft
+git fetch origin piper-partial-ft
+git switch --detach origin/piper-partial-ft
+export WORK_ROOT=/root/autodl-tmp/piper-partial-ft-work
+export DATASET_BASE=/root/autodl-fs/datasets/reality
+export TOKENIZER_PATH=/root/autodl-fs/ckpt/google/paligemma-3b-pt-224
+export PRETRAINED_PATH=/root/autodl-tmp/piper-revision/materialized/task3-priming-seed0-total50000
+
+df -h /root/autodl-tmp
+test -f "$PRETRAINED_PATH/model.safetensors" || \
+python examples/piper/revision_checkpoint.py materialize \
+  --bundle /root/autodl-tmp/piper-revision/runs/reality-parallel-v1/task3-priming-seed0-total50000/bundles/total-050000 \
+  --base /root/autodl-tmp/piper-revision/runs/reality-parallel-v1/storage_base \
+  --output "$PRETRAINED_PATH"
+```
+
+The materialize command requires a **nonexistent** output path, so inspect and
+remove/move any incomplete directory manually before rerunning; never delete a
+valid previously restored model. The launcher verifies source task identity
+using the source `train_config.json` and/or `dataset_info.json`, and refuses
+to train task3 from task2's checkpoint.
+
+Match task2's first-stage 10k cosine schedule and checkpoint positions:
+
+```bash
+PYTHONPATH=src python -m pytest \
+  tests/scripts/test_piper_partial_ft.py \
+  tests/scripts/test_piper_partial_ft_resume.py -q
+
+PIPER_TASK=3 GPU_IDS=0 RUN_GROUP=task3-fullhead-vlm2-plus10k \
+  DRY_RUN=true bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+
+PIPER_TASK=3 GPU_IDS=0 RUN_GROUP=task3-fullhead-vlm2-plus10k \
+  DRY_RUN=false bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+```
+
+Its output is:
+`$WORK_ROOT/chkpt/2601-lerobot/piper/task3-fullhead-vlm2-plus10k/pi05-may-3-move_the_tennis_from_yellow_plate_to_blue_plate-dual_prompt_only-seed0/`.
+The task3 validation numbers are unique to this dataset, not directly
+comparable to task2's 3.3137° without controlling for motion distribution.
+
+Once the first 10k job **fully finishes**, use its complete final training
+checkpoint to continue the same way as task2: preserve optimizer state and
+switch to a smooth 300-step LR restart at 50% of original group peaks.
+
+```bash
+PIPER_TASK=3 GPU_IDS=0 DRY_RUN=true \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+
+PIPER_TASK=3 GPU_IDS=0 DRY_RUN=false \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+```
+
+Checkpoints in the continuation are at `012000/015000/020000` for the new
+fullhead+VLM2 phase. The original 50k Prompt-only stage is in addition.
+Do not start task3 if task2 continues running on the single A800, and verify
+sufficient space for the new checkpoints; previous compact bundles should not
+be mistaken for complete optimizer-resumable checkpoints.
