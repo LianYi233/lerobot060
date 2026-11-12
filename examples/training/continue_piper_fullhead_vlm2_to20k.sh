@@ -113,8 +113,8 @@ print(f"Save at: {save_steps}; LR restart warmup={warmup}, peak_ratio={ratio}")
 PY
 
 TRAIN=(
-    accelerate launch --num_processes=1 --mixed_precision=bf16
-    lerobot-train
+    accelerate launch --num_machines=1 --num_processes=1 --mixed_precision=bf16
+    --dynamo_backend=no --module lerobot.scripts.lerobot_train
     "--config_path=$TRAIN_CONFIG"
     --resume=true
     "--output_dir=$OUTPUT_DIR"
@@ -130,7 +130,11 @@ if [[ "$DRY_RUN" == true ]]; then
     exit 0
 fi
 command -v accelerate >/dev/null || { echo "accelerate not installed" >&2; exit 1; }
-command -v lerobot-train >/dev/null || { echo "lerobot-train not installed" >&2; exit 1; }
+python - <<'PY'
+import importlib.util
+if importlib.util.find_spec("lerobot.scripts.lerobot_train") is None:
+    raise SystemExit("Unable to import lerobot.scripts.lerobot_train; check PYTHONPATH")
+PY
 mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export TMPDIR="${TMPDIR:-$WORK_ROOT/tmp}"

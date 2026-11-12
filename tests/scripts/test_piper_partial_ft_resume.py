@@ -151,6 +151,10 @@ def test_dry_run_uses_real_resume_not_fresh_weights(completed_checkpoint, tmp_pa
     args = set(shlex.split(line))
     for item in (
         "--resume=true",
+        "--module",
+        "lerobot.scripts.lerobot_train",
+        "--num_machines=1",
+        "--dynamo_backend=no",
         "--steps=20000",
         "--save_steps=[12000,15000,20000]",
         "--scheduler.restart_at_step=10000",
@@ -160,6 +164,7 @@ def test_dry_run_uses_real_resume_not_fresh_weights(completed_checkpoint, tmp_pa
         assert item in args
     assert any(x.startswith("--config_path=") and
                "checkpoints/010000/pretrained_model/train_config.json" in x for x in args)
+    assert "lerobot-train" not in args
     assert not (tmp_path / "chkpt").exists()
 
 
