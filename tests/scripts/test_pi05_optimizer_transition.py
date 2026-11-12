@@ -20,7 +20,7 @@ from lerobot.optim.optimizers import save_optimizer_state  # noqa: E402
 from lerobot.optim.schedulers import save_scheduler_state  # noqa: E402
 from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: E402
 from lerobot.scripts import lerobot_train as training  # noqa: E402
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR  # noqa: E402
+from lerobot.utils.constants import OPTIMIZER_PARAM_GROUPS, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR  # noqa: E402
 
 
 class _SingleRankAccelerator:
@@ -126,3 +126,32 @@ def test_stage3_rejects_mismatched_source_seed(tmp_path):
     cfg.seed = 4
     with pytest.raises(ValueError, match="seed mismatch"):
         training._validate_pi05_stage3_source(cfg)
+
+
+def test_stage3_carries_moments_without_deserializing_backend_options(tmp_path):
+    """Legacy optional AdamW flags must not block a Stage-II to III transfer."""
+    cfg, source_optimizer, _ = _fixture(tmp_path, "carry", "restart")
+    state_path = cfg.pi05_stage3_transfer_checkpoint / TRAINING_STATE_DIR / OPTIMIZER_PARAM_GROUPS
+    saved_groups = json.loads(state_path.read_text())
+    for group in saved_groups:
+        # Torch's fresh AdamW often sets foreach=None; the saved checkpoint
+        # can instead record a concrete boolean. The old strict loader fails.
+        group["foreach"] = False
+    state_path.write_text(json.dumps(saved_groups))
+
+    new_params = [torch.nn.Parameter(torch.zeros(2, 3)), torch.nn.Parameter(torch.zeros(2, 3))]
+    new_optimizer = _make_optimizer(new_params)
+    assert all(group["foreach"] is None for group in new_optimizer.param_groups)
+    new_scheduler = cfg.scheduler.build(new_optimizer, 3_000)
+
+    optimizer, _ = training._restore_pi05_stage3_transition(
+        cfg, new_optimizer, new_scheduler, _SingleRankAccelerator()
+    )
+    for source_group, target_group in zip(source_optimizer.param_groups, optimizer.param_groups, strict=True):
+        source_param, target_param = source_group["params"][0], target_group["params"][0]
+        assert target_group["foreach"] is None
+        assert torch.equal(optimizer.state[target_param]["exp_avg"], source_optimizer.state[source_param]["exp_avg"])
+        assert torch.equal(
+            optimizer.state[target_param]["exp_avg_sq"], source_optimizer.state[source_param]["exp_avg_sq"]
+        )
+        assert optimizer.state[target_param]["step"].item() == source_optimizer.state[source_param]["step"].item()

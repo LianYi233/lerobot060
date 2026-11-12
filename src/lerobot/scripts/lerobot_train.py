@@ -58,7 +58,7 @@ from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.cabo import CABO_GROUP_NAME, OptimizerStepControl, temporary_optimizer_group_lr_scales
 from lerobot.optim.factory import make_optimizer_and_scheduler
-from lerobot.optim.optimizers import load_optimizer_state
+from lerobot.optim.optimizers import load_optimizer_state_dict
 from lerobot.optim.schedulers import load_scheduler_state
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
@@ -639,7 +639,24 @@ def _restore_pi05_stage3_transition(
 
     reset_lrs = [group["lr"] for group in optimizer.param_groups]
     if cfg.policy.stage3_adamw_moments == "carry":
-        optimizer = load_optimizer_state(optimizer, state_dir)
+        # Carry AdamW moments only. The regular LeRobot loader deserializes all
+        # saved parameter-group options into the fresh optimizer, rejecting
+        # optional backend flags such as `foreach=False` vs `foreach=None`.
+        # These flags (and the LR) are not part of the moment-state ablation.
+        saved_state = load_optimizer_state_dict(state_dir)["state"]
+        transferred_state = {}
+        for saved_group, current_group in zip(saved_groups, current_groups, strict=True):
+            for source_id, target_id in zip(saved_group["params"], current_group["params"], strict=True):
+                source_moments = saved_state.get(str(source_id), saved_state.get(source_id))
+                if source_moments is None or not all(
+                    name in source_moments for name in ("step", "exp_avg", "exp_avg_sq")
+                ):
+                    raise ValueError("Stage-II AdamW moments or step missing for a Stage-III prompt")
+                transferred_state[target_id] = source_moments
+
+        # Use the fresh Stage-III parameter-group configuration so only the
+        # moments and step counters, not the optimizer's options, are carried.
+        optimizer.load_state_dict({"state": transferred_state, "param_groups": current_groups})
         for group in optimizer.param_groups:
             for param in group["params"]:
                 state = optimizer.state.get(param, {})
