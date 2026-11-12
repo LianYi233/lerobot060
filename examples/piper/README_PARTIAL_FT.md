@@ -228,3 +228,60 @@ for this GPU verification. For controlled mechanism claims, compare
 `fullhead` with `fullhead_vlm2` using the same 50k initialization and training
 budget, and add a matched Prompt-only continuation control.
 
+
+## Resume the completed task2 fullhead_vlm2 run from 10k to 20k (AutoDL A800)
+
+This is **not** a fresh 20k training job. It performs **10,000 additional optimizer
+updates**, advancing the second adaptation stage from 10,000 to 20,000.
+Its source is the final `checkpoints/010000/` from the already-completed
+`task2-fullhead-vlm2-plus10k` run. The 50k Prompt-only adaptation remains
+the initialization before this second stage. The final policy will have
+50k Prompt-only updates plus 20k fullhead+VLM2 updates.
+
+The source 10k schedule reached its LR floor at Step 10000. The resume launcher
+preserves AdamW moments and model weights, but deliberately modifies the
+**future** LR schedule: linear ramp from floor to **50% of the original group
+peak** over 300 updates, then cosine decay to floor by Step 20000.
+Group peaks in the resumed portion: prompts 1.25e-5, expert/projectors
+5e-6, VLM language blocks 5e-7. These are LR choices, not an exact
+uninterrupted replay of a hypothetical original 20k cosine schedule.
+
+```bash
+cd /root/autodl-tmp/lerobot060-piper-partial-ft
+git fetch origin piper-partial-ft
+git switch --detach origin/piper-partial-ft
+
+export WORK_ROOT=/root/autodl-tmp/piper-partial-ft-work
+# No PRETRAINED_PATH needed: this script resumes the 10k checkpoint *with optimizer state*.
+PYTHONPATH=src python -m pytest tests/scripts/test_piper_partial_ft_resume.py -q
+df -h /root/autodl-tmp
+nvidia-smi
+
+GPU_IDS=0 DRY_RUN=true \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+
+GPU_IDS=0 DRY_RUN=false \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+```
+
+Defaults: 1 GPU, BF16, exact saved batch size, held-out split, and all original
+dataset/processor settings. The launcher verifies original Step 10000, full
+training-state presence, fullhead+VLM2 configuration, non-overlapping output path
+and save steps. It refuses incomplete state instead of treating weights-only
+initialization as resume.
+
+New independent output run group:
+`$WORK_ROOT/chkpt/2601-lerobot/piper/task2-fullhead-vlm2-resume10k-to20k/`.
+Intermediate checkpoints: `012000`, `015000`, `020000` (step IDs are
+**total in the second adaptation stage**, not 62k/65k/70k).
+New action metrics start with Step 10000 and continue through Step 20000; compare
+`action_val/h8/*` to the source's Step 10000 with the same fixed evaluation
+selection. The original run and saved optimizer state are left untouched.
+
+Check that the training log prints a resume at Step 10000 rather than Step 0
+and runs exactly 10k more loop iterations. In the logged LR it should rise
+smoothly after the restart boundary rather than remain at 1e-6. The monitor
+should report finite loss and J2/J3/gripper validation improvements. Do not
+use the robot during this offline training. If the source checkpoint has been
+compacted or its `training_state` files were discarded, this **cannot** preserve
+AdamW state; use a separate weights-only adaptation procedure instead.
