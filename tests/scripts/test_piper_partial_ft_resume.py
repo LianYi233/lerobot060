@@ -184,3 +184,49 @@ def test_destination_collision_fails_closed(completed_checkpoint, tmp_path):
     result = _run(completed_checkpoint, tmp_path)
     assert result.returncode != 0
     assert "Refusing to overwrite" in result.stderr
+
+
+def test_task3_resume_dry_run_preserves_matching_task_identity(completed_checkpoint, tmp_path):
+    root = completed_checkpoint / "checkpoints/010000/pretrained_model/train_config.json"
+    cfg = json.loads(root.read_text())
+    folder = "3-move_the_tennis_from_yellow_plate_to_blue_plate"
+    dataset = tmp_path / "data" / folder
+    dataset.mkdir(parents=True)
+    cfg["dataset"]["root"] = str(dataset)
+    cfg["dataset"]["repo_id"] = "may-pick-and-place/" + folder
+    root.write_text(json.dumps(cfg))
+    env = {
+        **os.environ,
+        "SOURCE_RUN": str(completed_checkpoint),
+        "WORK_ROOT": str(tmp_path),
+        "DRY_RUN": "true",
+        "GPU_IDS": "0",
+        "PIPER_TASK": "3",
+    }
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "task=3" in result.stdout
+    cmdline = next(line for line in result.stdout.splitlines() if line.startswith("env "))
+    tokens = set(shlex.split(cmdline))
+    assert any(token.startswith("--output_dir=") and
+               "task3-fullhead-vlm2-resume10k-to20k" in token and folder in token
+               for token in tokens)
+
+
+def test_task3_resume_rejects_task2_training_config(completed_checkpoint, tmp_path):
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env={
+            **os.environ,
+            "SOURCE_RUN": str(completed_checkpoint),
+            "WORK_ROOT": str(tmp_path),
+            "PIPER_TASK": "3",
+            "DRY_RUN": "true",
+        },
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
