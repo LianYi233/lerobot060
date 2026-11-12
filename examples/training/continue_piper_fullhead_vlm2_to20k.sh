@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume the completed task2 fullhead_vlm2 +10k PI05 run through TOTAL step 20k.
+# Resume task2 or task3 fullhead_vlm2 +10k run through TOTAL step 20k.
 # Preserves model, optimizer moments, RNG, data-sampler offset, and trained processors.
 # Uses a smooth LR restart; source checkpoint is never modified.
 set -euo pipefail
@@ -10,11 +10,12 @@ Usage:
   GPU_IDS=0 DRY_RUN=true bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
   GPU_IDS=0 DRY_RUN=false bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
 Defaults:
-  SOURCE_RUN=/root/autodl-tmp/piper-partial-ft-work/chkpt/2601-lerobot/piper/task2-fullhead-vlm2-plus10k/pi05-may-2-remove_the_cuboid_from_blue_plate-dual_prompt_only-seed0
+  PIPER_TASK=2 (default) or 3
+  SOURCE_RUN=$WORK_ROOT/chkpt/2601-lerobot/piper/task<PIPER_TASK>-fullhead-vlm2-plus10k/<matching run name>
   SOURCE_STEP=10000, TARGET_STEPS=20000
   LR_RESTART_WARMUP=300, LR_RESTART_PEAK_RATIO=0.5
   SAVE_STEPS='[12000,15000,20000]'
-  RUN_GROUP=task2-fullhead-vlm2-resume10k-to20k
+  RUN_GROUP=task<PIPER_TASK>-fullhead-vlm2-resume10k-to20k
 Override SOURCE_RUN, WORK_ROOT, RUN_GROUP, TARGET_STEPS, SAVE_STEPS if needed.
 This is an optimizer-state resume (NOT a fresh 20k run). Input is the FULL
 checkpoint directory including training_state/, NOT just pretrained_model/.
@@ -25,14 +26,20 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; exit 0; fi
 if (( $# )); then echo "Unexpected arguments: $*" >&2; usage >&2; exit 2; fi
 
 export WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp/piper-partial-ft-work}"
-RUN_NAME=pi05-may-2-remove_the_cuboid_from_blue_plate-dual_prompt_only-seed0
-SOURCE_RUN="${SOURCE_RUN:-$WORK_ROOT/chkpt/2601-lerobot/piper/task2-fullhead-vlm2-plus10k/$RUN_NAME}"
+PIPER_TASK="${PIPER_TASK:-2}"
+case "$PIPER_TASK" in
+    2) TASK_FOLDER=2-remove_the_cuboid_from_blue_plate ;;
+    3) TASK_FOLDER=3-move_the_tennis_from_yellow_plate_to_blue_plate ;;
+    *) echo "PIPER_TASK must be 2 or 3, got $PIPER_TASK" >&2; exit 2 ;;
+esac
+RUN_NAME=pi05-may-${TASK_FOLDER}-dual_prompt_only-seed0
+SOURCE_RUN="${SOURCE_RUN:-$WORK_ROOT/chkpt/2601-lerobot/piper/task${PIPER_TASK}-fullhead-vlm2-plus10k/$RUN_NAME}"
 SOURCE_STEP="${SOURCE_STEP:-10000}"
 TARGET_STEPS="${TARGET_STEPS:-20000}"
 LR_RESTART_WARMUP="${LR_RESTART_WARMUP:-300}"
 LR_RESTART_PEAK_RATIO="${LR_RESTART_PEAK_RATIO:-0.5}"
 SAVE_STEPS="${SAVE_STEPS:-[12000,15000,20000]}"
-RUN_GROUP="${RUN_GROUP:-task2-fullhead-vlm2-resume10k-to20k}"
+RUN_GROUP="${RUN_GROUP:-task${PIPER_TASK}-fullhead-vlm2-resume10k-to20k}"
 GPU_IDS="${GPU_IDS:-0}"
 DRY_RUN="${DRY_RUN:-true}"
 if [[ ! "$GPU_IDS" =~ ^[0-9]+$ ]]; then echo "Set one numeric GPU_IDS" >&2; exit 2; fi
@@ -48,7 +55,7 @@ TRAIN_CONFIG="$CHECKPOINT/pretrained_model/train_config.json"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-export CHECKPOINT SOURCE_STEP TARGET_STEPS LR_RESTART_WARMUP LR_RESTART_PEAK_RATIO SAVE_STEPS OUTPUT_DIR
+export CHECKPOINT SOURCE_STEP TARGET_STEPS LR_RESTART_WARMUP LR_RESTART_PEAK_RATIO SAVE_STEPS OUTPUT_DIR PIPER_TASK TASK_FOLDER
 
 python - <<'PY'
 import json
@@ -104,9 +111,15 @@ assert policy["use_relative_actions"] is False
 assert cfg["dataset"]["eval_split"] == 0.1
 assert train_step.get("num_processes") == 1
 assert train_step.get("batch_size") == cfg["batch_size"]
-assert Path(cfg["dataset"]["root"]).is_dir(), cfg["dataset"]["root"]
+dataset_root = Path(cfg["dataset"]["root"])
+assert dataset_root.is_dir(), dataset_root
+expected_task = os.environ["TASK_FOLDER"]
+assert dataset_root.name == expected_task, (dataset_root, expected_task)
+repo_id = str(cfg["dataset"].get("repo_id", ""))
+if repo_id:
+    assert repo_id.rsplit("/", 1)[-1] == expected_task, (repo_id, expected_task)
 assert cfg["scheduler"]["type"] == "cosine_decay_with_warmup"
-print(f"Resume validated: source_step={source_step}, target_step={target}, batch={cfg['batch_size']}")
+print(f"Resume validated: task={os.environ['PIPER_TASK']}, source_step={source_step}, target_step={target}, batch={cfg['batch_size']}")
 print(f"Source: {src}")
 print(f"Output: {out}")
 print(f"Save at: {save_steps}; LR restart warmup={warmup}, peak_ratio={ratio}")
