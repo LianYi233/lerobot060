@@ -6,6 +6,7 @@ Run: python -m pytest tests/scripts/test_piper_partial_ft.py -q
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -247,3 +248,55 @@ def test_launcher_rejects_multi_gpu_and_wrong_checkpoint(fake_reality):
         result = subprocess.run(["bash", str(LAUNCHER), "dual2"], env=env,
                                 text=True, capture_output=True, check=False)
         assert result.returncode != 0
+
+
+@pytest.fixture
+def fake_task3(fake_reality):
+    """Use a task3 dataset and source policy from the matching recorded task."""
+    env = dict(fake_reality)
+    data_root = Path(env["DATASET_BASE"])
+    original = data_root / TASK
+    task3 = data_root / "3-move_the_tennis_from_yellow_plate_to_blue_plate"
+    shutil.copytree(original, task3)
+    original_train = {
+        "dataset": {
+            "root": str(task3),
+            "repo_id": f"may-pick-and-place/{task3.name}",
+        }
+    }
+    (Path(env["PRETRAINED_PATH"]) / "train_config.json").write_text(json.dumps(original_train))
+    env["PIPER_TASK"] = "3"
+    return env
+
+
+def test_task3_launcher_uses_task3_model_dataset_and_dry_run(fake_task3):
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "fullhead_vlm2"],
+        env={**fake_task3, "RUN_GROUP": "smoke-task3-fullhead-vlm2"},
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    line = next(x for x in result.stdout.splitlines() if x.startswith("env "))
+    tokens = set(shlex.split(line))
+    folder = "3-move_the_tennis_from_yellow_plate_to_blue_plate"
+    assert f"--dataset.repo_id=may-pick-and-place/{folder}" in tokens
+    assert f"--dataset.root={Path(fake_task3['DATASET_BASE']) / folder}" in tokens
+    assert f"--policy.pretrained_path={fake_task3['PRETRAINED_PATH']}" in tokens
+    assert "--policy.train_action_head=true" in tokens
+    assert "--policy.train_vlm_last_n_layers=2" in tokens
+    assert "--policy.next_action_pretrain_steps=0" in tokens
+    assert "--policy.next_action_bridge_steps=0" in tokens
+
+
+def test_task3_rejects_wrong_source_model_even_when_dataset_exists(fake_task3):
+    env = dict(fake_task3)
+    root = Path(env["PRETRAINED_PATH"])
+    train_config = json.loads((root / "train_config.json").read_text())
+    train_config["dataset"]["repo_id"] = f"may-pick-and-place/{TASK}"
+    (root / "train_config.json").write_text(json.dumps(train_config))
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "fullhead_vlm2"], env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "Wrong pretrained task" in result.stderr
