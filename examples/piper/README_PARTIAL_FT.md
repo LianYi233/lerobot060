@@ -353,3 +353,80 @@ fullhead+VLM2 phase. The original 50k Prompt-only stage is in addition.
 Do not start task3 if task2 continues running on the single A800, and verify
 sufficient space for the new checkpoints; previous compact bundles should not
 be mistaken for complete optimizer-resumable checkpoints.
+
+
+## Task 4 — red cube into yellow plate (AutoDL single A800)
+
+Task 4 must start from its **own completed Prompt-only 50k policy** from
+`reality-parallel-v1`. Check that the run status is `completed`, that
+`bundles/total-050000` exists, and that the frozen storage base is intact.
+Do not initialize task4 using the task2 or task3 model.
+
+```bash
+cd /root/autodl-tmp/lerobot060-piper-partial-ft
+git fetch origin piper-partial-ft
+git switch --detach origin/piper-partial-ft
+
+export WORK_ROOT=/root/autodl-tmp/piper-partial-ft-work
+export DATASET_BASE=/root/autodl-fs/datasets/reality
+export TOKENIZER_PATH=/root/autodl-fs/ckpt/google/paligemma-3b-pt-224
+export PRETRAINED_PATH=/root/autodl-tmp/piper-revision/materialized/task4-priming-seed0-total50000
+
+export ORIGINAL_RUN_ROOT=/root/autodl-tmp/piper-revision/runs/reality-parallel-v1
+# The status must read completed, not running or failed.
+OUTPUT_ROOT="$ORIGINAL_RUN_ROOT" bash examples/training/train_piper_revision_parallel.sh --status
+test -d "$ORIGINAL_RUN_ROOT/task4-priming-seed0-total50000/bundles/total-050000"
+df -h /root/autodl-tmp
+
+# Only materialize when the output directory does NOT already exist.
+if [[ ! -f "$PRETRAINED_PATH/model.safetensors" ]]; then
+    if [[ -e "$PRETRAINED_PATH" ]]; then
+        echo "Incomplete existing materialization; investigate before continuing." >&2
+        exit 1
+    fi
+    python examples/piper/revision_checkpoint.py materialize \
+      --bundle "$ORIGINAL_RUN_ROOT/task4-priming-seed0-total50000/bundles/total-050000" \
+      --base "$ORIGINAL_RUN_ROOT/storage_base" \
+      --output "$PRETRAINED_PATH"
+fi
+```
+
+The launcher checks both prompt tensors and validates `train_config.json`
+or the saved `dataset_info.json` against the task4 folder before training.
+
+```bash
+PYTHONPATH=src python -m pytest \
+  tests/scripts/test_piper_partial_ft.py \
+  tests/scripts/test_piper_partial_ft_resume.py -q
+
+PIPER_TASK=4 GPU_IDS=0 RUN_GROUP=task4-fullhead-vlm2-plus10k \
+  DRY_RUN=true bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+
+# First do a separate 200-step smoke with its own run group:
+PIPER_TASK=4 GPU_IDS=0 FLOW_STEPS=200 WARMUP_STEPS=20 \
+  SAVE_STEPS='[100,200]' RUN_GROUP=smoke-task4-fullhead-vlm2 \
+  DRY_RUN=false bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+
+# After checking the trainable parameter report and finite loss:
+PIPER_TASK=4 GPU_IDS=0 RUN_GROUP=task4-fullhead-vlm2-plus10k \
+  DRY_RUN=false bash examples/training/train_piper_partial_ft.sh fullhead_vlm2
+```
+
+This produces checkpoints of additional +1k/+3k/+5k/+10k (on top of the
+50k Prompt-only initialization) under
+`$WORK_ROOT/chkpt/2601-lerobot/piper/task4-fullhead-vlm2-plus10k/`.
+The dataset, saved pre/postprocessors and held-out validation must be task4-specific.
+
+Once the +10k run has completed and a full `training_state/` exists:
+
+```bash
+PIPER_TASK=4 GPU_IDS=0 DRY_RUN=true \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+PIPER_TASK=4 GPU_IDS=0 DRY_RUN=false \
+  bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
+```
+
+Resume checkpoints will be +12k/+15k/+20k and live under an independent
+`task4-fullhead-vlm2-resume10k-to20k/` run group. This is a resumed
+optimizer state with a new future LR schedule, not a zero-state weight-only
+continuation. Do not run task4 on a card occupied by task2/task3.
