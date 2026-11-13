@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Controlled Piper task-2/task-3 partial-FT profiles, each from its OWN 50k model.
+# Controlled Piper task-2/task-3/task-4 partial-FT profiles from OWN 50k models.
 # One GPU per invocation. This script does not drive a robot.
 set -euo pipefail
 
@@ -9,8 +9,8 @@ Usage: DRY_RUN=true GPU_IDS=0 bash examples/training/train_piper_partial_ft.sh f
        DRY_RUN=false GPU_IDS=0 bash examples/training/train_piper_partial_ft.sh fullhead|fullhead_vlm2|fullhead_vlm4
 Also supported (original partial experiments): action4|dual2|dual4
 Required: DATASET_BASE, PRETRAINED_PATH (materialized task-specific 50k), TOKENIZER_PATH.
- Optional: PIPER_TASK=2 (default) or PIPER_TASK=3; task 3 REQUIRES a matching
- source train_config.json and/or dataset_info.json to prevent mixed-task runs.
+ Optional: PIPER_TASK=2 (default), 3, or 4; tasks 3/4 REQUIRE matching source
+ train_config.json and/or dataset_info.json to prevent mixed-task runs.
 Optional: WORK_ROOT=/data1/wyn/piper-work, FLOW_STEPS=10000, SAVE_STEPS='[1000,3000,5000,10000]',
           WARMUP_STEPS=500, BATCH_SIZE=1, RUN_GROUP=..., EVAL_SPLIT=0.1,
           ACTION_EVAL_FREQ=500, NUM_WORKERS=2.
@@ -41,7 +41,8 @@ PIPER_TASK="${PIPER_TASK:-2}"
 case "$PIPER_TASK" in
   2) TASK_FOLDER=2-remove_the_cuboid_from_blue_plate ;;
   3) TASK_FOLDER=3-move_the_tennis_from_yellow_plate_to_blue_plate ;;
-  *) echo "PIPER_TASK must be 2 or 3; got: $PIPER_TASK" >&2; exit 2 ;;
+  4) TASK_FOLDER=4-pick_the_red_cube_into_the_yellow_plate ;;
+  *) echo "PIPER_TASK must be 2, 3, or 4; got: $PIPER_TASK" >&2; exit 2 ;;
 esac
 export PIPER_TASK TASK_FOLDER
 
@@ -117,7 +118,7 @@ for key, value in (
         raise SystemExit(f"Wrong source policy {key}={cfg.get(key)!r}, expected {value!r}")
 
 # Cross-check task identity from original training provenance or saved dataset
-# metadata. The task3 path must provide positive evidence; otherwise fail closed.
+# metadata. Tasks 3/4 require positive evidence; otherwise fail closed.
 identity_sources = []
 source_train_cfg = p / "train_config.json"
 if source_train_cfg.is_file():
@@ -138,9 +139,9 @@ if source_dataset_info.is_file():
     if json.loads(source_dataset_info.read_text()) != json.loads(dataset_info.read_text()):
         raise SystemExit(f"Pretrained dataset_info.json differs from selected task {task}")
     identity_sources.append("dataset_info.json")
-if task == 3 and not identity_sources:
+if task in (3, 4) and not identity_sources:
     raise SystemExit(
-        "Task 3 requires original train_config.json or dataset_info.json "
+        f"Task {task} requires original train_config.json or dataset_info.json "
         "inside the materialized policy to verify task identity; refusing to mix tasks"
     )
 
