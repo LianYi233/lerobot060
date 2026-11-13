@@ -300,3 +300,62 @@ def test_task3_rejects_wrong_source_model_even_when_dataset_exists(fake_task3):
     )
     assert result.returncode != 0
     assert "Wrong pretrained task" in result.stderr
+
+
+@pytest.fixture
+def fake_task4(fake_reality):
+    """Task4 must have its own dataset and model provenance."""
+    env = dict(fake_reality)
+    dataset_base = Path(env["DATASET_BASE"])
+    task4 = dataset_base / "4-pick_the_red_cube_into_the_yellow_plate"
+    shutil.copytree(dataset_base / TASK, task4)
+    (Path(env["PRETRAINED_PATH"]) / "train_config.json").write_text(
+        json.dumps({
+            "dataset": {
+                "root": str(task4),
+                "repo_id": f"may-pick-and-place/{task4.name}",
+            }
+        })
+    )
+    env["PIPER_TASK"] = "4"
+    return env
+
+
+def test_task4_fullhead_vlm2_dry_run_resolves_own_dataset_and_source(fake_task4):
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "fullhead_vlm2"],
+        env={**fake_task4, "RUN_GROUP": "test-task4-fullhead-vlm2"},
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    command = next(line for line in result.stdout.splitlines() if line.startswith("env "))
+    args = set(shlex.split(command))
+    folder = "4-pick_the_red_cube_into_the_yellow_plate"
+    assert f"--dataset.repo_id=may-pick-and-place/{folder}" in args
+    assert f"--dataset.root={Path(fake_task4['DATASET_BASE']) / folder}" in args
+    assert f"--policy.pretrained_path={fake_task4['PRETRAINED_PATH']}" in args
+    assert "--policy.train_action_head=true" in args
+    assert "--policy.train_vlm_last_n_layers=2" in args
+    assert "--policy.cabo_enabled=false" in args
+    assert "--steps=1000" in args
+
+
+def test_task4_rejects_task2_model_and_missing_provenance(fake_task4):
+    model = Path(fake_task4["PRETRAINED_PATH"])
+    source = model / "train_config.json"
+    original = json.loads(source.read_text())
+    original["dataset"]["repo_id"] = f"may-pick-and-place/{TASK}"
+    source.write_text(json.dumps(original))
+    failed = subprocess.run(
+        ["bash", str(LAUNCHER), "fullhead_vlm2"], env=fake_task4,
+        text=True, capture_output=True, check=False,
+    )
+    assert failed.returncode != 0
+    assert "Wrong pretrained task" in failed.stderr
+    source.unlink()
+    missing = subprocess.run(
+        ["bash", str(LAUNCHER), "fullhead_vlm2"], env=fake_task4,
+        text=True, capture_output=True, check=False,
+    )
+    assert missing.returncode != 0
+    assert "requires original train_config.json" in missing.stderr
