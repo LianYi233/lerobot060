@@ -230,3 +230,51 @@ def test_task3_resume_rejects_task2_training_config(completed_checkpoint, tmp_pa
     )
     assert result.returncode != 0
     assert "AssertionError" in result.stderr
+
+
+def test_task4_resume_from_completed_task4_10k_checkpoint(completed_checkpoint, tmp_path):
+    train_cfg_file = completed_checkpoint / "checkpoints/010000/pretrained_model/train_config.json"
+    cfg = json.loads(train_cfg_file.read_text())
+    folder = "4-pick_the_red_cube_into_the_yellow_plate"
+    dataset = tmp_path / "data" / folder
+    dataset.mkdir(parents=True)
+    cfg["dataset"]["root"] = str(dataset)
+    cfg["dataset"]["repo_id"] = "may-pick-and-place/" + folder
+    train_cfg_file.write_text(json.dumps(cfg))
+    env = {
+        **os.environ,
+        "SOURCE_RUN": str(completed_checkpoint),
+        "WORK_ROOT": str(tmp_path),
+        "DRY_RUN": "true",
+        "GPU_IDS": "0",
+        "PIPER_TASK": "4",
+    }
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "task=4" in result.stdout
+    line = next(x for x in result.stdout.splitlines() if x.startswith("env "))
+    args = set(shlex.split(line))
+    assert any(x.startswith("--output_dir=") and
+               "task4-fullhead-vlm2-resume10k-to20k" in x and folder in x for x in args)
+    assert "--resume=true" in args
+    assert "--steps=20000" in args
+    assert "--scheduler.restart_at_step=10000" in args
+
+
+def test_task4_resume_rejects_task2_training_config(completed_checkpoint, tmp_path):
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env={
+            **os.environ,
+            "SOURCE_RUN": str(completed_checkpoint),
+            "WORK_ROOT": str(tmp_path),
+            "PIPER_TASK": "4",
+            "DRY_RUN": "true",
+        },
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
