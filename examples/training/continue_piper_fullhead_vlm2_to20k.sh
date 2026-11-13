@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume task2 or task3 fullhead_vlm2 +10k run through TOTAL step 20k.
+# Resume task2, task3, or task4 fullhead_vlm2 +10k run through TOTAL step 20k.
 # Preserves model, optimizer moments, RNG, data-sampler offset, and trained processors.
 # Uses a smooth LR restart; source checkpoint is never modified.
 set -euo pipefail
@@ -10,7 +10,7 @@ Usage:
   GPU_IDS=0 DRY_RUN=true bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
   GPU_IDS=0 DRY_RUN=false bash examples/training/continue_piper_fullhead_vlm2_to20k.sh
 Defaults:
-  PIPER_TASK=2 (default) or 3
+  PIPER_TASK=2 (default), 3, or 4
   SOURCE_RUN=$WORK_ROOT/chkpt/2601-lerobot/piper/task<PIPER_TASK>-fullhead-vlm2-plus10k/<matching run name>
   SOURCE_STEP=10000, TARGET_STEPS=20000
   LR_RESTART_WARMUP=300, LR_RESTART_PEAK_RATIO=0.5
@@ -30,7 +30,8 @@ PIPER_TASK="${PIPER_TASK:-2}"
 case "$PIPER_TASK" in
     2) TASK_FOLDER=2-remove_the_cuboid_from_blue_plate ;;
     3) TASK_FOLDER=3-move_the_tennis_from_yellow_plate_to_blue_plate ;;
-    *) echo "PIPER_TASK must be 2 or 3, got $PIPER_TASK" >&2; exit 2 ;;
+    4) TASK_FOLDER=4-pick_the_red_cube_into_the_yellow_plate ;;
+    *) echo "PIPER_TASK must be 2, 3 or 4, got $PIPER_TASK" >&2; exit 2 ;;
 esac
 RUN_NAME=pi05-may-${TASK_FOLDER}-dual_prompt_only-seed0
 SOURCE_RUN="${SOURCE_RUN:-$WORK_ROOT/chkpt/2601-lerobot/piper/task${PIPER_TASK}-fullhead-vlm2-plus10k/$RUN_NAME}"
