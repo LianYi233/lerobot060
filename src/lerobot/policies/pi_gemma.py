@@ -272,9 +272,21 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
 
         # embed positions
         hidden_states = inputs_embeds
-        # Convert to bfloat16 if the first layer uses bfloat16
+        # Convert to bfloat16 if the first layer uses bfloat16.
         if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
+
+        # On some PyTorch CUDA SDPA backends, additive attention bias must have
+        # the same dtype as Q/K/V. create_causal_mask() can return float32 when
+        # the incoming image/language embeddings or explicit PI0.5 mask are
+        # float32, even though the decoder projects queries in bfloat16.
+        # Keep boolean masks boolean and preserve finite padding sentinels.
+        if (
+            causal_mask is not None
+            and causal_mask.is_floating_point()
+            and causal_mask.dtype != hidden_states.dtype
+        ):
+            causal_mask = causal_mask.to(dtype=hidden_states.dtype)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

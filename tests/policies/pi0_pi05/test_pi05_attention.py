@@ -103,3 +103,31 @@ def test_invalid_attention_implementation_is_rejected():
     tensor = torch.zeros(1, 1, 1, 1)
     with pytest.raises(ValueError, match="Unsupported PI0.5 attention implementation"):
         pi05_attention_forward(SimpleNamespace(), tensor, tensor, tensor, None, 1.0, implementation="unknown")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sdpa_additive_mask_dtype_matches_query_and_preserves_finite_sentinel(dtype, monkeypatch):
+    """CUDA SDPA requires bf16 bias for bf16 Q; mask starts as float32."""
+    from lerobot.policies.pi05 import attention_pi05
+
+    original = torch.nn.functional.scaled_dot_product_attention
+    observed = []
+
+    def strict_sdpa(query, key, value, *, attn_mask=None, **kwargs):
+        if attn_mask is not None and attn_mask.is_floating_point():
+            observed.append(attn_mask.dtype)
+            assert attn_mask.dtype == query.dtype
+            assert bool(torch.isfinite(attn_mask).all())
+            assert bool((attn_mask < 0).any())
+        return original(query, key, value, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(attention_pi05.F, "scaled_dot_product_attention", strict_sdpa)
+    # Input is deliberately float32, matching the model's OpenPI mask builder.
+    mask = torch.tensor([[[[0.0, OPENPI_ATTENTION_MASK_VALUE], [0.0, 0.0]]]])
+    q = torch.randn(1, 2, 2, 8, dtype=dtype)
+    kv = torch.randn(1, 2, 2, 8, dtype=dtype)
+    actual, _ = pi05_attention_forward(
+        SimpleNamespace(), q, kv, kv, mask, 0.25, implementation="sdpa"
+    )
+    assert actual.shape == (1, 2, 2, 8)
+    assert observed == [dtype]

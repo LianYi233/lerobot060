@@ -1049,3 +1049,29 @@ def test_real_peft_trains_and_saves_only_both_prompt_banks(tmp_path, custom_targ
         fresh_policy.model.paligemma_with_expert.gemma_expert,
     ):
         assert all(not module.training for module in backbone.modules())
+
+
+@torch.no_grad()
+def test_bfloat16_cached_prefix_passes_matching_sdpa_bias_dtype(monkeypatch):
+    """Regression: HF Gemma SDPA rejects float32 additive bias with bf16 query on CUDA."""
+    core = PI05Policy(_config(dtype="bfloat16", cabo_enabled=False)).model.eval()
+    language_model = core.paligemma_with_expert.paligemma.model.language_model
+    first_attention = language_model.layers[0].self_attn
+    observed = []
+    original_forward = first_attention.forward
+
+    def inspect_mask(*args, **kwargs):
+        bias = kwargs.get("attention_mask")
+        if bias is not None and bias.is_floating_point():
+            observed.append((bias.dtype, first_attention.q_proj.weight.dtype))
+            assert bias.dtype == first_attention.q_proj.weight.dtype
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(first_attention, "forward", inspect_mask)
+    inputs = _inputs()
+    noise = _actions()
+    prediction = core.sample_actions(**inputs, noise=noise, num_steps=1)
+    assert prediction.shape == noise.shape
+    assert torch.isfinite(prediction).all()
+    assert observed, "Expected the prefix attention mask to reach Gemma"
+    assert all(actual == expected == torch.bfloat16 for actual, expected in observed)

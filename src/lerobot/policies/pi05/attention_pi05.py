@@ -35,10 +35,12 @@ def pi05_attention_forward(
 ) -> tuple[Tensor, Tensor | None]:
     """Return attention in [batch, query tokens, heads, head dimension] order.
 
-    The additive mask remains float32 even for bfloat16 queries. In particular,
-    preserve PI0.5's finite negative padding value instead of converting it to
-    an infinite value with different fully masked-row semantics. Fully masked
-    rows represent padding and their outputs must not contribute to the loss.
+    The additive mask is constructed with a finite float32 padding sentinel.
+    For optimized SDPA, match its dtype to the query when needed: PyTorch
+    CUDA backends can reject float32 bias with bfloat16 Q/K/V. The PI0.5
+    sentinel remains finite in bfloat16 (unlike an infinite -inf mask), so
+    fully masked padding rows preserve the intended finite-mask semantics.
+    Padding rows must still be excluded from the training loss.
     """
     if implementation == "eager":
         # Transformers is optional; the optimized backend only depends on PyTorch.
@@ -55,6 +57,13 @@ def pi05_attention_forward(
         key = key.expand(-1, query.shape[1], -1, -1)
         value = value.expand(-1, query.shape[1], -1, -1)
         enable_gqa = False
+
+    if (
+        attention_mask is not None
+        and attention_mask.is_floating_point()
+        and attention_mask.dtype != query.dtype
+    ):
+        attention_mask = attention_mask.to(dtype=query.dtype)
 
     output = F.scaled_dot_product_attention(
         query,
