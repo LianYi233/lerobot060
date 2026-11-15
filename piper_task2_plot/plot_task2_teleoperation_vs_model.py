@@ -484,7 +484,10 @@ def run(args: argparse.Namespace) -> Path | None:
     except ImportError as exc:
         raise RuntimeError("Plotting dependencies missing. In the active environment run: "
                            "python -m pip install matplotlib pillow") from exc
-    device = torch.device(args.device)
+    # Resolve an unindexed 'cuda' to the first visible GPU. PyTorch set_device
+    # requires an explicit ordinal, while CUDA_VISIBLE_DEVICES maps the chosen
+    # physical GPU to local cuda:0 in this single-GPU launcher.
+    device = torch.device("cuda:0" if args.device == "cuda" else args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA unavailable in the active environment.")
     if device.type != "cuda" and config.dtype != "float32":
@@ -500,7 +503,7 @@ def run(args: argparse.Namespace) -> Path | None:
     np.random.seed(args.seed % (2**32))
     torch.manual_seed(args.seed)
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(device.index)
         torch.cuda.manual_seed_all(args.seed)
     dataset = LeRobotDataset(training.get("repo_id") or TASK_REPO, root=root, episodes=episodes,
                             delta_timestamps=resolve_delta_timestamps(config, metadata),
