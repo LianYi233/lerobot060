@@ -214,7 +214,9 @@ def train(args):
         raise RuntimeError(f"Unexpected trainable parameters: {[name for name, _ in trainable]}")
 
     optimizer = cfg.get_optimizer_preset().build([trainable[0][1]])
-    scheduler = cfg.get_scheduler_preset().build(optimizer, args.steps)
+    # Original PrimingVLA trains 750 SAP updates before 250 bridge updates in
+    # a 1000-update Stage-I schedule. Preserve that scheduler prefix exactly.
+    scheduler = cfg.get_scheduler_preset().build(optimizer, max(args.steps, 1_000))
     prompt_initial = _checkpoint_prompt(policy)
     action_dim = normalized.shape[-1]
     actions = torch.as_tensor(normalized, dtype=torch.float32, device=args.device)
