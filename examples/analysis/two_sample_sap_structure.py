@@ -15,9 +15,16 @@ import argparse
 import hashlib
 import json
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# Resolve the matching LeRobot implementation in this Git worktree, even when
+# the active Conda env has an editable installation of a different checkout.
+_WORKTREE_SRC = Path(__file__).resolve().parents[2] / "src"
+if str(_WORKTREE_SRC) not in sys.path:
+    sys.path.insert(0, str(_WORKTREE_SRC))
 
 
 def parse_episode_offsets(spec: str) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -37,7 +44,7 @@ def parse_episode_offsets(spec: str) -> tuple[tuple[int, int], tuple[int, int]]:
 
 
 def select_chunk_starts(
-    episode_records: list[dict],
+    episode_records: list[dict] | dict[int, dict],
     selectors: tuple[tuple[int, int], tuple[int, int]],
     horizon: int,
 ) -> list[int]:
@@ -45,9 +52,14 @@ def select_chunk_starts(
     selected = []
     ranges = []
     for episode, offset in selectors:
-        if episode >= len(episode_records):
-            raise ValueError(f"Episode {episode} is outside [0, {len(episode_records)})")
-        record = episode_records[episode]
+        if isinstance(episode_records, dict):
+            if episode not in episode_records:
+                raise ValueError(f"Episode {episode} was not found in the dataset metadata")
+            record = episode_records[episode]
+        else:
+            if episode >= len(episode_records):
+                raise ValueError(f"Episode {episode} is outside [0, {len(episode_records)})")
+            record = episode_records[episode]
         lo, hi = int(record["dataset_from_index"]), int(record["dataset_to_index"])
         start = lo + offset
         if start + horizon > hi:
@@ -136,33 +148,78 @@ def _configure_pi05(base: Path, device: str, *, gradient_checkpointing: bool = T
 
 
 def _load_real_action_chunks(args, cfg):
-    """Use the original LeRobot index and dataset quantiles, but never decode images."""
-    import torch
+    """Read two tiny Parquet slices directly without building an HF Arrow cache.
 
-    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.utils.constants import ACTION
+    ``LeRobotDataset`` loads *all* action Parquet files through
+    ``datasets.Dataset.from_parquet`` and writes a second, potentially huge
+    Arrow dataset. That is inappropriate for this strictly two-chunk probe.
+    Here PyArrow scans only the needed columns and rows in memory.
+    """
+    import pyarrow.dataset as pa_ds
 
-    meta = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
-    dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root, video_backend="pyav")
+    action_key = "action"
+    root = Path(args.dataset_root)
+    info_path = root / "meta" / "info.json"
+    stats_path = root / "meta" / "stats.json"
+    episodes_dir = root / "meta" / "episodes"
+    for path in (info_path, stats_path, episodes_dir):
+        if not path.exists():
+            raise FileNotFoundError(f"Missing local LIBERO dataset metadata: {path}")
+
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    data_template = info.get("data_path")
+    if not isinstance(data_template, str):
+        raise ValueError("Dataset meta/info.json has no data_path template")
     horizon = cfg.chunk_size
-    records = [meta.episodes[i] for i in range(meta.total_episodes)]
     selectors = parse_episode_offsets(args.chunks)
+    episode_ids = sorted({episode for episode, _ in selectors})
+    episode_columns = [
+        "episode_index", "dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index"
+    ]
+    episode_ds = pa_ds.dataset(str(episodes_dir), format="parquet")
+    episode_rows = episode_ds.to_table(
+        columns=episode_columns,
+        filter=pa_ds.field("episode_index").isin(episode_ids),
+    ).to_pylist()
+    records = {int(row["episode_index"]): row for row in episode_rows}
     starts = select_chunk_starts(records, selectors, horizon)
 
-    # The original training pipeline takes full action chunks via action_delta_indices.
-    # Reading HF action columns directly avoids decoding unused camera videos.
+    # The original training pipeline takes exactly these H consecutive frames
+    # via action_delta_indices. Reading their Parquet columns directly avoids
+    # loading videos, all other episodes, or writing any HF dataset cache.
     chunks = []
-    for start in starts:
-        values = dataset.hf_dataset[list(range(start, start + horizon))][ACTION]
-        chunks.append(torch.stack(values).to(dtype=torch.float32).cpu().numpy())
+    for (episode, _), start in zip(selectors, starts, strict=True):
+        record = records[episode]
+        parquet_path = root / data_template.format(
+            chunk_index=int(record["data/chunk_index"]),
+            file_index=int(record["data/file_index"]),
+        )
+        if not parquet_path.is_file():
+            raise FileNotFoundError(f"Parquet file for episode {episode} not found: {parquet_path}")
+        action_ds = pa_ds.dataset(str(parquet_path), format="parquet")
+        window = action_ds.to_table(
+            columns=["index", action_key],
+            filter=(pa_ds.field("episode_index") == episode)
+            & (pa_ds.field("index") >= start)
+            & (pa_ds.field("index") < start + horizon),
+        ).to_pydict()
+        indices = np.asarray(window["index"], dtype=np.int64)
+        order = np.argsort(indices)
+        if not np.array_equal(indices[order], np.arange(start, start + horizon)):
+            raise ValueError(
+                f"Episode {episode}: expected absolute indices {start}..{start + horizon - 1}, "
+                f"received {indices[order].tolist()}"
+            )
+        chunks.append(np.asarray(window[action_key], dtype=np.float32)[order])
     raw = np.stack(chunks, axis=0)
     if raw.ndim != 3 or raw.shape[1] != horizon:
         raise ValueError(f"Expected two action chunks of shape [2, {horizon}, D], got {raw.shape}")
     if raw.shape[2] > cfg.max_action_dim:
         raise ValueError("Dataset action dimension exceeds PI0.5 max_action_dim")
-    stats = meta.stats[ACTION]
-    normalized = quantile_normalize(raw, stats["q01"].numpy(), stats["q99"].numpy())
+    if action_key not in stats or "q01" not in stats[action_key] or "q99" not in stats[action_key]:
+        raise ValueError("Dataset meta/stats.json needs action.q01 and action.q99 for PI0.5 normalization")
+    normalized = quantile_normalize(raw, stats[action_key]["q01"], stats[action_key]["q99"])
     if not np.isfinite(normalized).all():
         raise ValueError("Non-finite normalized actions; check dataset action quantile statistics")
     return normalized, selectors, starts
@@ -187,8 +244,12 @@ def _checkpoint_prompt(policy):
 
 def train(args):
     torch = _get_torch()
+    import lerobot
+
     from lerobot.policies.pi05.configuration_pi05 import PI05TrainingObjective
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy, pad_vector
+
+    print(f"[IMPORT] lerobot={Path(lerobot.__file__).resolve()}", flush=True)
 
     output = args.output.resolve()
     if output.exists():
@@ -202,6 +263,7 @@ def train(args):
     cfg = _configure_pi05(args.base_checkpoint, args.device)
     cfg.next_action_masked_steps = args.masked_steps
     normalized, selectors, starts = _load_real_action_chunks(args, cfg)
+    print(f"[DATA] two action chunks only: selectors={selectors}, absolute_starts={starts}", flush=True)
     data_hash = hashlib.sha256(normalized.tobytes()).hexdigest()
 
     # Only create output after validating all input paths and action windows.
