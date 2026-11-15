@@ -51,7 +51,9 @@ they do not prove that this finite-sample SAP experiment will succeed.
 | `full_mask` | Same two original chunks | All 50/50 | Can a context-free action prior explain the effect? |
 
 All three have the **same two chunks, checkpoint, random seed, prompt
-initialization, AdamW/scheduler recipe, and number of updates**. The shuffled
+initialization, AdamW/scheduler recipe, and number of updates**. The 750 updates
+use the *first 750 steps of the original 1000-update Stage-I LR schedule*,
+which continues through the 250 bridge updates in the main experiment. The shuffled
 run preserves the multiset of actions and each channel's marginal values at
 every update, but randomizes their time coordinates independently. The
 full-mask control has more supervised positions (50 versus 40), which must be
