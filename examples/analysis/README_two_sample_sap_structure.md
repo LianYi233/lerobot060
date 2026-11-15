@@ -16,6 +16,15 @@ are shared across groups. Therefore, the conclusion concerns the **additional
 learning of action prompts**, *not* learning robotics from only two examples or
 generalizing to unseen tasks.
 
+**Low-disk-space note:** this script uses **PyArrow's in-memory filtered reads**
+of the two episode Parquet files; it does not instantiate `LeRobotDataset` or
+convert every LIBERO file into a Hugging Face Arrow cache. Its first output
+line also reports the exact LeRobot source path being imported. If a previous
+version failed with `Errno 28`, inspect `df -h` and the size of the HF datasets
+cache separately before retrying; a partially created cache is not deleted by
+this script. The script automatically puts its own worktree `src/` first on
+Python's import path, avoiding stale editable installs from other checkouts.
+
 ## Hypothesis and mathematical grounding
 
 With MSE-based conditional reconstruction, the population-optimal missing-action
