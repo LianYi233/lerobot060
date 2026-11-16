@@ -255,3 +255,145 @@ Further primary references:
   Optimisation*, IJRR 2024: https://doi.org/10.1177/02783649241233300
 - Lipman et al., *Flow Matching for Generative Modeling*, ICLR 2023:
   https://arxiv.org/abs/2210.02747
+
+## V3: theory-grounded structure probes (no retraining)
+
+The new **evaluation-only** script `two_sample_sap_structure_v3.py` adds four
+different analyses of the *same* pretrained PI0.5 and the three existing
+750-update Action Prompt checkpoints. It does **not** load the full dataset
+into a Hugging Face Arrow cache and does **not** modify any checkpoints.
+
+All comparisons reuse the same mask positions, Gaussian noise, two training
+chunks (or explicitly selected held-out episodes), ODE budget, and random seed.
+An `init` control uses the *saved initial prompt*; a `linear_interpolation`
+control is used for all trajectory comparisons but cannot predict a flow field.
+
+| Analysis name | Mathematical connection | Primary reported metric | When measured |
+| --- | --- | --- | --- |
+| `temporal_gain` | Conditional prediction under squared error | `temporal_predictive_gain = MSE(permuted context) - MSE(correct context)` | Random masks and long gap |
+| `hankel` | Time-delay embedding / space-time POD / system identification | Distance between top-r singular subspace projectors; normalized SVD energy-spectrum error | Hidden *contiguous* region, continuous channels only |
+| `flow_field` | PI0.5 action-only Flow Matching objective | Cosine alignment to the exact masked training velocity `z-a`; relative flow-MSE; context-order gain | Both masks, times `0.1,0.3,0.5,0.7,0.9` |
+| `lag_correlation` | Autocorrelation / multi-joint dynamical coordination | Relative Frobenius error of lagged cross-joint covariance of action increments | Hidden *contiguous* region, continuous channels only |
+
+### The exact interpretation of the theory
+
+Let `Y` denote hidden actions, `C_ord` the ordered observed actions and
+`C_bag` their unordered multiset. The conditional-expectation projection
+theorem gives the **Bayes-optimal** squared-error risk decomposition
+
+`R*(C_bag) - R*(C_ord) = E[ || E[Y|C_ord] - E[Y|C_bag] ||^2 ] >= 0`.
+
+The implemented temporal-gain metric is **not** an estimator of that population
+identity. It is a *paired intervention on a particular finite-capacity policy*:
+the visible action vectors are randomly permuted across visible time positions,
+with exactly the same hidden target and masked noise. This corruption can
+create out-of-distribution input. Therefore, always compare SAP against
+`init`, `shuffled`, `full_mask`, and interpolation, and report
+`order_gain_vs_init` and `order_gain_vs_shuffled` (difference in differences).
+Report both all-action and continuous-motion-only gains, to ensure that a
+binary gripper state does not dominate the analysis.
+
+Hankel analysis uses the **masked 20-step interval alone** (not all 50 steps
+with 30 copied visible ground-truth values). For each 20x6 continuous-action
+path, a window of 5 constructs a block time-delay Hankel matrix. All model
+paths are centered/scaled with the *same reference statistics* (0.05 minimum
+standard deviation). If `U_r` and `Uhat_r` contain top-r left singular
+vectors, the subspace distance is
+
+`||U_r U_r^T - Uhat_r Uhat_r^T||_F / sqrt(2r)`.
+
+The extra SVD-spectrum metric compares normalized **squared** singular values.
+An exactly static reference yields `null`, not a spurious structure score.
+These are *finite-sequence diagnostic proxies*, not proof that a nonlinear
+robotic action system is globally low rank or Koopman invariant. Only the
+contiguous `long_gap` mode is eligible for these time-delay analyses: selecting
+randomly scattered hidden steps would falsely treat unequal time intervals as
+adjacent.
+
+`flow_field` uses **the exact training flow convention** from
+`PI05Pytorch.forward(ACTION_INPAINTING)`:
+`x_t=(1-t)*a+t*z` for hidden timesteps; visible timesteps remain clamped to
+clean actions. The target is `u_t=z-a`. Only hidden **original** action
+dimensions are scored (not the internal zero-padded dimensions). Ground-truth
+hidden actions are present in the *diagnostic* noising path, as in training,
+but they are never supplied to the complete-ODE generator. This helps
+distinguish poor local vector-field learning from ODE integration difficulties;
+it does not by itself establish learned temporal structure.
+
+`lag_correlation` constructs the velocity-increment sequence of each hidden
+contiguous segment and compares the lag-0 through lag-5 cross-joint covariance
+matrices to the reference. It uses shared reference-based velocity scaling.
+The sample has few temporal observations, so its result is descriptive, not a
+consistent estimate of a population autocorrelation function.
+
+### Run sequentially on the existing trained prompts
+
+First pull the updated **same branch** `sap-two-sample-structure` into the
+separate existing checkout. Your old `sap/`, `shuffled/`, and `full_mask/`
+directories are retained unchanged.
+
+```bash
+cd /root/autodl-tmp/lerobot060-sap-two-sample
+git pull --ff-only origin sap-two-sample-structure
+
+export OUT_ROOT=/root/autodl-tmp/wyn/chkpt/2601-lerobot/two-sample-sap
+export DATASET_ROOT=/root/autodl-fs/datasets/libero
+
+# Step 1: inexpensive Flow-Matching diagnosis, no full ODE solver.
+CUDA_VISIBLE_DEVICES=0 python examples/analysis/two_sample_sap_structure_v3.py \
+  --sap "$OUT_ROOT/sap" --shuffled "$OUT_ROOT/shuffled" \
+  --full-mask "$OUT_ROOT/full_mask" \
+  --analyses flow_field \
+  --masked-steps 20 --repeats 4 \
+  --output "$OUT_ROOT/analysis_v3_flow"
+
+# Step 2: ordered-context risk + two dynamics tests, sharing full-ODE rollouts.
+CUDA_VISIBLE_DEVICES=0 python examples/analysis/two_sample_sap_structure_v3.py \
+  --sap "$OUT_ROOT/sap" --shuffled "$OUT_ROOT/shuffled" \
+  --full-mask "$OUT_ROOT/full_mask" \
+  --analyses temporal_gain,hankel,lag_correlation \
+  --masked-steps 20 --ode-steps 32 --repeats 4 \
+  --output "$OUT_ROOT/analysis_v3_dynamics"
+```
+
+Alternatively, run `--analyses all --output "$OUT_ROOT/analysis_v3_all"`
+once to share the same probes and compare every metric together.
+All output directories must be new/empty; the script refuses to overwrite a
+previous analysis. The numerical results and **per-chunk raw observations**
+are written to `metrics_v3.json` and `per_chunk_v3.json`. Depending on
+`--analyses`, it also creates:
+
+- `temporal_gain_v3.png`: ordered versus permuted context-risk gain;
+- `hankel_v3.png`: reference/model mode-energy spectra and subspace/spectrum error;
+- `flow_field_v3.png`: exact flow-target cosine versus flow time;
+- `lag_correlation_v3.png`: lagged covariance magnitude and error.
+
+To retain the original two-chunk training setup while measuring generalization,
+specify **independent episodes** using `--eval-chunks` and `--dataset-root`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/analysis/two_sample_sap_structure_v3.py \
+  --sap "$OUT_ROOT/sap" --shuffled "$OUT_ROOT/shuffled" \
+  --full-mask "$OUT_ROOT/full_mask" \
+  --dataset-root "$DATASET_ROOT" --eval-chunks 2:10,3:10,4:10,5:10 \
+  --analyses all --masked-steps 20 --ode-steps 32 --repeats 4 \
+  --output "$OUT_ROOT/analysis_v3_heldout"
+```
+
+The episode selectors are examples: verify that the selected episodes have
+50 unpadded consecutive steps. The code **rejects any training episode** in
+held-out evaluation. Repeating masks on the same trajectory is not an
+independent statistical seed, and using only two training chunks cannot
+establish a general structure-learning claim. Low error on these metrics is
+meaningful only if SAP separates from its shuffled and untrained controls.
+
+Relevant theory and primary studies:
+
+- Conditional expectation and squared-error projection:
+  https://ee.stanford.edu/~gray/LPCIP-sig-029-ebook.pdf
+- Frame and Towne, *Space-time POD and the Hankel Matrix*, 2023:
+  https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0289637
+- Han et al., *On the Utility of Koopman Operator Theory in Learning Dexterous
+  Manipulation Skills*, CoRL 2023: https://proceedings.mlr.press/v229/han23a.html
+- Lipman et al., *Flow Matching for Generative Modeling*, ICLR 2023:
+  https://arxiv.org/abs/2210.02747
