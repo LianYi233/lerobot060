@@ -165,3 +165,93 @@ information, prove physically correct dynamics, isolate entirely new structures
 from those already present in the frozen pretrained expert, or establish
 generalization to unseen trajectories. With only two independent chunks, CKA
 and population covariance estimates are inappropriate as primary metrics.
+
+## V2: full flow sampling, action transitions, and path-signature geometry
+
+The evaluation-only companion `two_sample_sap_structure_v2.py` adds **two
+structural measures** while keeping the original `analyze` output unchanged:
+
+1. **Action Transition Recovery** in the last action dimension (LIBERO gripper
+   by default). It detects signed state changes at threshold zero, counts
+   only transitions whose *two adjacent ground-truth positions* are masked,
+   and reports recall within a two-step tolerance, timing MAE among matched
+   transitions, and false transitions. If no transition is eligible (or none
+   is recovered), timing MAE is `null`; this is not zero error. A separate
+   first-difference MSE covers continuous motion dimensions.
+2. **Second-order Path Signature Error**, using the antisymmetric level-2
+   iterated integral (Lévy area) of the `action + normalized time` path.
+   It measures ordered coupling and timing. Absolute and relative L2 errors
+   are reported; a near-zero reference signature yields a `null` relative
+   error. A low error alone does not establish learning: compare against
+   matched controls and linear interpolation.
+
+Unlike the old single-step denoising probe, V2 begins **every masked action
+dimension at pure Gaussian noise at flow time t=1**, Euler-integrates the
+actual Stage-I `predict_inpainting_velocity` to `t=0`, and hard-clamps the
+visible action values after every step. All padded internal action dimensions
+also start with noise when masked. Ground-truth hidden actions do *not* enter
+the sampler. Initial, SAP, shuffled, and full-mask prompts reuse identical
+noise/masks/inference budgets; interpolation uses the same visible positions.
+
+Two mask protocols are reported separately:
+
+- `random`: 40 of 50 timesteps selected randomly (as in SAP training).
+- `long_gap`: the **fixed middle 40/50 timesteps** masked, with five visible
+  steps at each end. Because the mask location is fixed, it does not reveal
+  ground-truth event timing. This tests much longer-range completion.
+
+### Run without retraining (recommended first)
+
+```bash
+cd /root/autodl-tmp/lerobot060-sap-two-sample
+export OUT_ROOT=/root/autodl-tmp/wyn/chkpt/2601-lerobot/two-sample-sap
+export DATASET_ROOT=/root/autodl-fs/datasets/libero
+
+CUDA_VISIBLE_DEVICES=0 python examples/analysis/two_sample_sap_structure_v2.py \
+  --sap "$OUT_ROOT/sap" \
+  --shuffled "$OUT_ROOT/shuffled" \
+  --full-mask "$OUT_ROOT/full_mask" \
+  --output "$OUT_ROOT/analysis_v2" \
+  --ode-steps 16 --repeats 2 --masked-steps 40 --batch-size 1
+```
+
+The default evaluation uses the **original two training chunks**, under new
+masks/noise. This is a diagnostic, not an independent test. To test **unseen
+trajectories while continuing to train on only two chunks**, use different
+episodes with the same low-memory Parquet reader:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/analysis/two_sample_sap_structure_v2.py \
+  --sap "$OUT_ROOT/sap" \
+  --shuffled "$OUT_ROOT/shuffled" \
+  --full-mask "$OUT_ROOT/full_mask" \
+  --output "$OUT_ROOT/analysis_v2_heldout" \
+  --dataset-root "$DATASET_ROOT" \
+  --eval-chunks 2:10,3:10,4:10,5:10 \
+  --ode-steps 16 --repeats 2 --batch-size 1
+```
+
+The selectors are examples; every window must fit 50 unpadded frames. All
+episodes containing the training chunks (here 0 and 1) are rejected. For
+stronger generalization evidence use 20+ held-out episodes. Repeated masks
+are **not** independent trajectories.
+
+The outputs are `metrics_v2.json`, `per_chunk_v2.json`, and
+`structure_v2.png`; the original `analysis/` files and all checkpoints are
+left untouched. Empty event recall is `null`, never silently treated as zero.
+
+**More training steps?** Not yet. The **750 SAP updates** already reproduce
+the original Stage-I priming budget, and all three controls received the
+same number of updates. Check full-ODE structural metrics first. If SAP
+still fails to outperform controls, a distinct 1500/3000-update sensitivity
+study could retrain **all variants** with equal budgets and evaluate on
+independent episodes; longer training of two examples may just memorize them.
+
+Further primary references:
+
+- Chevyrev and Kormilitzin, *A Primer on the Signature Method in Machine
+  Learning*: https://arxiv.org/abs/1603.03788
+- Barcelos et al., *Path Signatures for Diversity in Probabilistic Trajectory
+  Optimisation*, IJRR 2024: https://doi.org/10.1177/02783649241233300
+- Lipman et al., *Flow Matching for Generative Modeling*, ICLR 2023:
+  https://arxiv.org/abs/2210.02747

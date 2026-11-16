@@ -29,23 +29,31 @@ if str(_WORKTREE_SRC) not in sys.path:
 
 def parse_episode_offsets(spec: str) -> tuple[tuple[int, int], tuple[int, int]]:
     """Parse two ``episode:offset`` selectors, including robust validation."""
-    selectors = spec.split(",")
-    if len(selectors) != 2:
+    pairs = parse_episode_offsets_many(spec)
+    if len(pairs) != 2:
         raise ValueError("Exactly two episode:offset selectors are required, e.g. 0:10,1:10")
+    return pairs[0], pairs[1]
+
+
+def parse_episode_offsets_many(spec: str) -> tuple[tuple[int, int], ...]:
+    """Parse a nonempty list of episode:offset selectors for held-out evaluation."""
+    selectors = spec.split(",")
+    if not selectors or not spec.strip():
+        raise ValueError("At least one episode:offset selector is required")
     pairs = []
     for value in selectors:
         values = value.strip().split(":")
         if len(values) != 2 or any(not part.isdecimal() for part in values):
             raise ValueError("Selectors must be nonnegative episode:offset pairs")
         pairs.append((int(values[0]), int(values[1])))
-    if len(set(pairs)) != 2:
-        raise ValueError("The two action chunks must have different selectors")
-    return pairs[0], pairs[1]
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("Action chunk selectors must be distinct")
+    return tuple(pairs)
 
 
 def select_chunk_starts(
     episode_records: list[dict] | dict[int, dict],
-    selectors: tuple[tuple[int, int], tuple[int, int]],
+    selectors: tuple[tuple[int, int], ...],
     horizon: int,
 ) -> list[int]:
     """Select non-overlapping, unpadded full chunks by absolute dataset index."""
@@ -69,9 +77,10 @@ def select_chunk_starts(
             )
         selected.append(start)
         ranges.append((start, start + horizon))
-    (a0, a1), (b0, b1) = ranges
-    if max(a0, b0) < min(a1, b1):
-        raise ValueError("The two chunks overlap; choose two different episodes or distant offsets")
+    for i, (a0, a1) in enumerate(ranges):
+        for b0, b1 in ranges[i + 1:]:
+            if max(a0, b0) < min(a1, b1):
+                raise ValueError("Action chunks overlap; choose different episodes or distant offsets")
     return selected
 
 
@@ -148,6 +157,13 @@ def _configure_pi05(base: Path, device: str, *, gradient_checkpointing: bool = T
 
 
 def _load_real_action_chunks(args, cfg):
+    """Read the exact two SAP training chunks, or the original analysis chunks."""
+    return _load_action_chunks_from_selectors(
+        args.dataset_root, cfg, parse_episode_offsets(args.chunks)
+    )
+
+
+def _load_action_chunks_from_selectors(dataset_root, cfg, selectors):
     """Read two tiny Parquet slices directly without building an HF Arrow cache.
 
     ``LeRobotDataset`` loads *all* action Parquet files through
@@ -158,7 +174,7 @@ def _load_real_action_chunks(args, cfg):
     import pyarrow.dataset as pa_ds
 
     action_key = "action"
-    root = Path(args.dataset_root)
+    root = Path(dataset_root)
     info_path = root / "meta" / "info.json"
     stats_path = root / "meta" / "stats.json"
     episodes_dir = root / "meta" / "episodes"
@@ -172,7 +188,8 @@ def _load_real_action_chunks(args, cfg):
     if not isinstance(data_template, str):
         raise ValueError("Dataset meta/info.json has no data_path template")
     horizon = cfg.chunk_size
-    selectors = parse_episode_offsets(args.chunks)
+    if not selectors:
+        raise ValueError("At least one action chunk must be specified")
     episode_ids = sorted({episode for episode, _ in selectors})
     episode_columns = [
         "episode_index", "dataset_from_index", "dataset_to_index", "data/chunk_index", "data/file_index"
@@ -214,7 +231,7 @@ def _load_real_action_chunks(args, cfg):
         chunks.append(np.asarray(window[action_key], dtype=np.float32)[order])
     raw = np.stack(chunks, axis=0)
     if raw.ndim != 3 or raw.shape[1] != horizon:
-        raise ValueError(f"Expected two action chunks of shape [2, {horizon}, D], got {raw.shape}")
+        raise ValueError(f"Expected action chunks of shape [N, {horizon}, D], got {raw.shape}")
     if raw.shape[2] > cfg.max_action_dim:
         raise ValueError("Dataset action dimension exceeds PI0.5 max_action_dim")
     if action_key not in stats or "q01" not in stats[action_key] or "q99" not in stats[action_key]:
