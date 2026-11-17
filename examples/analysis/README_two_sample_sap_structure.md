@@ -256,6 +256,116 @@ Further primary references:
 - Lipman et al., *Flow Matching for Generative Modeling*, ICLR 2023:
   https://arxiv.org/abs/2210.02747
 
+## V4: Four data-scale experiments on a local A100 (all outputs on /data1)
+
+V4 is the **new** episode-disjoint experiment. It is separate from the original
+two-chunk V1/V2/V3 scripts and keeps their data, prompts, and results unchanged.
+The immediate question is whether having only two independent training chunks
+prevents SAP from separating from a time-shuffled control.
+
+Four data scales run **sequentially**: `N=2,32,128,512`, with two matched
+training groups (`sap`, `shuffled`) at each scale. This means **8 training
+runs**, followed by a held-out flow-field evaluation for each scale. `init`
+is evaluated without training. Full-mask and downstream Bridge/Adaptation
+comparisons are deliberately deferred until these first data-scale results are
+interpretable; they are not silently claimed as part of the four-run sweep.
+
+**Dataset design:** A one-time preparation stage reads LIBERO's episode metadata,
+splits episodes by task when that metadata is available, and selects up to one
+full 50-step action chunk per episode. Training and testing share **no episode
+IDs**. Action windows are grouped by Parquet shard and read directly into memory,
+without building a Hugging Face Arrow cache. Training chunks are ordered in
+three interleaved motion categories (gripper transition, continuous movement,
+steady) to avoid choosing only the first few, mostly static actions. The train
+sets are nested: `train_2 ⊂ train_32 ⊂ train_128 ⊂ train_512`.
+Every experiment evaluates on the same **200 independent test episodes**
+(provided the dataset contains enough valid episodes). Repeated masks/noise and
+flow times are *not* counted as independent test episodes.
+
+**Training design:** The PI0.5 LIBERO checkpoint, action Prompt initialization,
+number of trainable parameters (16 × 1024), 750 optimization steps, batch size
+of 2, 40/50 randomly masked training timesteps, and model optimizer/scheduler
+are shared by all groups. At each update `shuffled` performs a fresh temporal
+permutation on the same sampled action chunks, retaining their value
+distribution. The 2-chunk group is retrained with V4's **nested** sample choice:
+the old two-chunk checkpoint does not share V4's training data.
+
+**Primary evaluation:** PI0.5's exact masked conditional flow target
+`u_t=z-a` on 200 held-out action chunks with 40/50 masked timesteps, at
+flow times `0.1,0.3,0.5,0.7,0.9`. This is an action-only Flow Matching
+diagnostic, **not** a complete-ODE motion sample. As a separately labeled
+mask-generalization test, V4 also evaluates 20/50 masking. The primary scalar
+is episode-averaged flow-target *relative MSE*. A positive
+`MSE(shuffled) - MSE(sap)` supports a relative benefit of correctly ordered
+training, although not by itself a proof of identifiable action dynamics.
+The paired 95% bootstrap interval resamples **episodes**, not noise/mask trials;
+train-seed uncertainty requires additional repeated training runs. The evaluation
+also reports the relative change in predicted velocity caused by learned prompts
+versus the saved common initialization.
+
+### Local A100: launch all four data-scale groups in order
+
+Use a local checkout of `LianYi233/lerobot060` on the
+`sap-two-sample-structure` branch. Install it into the existing GPU
+environment (`pip install -e .`). Required Python packages include PyTorch,
+PyArrow, NumPy, and the LeRobot dependencies; Matplotlib is used to draw a
+summary figure. No GPU training or checkpoint upload is performed by this README.
+
+The paths to the **already existing** LIBERO dataset and the
+`pi05_libero_base` model are environment-specific and must be provided by the
+user. The example values below are **placeholders**; verify the actual paths on
+your local A100 first. Unlike the old AutoDL commands, neither training outputs
+nor caches are written under `/root/autodl-*`.
+
+```bash
+cd /path/to/your/lerobot060
+git fetch origin sap-two-sample-structure
+git switch sap-two-sample-structure
+git pull --ff-only origin sap-two-sample-structure
+
+# Replace these two locations with the real local paths.
+export DATASET_ROOT=/data1/datasets/libero
+export BASE_PI05=/data1/models/pi05_libero_base
+
+# All new prompts, prepared action data, logs, figures and caches go to /data1.
+export OUT_ROOT=/data1/wyn/chkpt/2601-lerobot/sap-structure-v4
+export GPU_ID=0
+
+bash examples/analysis/run_sap_structure_v4_local_a100.sh
+```
+
+The runner validates the input directories and the `/data1` mount **before**
+starting. It executes:
+
+1. `prepare` once to save `prepared/prepared_v4.pt` and the full selection
+   manifest in `prepared/manifest_v4.json`.
+2. `N=2`: train SAP and Shuffled, then evaluate both on held-out episodes.
+3. `N=32`, then `N=128`, then `N=512`: repeat the matched procedure.
+4. Create `summary-seed0/sample_size_summary_v4.json` and
+   `sample_size_v4.png` / `.pdf`.
+
+The runner prints a compact `[RESULT]` line for each scale and mask ratio:
+SAP relative flow MSE, shuffled relative flow MSE, their paired difference,
+and a paired episode-bootstrap 95% interval. Full numerical records are retained
+under `eval/n{N}-seed0/per_episode_v4.json`.
+
+All files are new to `OUT_ROOT`; existing complete groups are skipped on
+rerun, while **incomplete output directories cause an explicit stop** rather
+than automatic deletion or overwrite. For a second training seed, use a
+different prepared directory/output root; the provided script is currently
+designed as a matched *one-seed pilot*. Change `TRAIN_STEPS` and match all
+groups if doing a separate longer-training study. An increased dataset size
+gets fewer presentations per unique chunk at fixed 750 updates, so a later
+750-versus-1500/3000 budget sensitivity comparison is necessary if the
+512-chunk group appears undertrained.
+
+**Scope:** The held-out episodes are withheld from the *new SAP adaptation*
+only. They may have appeared during the pretraining of `pi05_libero_base`.
+Thus V4 tests whether Stage-I **Action Prompt updates** learn reusable
+sequence information on top of the same pretrained expert, not whether PI0.5
+learns LIBERO dynamics from scratch. A downstream matched-budget
+SAP/Shuffled/Full-mask/Direct-Dual comparison remains a separate Experiment C.
+
 ## V3: theory-grounded structure probes (no retraining)
 
 The new **evaluation-only** script `two_sample_sap_structure_v3.py` adds four
