@@ -5,7 +5,7 @@ set -euo pipefail
 
 if [[ -z "${DATASET_ROOT:-}" || -z "${BASE_PI05:-}" ]]; then
   echo "[ERROR] Set DATASET_ROOT and BASE_PI05 to existing local paths." >&2
-  echo "Example: DATASET_ROOT=/data1/datasets/libero BASE_PI05=/data1/models/pi05_libero_base bash examples/analysis/run_sap_structure_v4_local_a100.sh" >&2
+  echo "Example: DATASET_ROOT=/data/datasets/libero BASE_PI05=/data/models/lerobot/pi05_libero_base/ bash examples/analysis/run_sap_structure_v4_local_a100.sh" >&2
   exit 2
 fi
 if [[ ! -d "$DATASET_ROOT" || ! -d "$BASE_PI05" ]]; then

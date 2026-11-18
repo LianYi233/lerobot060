@@ -311,11 +311,10 @@ environment (`pip install -e .`). Required Python packages include PyTorch,
 PyArrow, NumPy, and the LeRobot dependencies; Matplotlib is used to draw a
 summary figure. No GPU training or checkpoint upload is performed by this README.
 
-The paths to the **already existing** LIBERO dataset and the
-`pi05_libero_base` model are environment-specific and must be provided by the
-user. The example values below are **placeholders**; verify the actual paths on
-your local A100 first. Unlike the old AutoDL commands, neither training outputs
-nor caches are written under `/root/autodl-*`.
+The paths below are the LIBERO dataset and `pi05_libero_base` locations
+specified for the user's local A100 server. Verify these locations before
+launching. The **inputs** are read from `/data`; all **new training outputs**
+and caches are saved under `/data1`, not under the old AutoDL paths.
 
 ```bash
 cd /path/to/your/lerobot060
@@ -323,9 +322,8 @@ git fetch origin sap-two-sample-structure
 git switch sap-two-sample-structure
 git pull --ff-only origin sap-two-sample-structure
 
-# Replace these two locations with the real local paths.
-export DATASET_ROOT=/data1/datasets/libero
-export BASE_PI05=/data1/models/pi05_libero_base
+export DATASET_ROOT=/data/datasets/libero
+export BASE_PI05=/data/models/lerobot/pi05_libero_base/
 
 # All new prompts, prepared action data, logs, figures and caches go to /data1.
 export OUT_ROOT=/data1/wyn/chkpt/2601-lerobot/sap-structure-v4
