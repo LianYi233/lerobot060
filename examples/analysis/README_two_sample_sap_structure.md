@@ -273,8 +273,9 @@ interpretable; they are not silently claimed as part of the four-run sweep.
 **Dataset design:** A one-time preparation stage reads LIBERO's episode metadata,
 splits episodes by task when that metadata is available, and selects up to one
 full 50-step action chunk per episode. Training and testing share **no episode
-IDs**. Action windows are grouped by Parquet shard and read directly into memory,
-without building a Hugging Face Arrow cache. Training chunks are ordered in
+IDs**. Action windows are fetched with a filtered Arrow scan of the full
+`data/` Parquet directory by global `episode_index` (without building a Hugging
+Face Arrow cache). Training chunks are ordered in
 three interleaved motion categories (gripper transition, continuous movement,
 steady) to avoid choosing only the first few, mostly static actions. The train
 sets are nested: `train_2 ⊂ train_32 ⊂ train_128 ⊂ train_512`.
@@ -282,13 +283,15 @@ Every experiment evaluates on the same **200 independent test episodes**
 (provided the dataset contains enough valid episodes). Repeated masks/noise and
 flow times are *not* counted as independent test episodes.
 
-The grouped Parquet reader uses the per-episode `frame_index` if available,
-falling back to ordered `index` values within each episode. It does not assume
-that the global `dataset_from_index` value must match the physical Parquet
-`index` field for every episode. Incomplete or noncontiguous episode windows
-are excluded with explicit diagnostics; preparation stops if fewer than 512
-valid train windows or 200 valid held-out windows remain. This also handles
-some merged LIBERO datasets whose later episode indices are remapped.
+The reader uses the per-episode `frame_index` if available, falling back to
+ordered `index` values within each episode. It **does not trust** the metadata
+`data/chunk_index` and `data/file_index` as physical locations: in the user's
+merged LIBERO copy, the metadata points episode 183 to `file-012.parquet` but
+that file holds episodes 29/30; the full data directory correctly contains all
+303 rows of episode 183. The reader validates the actual row count against the
+metadata episode length and rejects missing, incomplete, or noncontiguous
+episodes with explicit diagnostics. Preparation stops if fewer than 512 valid
+train windows or 200 valid held-out windows remain.
 
 **Training design:** The PI0.5 LIBERO checkpoint, action Prompt initialization,
 number of trainable parameters (16 × 1024), 750 optimization steps, batch size

@@ -65,14 +65,13 @@ class SapStructureV4Test(unittest.TestCase):
         with self.assertRaises(ValueError):
             _choose_candidates(records, 81, seed=0, horizon=50)
 
-    def test_grouped_reader_uses_episode_relative_frames_not_global_indices(self):
-        # Simulates a merged dataset whose episode metadata start index does
-        # not agree with the per-Parquet index column. This broke episode 1571.
+    def test_reader_scans_all_shards_by_episode_id_not_stale_metadata_path(self):
+        # In the actual local LIBERO copy, metadata points episode 1571 at
+        # file-064.parquet, but that shard contains only episodes 162-164.
+        # The global episode-ID scan still finds all 133 frames of 1571.
         with tempfile.TemporaryDirectory() as temp:
             dataset_root = Path(temp)
-            action_file = dataset_root / "data" / "chunk-000" / "file-000.parquet"
-            action_file.parent.mkdir(parents=True)
-            action_file.touch()
+            (dataset_root / "data").mkdir()
             action_rows = [
                 {"episode_index": 1571, "index": j, "frame_index": j,
                  "action": [float(j), float(2 * j)]} for j in range(100)
@@ -95,24 +94,36 @@ class SapStructureV4Test(unittest.TestCase):
 
                 def to_table(self, columns, filter):
                     self.requested_columns = columns
+                    filter_name, filter_ids = filter
+                    assert filter_name == "episode_index"
+                    included = [row for row in action_rows
+                                if row["episode_index"] in filter_ids]
                     return FakeTable({
-                        column: [row[column] for row in action_rows]
+                        column: [row[column] for row in included]
                         for column in columns
                     })
 
             pa = types.ModuleType("pyarrow")
             pa.__path__ = []
             pa_dataset = types.ModuleType("pyarrow.dataset")
-            pa_dataset.dataset = lambda path, format: FakeDataset()
+            paths_seen = []
+
+            def fake_dataset(path, format):
+                paths_seen.append(path)
+                self.assertEqual(path, str(dataset_root / "data"))
+                self.assertEqual(format, "parquet")
+                return FakeDataset()
+
+            pa_dataset.dataset = fake_dataset
             pa_dataset.field = lambda name: types.SimpleNamespace(isin=lambda ids: (name, ids))
             pa.dataset = pa_dataset
             candidates = [
-                {"episode_index": 1571, "offset": 10,
+                {"episode_index": 1571, "offset": 10, "episode_length": 100,
                  "dataset_from_index": 258505,
-                 "data/chunk_index": 0, "data/file_index": 0},
-                {"episode_index": 1572, "offset": 10,
+                 "data/chunk_index": 0, "data/file_index": 64},
+                {"episode_index": 1572, "offset": 10, "episode_length": 100,
                  "dataset_from_index": 258605,
-                 "data/chunk_index": 0, "data/file_index": 0},
+                 "data/chunk_index": 0, "data/file_index": 64},
             ]
             with patch.dict(sys.modules, {"pyarrow": pa, "pyarrow.dataset": pa_dataset}):
                 normalized, accepted, rejected = _read_action_windows(
@@ -122,10 +133,12 @@ class SapStructureV4Test(unittest.TestCase):
                     horizon=50,
                 )
             self.assertEqual(normalized.shape, (1, 50, 2))
+            self.assertEqual(paths_seen, [str(dataset_root / "data")])
             self.assertEqual(accepted[0]["episode_index"], 1571)
             self.assertAlmostEqual(float(normalized[0, 0, 0]), -.8, places=5)
             self.assertEqual(len(rejected), 1)
             self.assertIn("episode=1572", rejected[0])
+            self.assertIn("actual_rows=30, metadata_rows=100", rejected[0])
 
     def test_strata_and_nested_balancing(self):
         chunks = np.zeros((6, 50, 7), dtype=np.float32)

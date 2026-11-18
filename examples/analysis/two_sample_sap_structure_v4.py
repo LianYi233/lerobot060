@@ -161,14 +161,12 @@ def _read_episode_records(dataset_root: Path, horizon: int) -> tuple[list[dict],
 
     info = json.loads((dataset_root / "meta" / "info.json").read_text(encoding="utf-8"))
     stats = json.loads((dataset_root / "meta" / "stats.json").read_text(encoding="utf-8"))
-    if not isinstance(info.get("data_path"), str):
-        raise ValueError("LIBERO meta/info.json requires a data_path template")
     if "action" not in stats or not {"q01", "q99"}.issubset(stats["action"]):
         raise ValueError("LIBERO meta/stats.json requires action.q01/q99")
     metadata = pa_ds.dataset(str(dataset_root / "meta" / "episodes"), format="parquet")
-    required = ["episode_index", "dataset_from_index", "dataset_to_index",
-                "data/chunk_index", "data/file_index"]
-    optional = [x for x in ("task_index", "tasks", "task_indices")
+    required = ["episode_index", "dataset_from_index", "dataset_to_index"]
+    optional = [x for x in ("data/chunk_index", "data/file_index",
+                           "task_index", "tasks", "task_indices")
                 if x in metadata.schema.names]
     missing = set(required) - set(metadata.schema.names)
     if missing:
@@ -179,7 +177,8 @@ def _read_episode_records(dataset_root: Path, horizon: int) -> tuple[list[dict],
         length = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
         if length < horizon:
             continue
-        task_value = next((row[key] for key in optional if row.get(key) is not None), "unknown")
+        task_value = next((row[key] for key in ("task_index", "tasks", "task_indices")
+                           if row.get(key) is not None), "unknown")
         records.append({**row, "task": str(task_value), "episode_length": length})
     return records, info, stats
 
@@ -210,54 +209,55 @@ def _choose_candidates(rows: list[dict], count: int, seed: int, horizon: int) ->
 
 def _read_action_windows(dataset_root: Path, candidates: list[dict], info: dict,
                          stats: dict, horizon: int) -> tuple[np.ndarray, list[dict], list[str]]:
-    """Read episode-relative contiguous windows, rejecting malformed candidates.
+    """Read chunks by global episode ID, never by metadata's physical shard path.
 
-    dataset_from_index in metadata is not guaranteed to match the index values
-    within every Parquet shard. Prefer episode-local frame_index where present;
-    otherwise use sorted within-episode index order. Never mix episodes or
-    silently accept discontinuous frames.
+    Some merged LIBERO copies have stale ``data/file_index`` metadata: e.g.
+    file-012.parquet holds episodes 29/30, despite metadata pointing there for
+    episodes 182/183/196. Their episode IDs and frame counts in the *entire*
+    data directory are still correct. Use Arrow's episode-ID filter across all
+    shards, then validate episode length and frame continuity before sampling.
     """
     import pyarrow.dataset as pa_ds
 
     result = [None] * len(candidates)
-    groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
-    for i, row in enumerate(candidates):
-        path = dataset_root / info["data_path"].format(
-            chunk_index=int(row["data/chunk_index"]), file_index=int(row["data/file_index"])
-        )
-        groups[str(path)].append((i, row))
+    data_root = dataset_root / "data"
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"Missing action data directory: {data_root}")
+    dataset = pa_ds.dataset(str(data_root), format="parquet")
+    sequence_key = "frame_index" if "frame_index" in dataset.schema.names else "index"
+    required_columns = {"episode_index", "action", sequence_key}
+    if not required_columns.issubset(dataset.schema.names):
+        missing = sorted(required_columns - set(dataset.schema.names))
+        raise ValueError(f"Action data directory {data_root} missing columns: {missing}")
+
+    wanted = sorted({int(row["episode_index"]) for row in candidates})
+    table = dataset.to_table(
+        columns=["episode_index", sequence_key, "action"],
+        filter=pa_ds.field("episode_index").isin(wanted),
+    ).to_pydict()
+    by_episode: dict[int, list[tuple[int, object]]] = defaultdict(list)
+    for ep, index, action in zip(table["episode_index"], table[sequence_key],
+                                 table["action"], strict=True):
+        by_episode[int(ep)].append((int(index), action))
+
     rejected = []
-    for path, entries in groups.items():
-        if not Path(path).is_file():
-            raise FileNotFoundError(f"Missing action file: {path}")
-        wanted = [int(row["episode_index"]) for _, row in entries]
-        dataset = pa_ds.dataset(path, format="parquet")
-        sequence_key = "frame_index" if "frame_index" in dataset.schema.names else "index"
-        if sequence_key not in dataset.schema.names:
-            raise ValueError(f"{path} has neither frame_index nor index for ordering")
-        table = dataset.to_table(
-            columns=["episode_index", sequence_key, "action"],
-            filter=pa_ds.field("episode_index").isin(wanted),
-        ).to_pydict()
-        by_episode: dict[int, list[tuple[int, object]]] = defaultdict(list)
-        for ep, index, action in zip(table["episode_index"], table[sequence_key],
-                                     table["action"], strict=True):
-            by_episode[int(ep)].append((int(index), action))
-        for i, row in entries:
-            episode_id = int(row["episode_index"])
-            offset = int(row["offset"])
-            episode_rows = sorted(by_episode[episode_id], key=lambda item: item[0])
-            selected = episode_rows[offset:offset + horizon]
-            indices = [index for index, _ in selected]
-            if (len(indices) != horizon
-                    or indices != list(range(indices[0], indices[0] + horizon))):
-                rejected.append(
-                    f"episode={episode_id}, file={Path(path).name}, "
-                    f"key={sequence_key}, offset={offset}, rows={len(episode_rows)}, "
-                    f"selected={len(indices)}, first_indices={indices[:5]}"
-                )
-                continue
-            result[i] = np.asarray([action for _, action in selected], dtype=np.float32)
+    for i, row in enumerate(candidates):
+        episode_id = int(row["episode_index"])
+        offset = int(row["offset"])
+        episode_rows = sorted(by_episode[episode_id], key=lambda item: item[0])
+        expected_length = int(row["episode_length"])
+        selected = episode_rows[offset:offset + horizon]
+        indices = [index for index, _ in selected]
+        if (len(episode_rows) != expected_length
+                or len(indices) != horizon
+                or indices != list(range(indices[0], indices[0] + horizon))):
+            rejected.append(
+                f"episode={episode_id}, key={sequence_key}, offset={offset}, "
+                f"actual_rows={len(episode_rows)}, metadata_rows={expected_length}, "
+                f"selected={len(indices)}, first_indices={indices[:5]}"
+            )
+            continue
+        result[i] = np.asarray([action for _, action in selected], dtype=np.float32)
     valid_indices = [i for i, value in enumerate(result) if value is not None]
     if not valid_indices:
         raise ValueError(f"No valid {horizon}-step action chunks; examples: {rejected[:3]}")
@@ -327,7 +327,9 @@ def prepare(args) -> None:
         "train": train_meta, "test": test_meta,
         "selection": "one offset per episode, task-round-robin candidate sampling, "
                      "movement/transition/steady interleaving; nested train subsets; "
-                     "ordered by episode-local frame_index or within-episode index",
+                     "global episode-ID Parquet filter independent of metadata shard paths; "
+                     "ordered by episode-local frame_index or within-episode index; "
+                     "validated against metadata episode lengths",
         "excluded_candidate_windows": {
             "train": len(train_rejected), "test": len(test_rejected),
             "examples": (train_rejected + test_rejected)[:10],
