@@ -113,6 +113,9 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 10_000
+    # Additional exact completed-update checkpoints in this training run. Include 0 to save the
+    # initialized model and processors before any updates. These do not restart the optimizer.
+    save_steps: list[int] = field(default_factory=list)
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -218,6 +221,14 @@ class TrainPipelineConfig(HubMixin):
             self.reward_model.pretrained_path = str(policy_dir)
 
     def validate(self) -> None:
+        if any(
+            not isinstance(step, int) or isinstance(step, bool) or not 0 <= step <= self.steps
+            for step in self.save_steps
+        ):
+            raise ValueError(f"save_steps must contain integers between 0 and steps={self.steps}.")
+        if self.save_steps and not self.save_checkpoint:
+            raise ValueError("save_steps requires save_checkpoint=True.")
+        self.save_steps = sorted(set(self.save_steps))
         self._resolve_pretrained_from_cli()
 
         if self.policy is None and self.reward_model is None:

@@ -20,28 +20,14 @@ from lerobot.utils.ntk import (
     projected_jacobian_rows,
     spectral_metrics,
 )
+from lerobot.utils.ntk_protocol import (
+    COMPARABLE_FIELDS,
+    measurement_digest,
+    measurement_identity,
+    validate_measurement_pair,
+)
 
 STAGES = ("before", "priming", "stage2", "final")
-COMPARABLE_FIELDS = (
-    "paligemma_variant",
-    "action_expert_variant",
-    "num_vlm_prompt_tokens",
-    "num_prompt_tokens",
-    "chunk_size",
-    "max_action_dim",
-    "max_state_dim",
-    "image_resolution",
-    "input_features",
-    "output_features",
-    "normalization_mapping",
-    "tokenizer_max_length",
-    "min_period",
-    "max_period",
-    "time_sampling_beta_alpha",
-    "time_sampling_beta_beta",
-    "time_sampling_scale",
-    "time_sampling_offset",
-)
 
 
 def read_json(path):
@@ -61,6 +47,12 @@ def checkpoint_dir(path):
 
 
 def resolve_stages(args):
+    if args.schedule == "prompt-only":
+        from lerobot.utils.ntk_control import resolve_prompt_only_stages
+
+        if args.through_stage != "final" or any(getattr(args, name) for name in STAGES):
+            raise ValueError("prompt-only uses --run-dir and --through-step, not staged checkpoint flags")
+        return resolve_prompt_only_stages(args)
     selected = STAGES[: STAGES.index(args.through_stage) + 1]
     if args.final_flow_steps <= 0:
         raise ValueError("--final-flow-steps must be positive (2000 means 3000 cumulative updates)")
@@ -131,6 +123,13 @@ def validate_manifest_extension(previous, current):
     """Reuse completed stages only when all measurement settings stay identical."""
     previous_protocol = {key: value for key, value in previous.items() if key != "stages"}
     current_protocol = {key: value for key, value in current.items() if key != "stages"}
+    # An audited CLI-only revision can reuse numerical measurements. All inputs,
+    # weights and remaining settings must still match exactly.
+    identity = measurement_identity(previous)
+    if identity and identity == measurement_identity(current):
+        for protocol in (previous_protocol, current_protocol):
+            protocol.pop("source_digest", None)
+            protocol["measurement_digest"] = identity
     old_stages, new_stages = previous["stages"], current["stages"]
     if previous_protocol != current_protocol or old_stages != new_stages[: len(old_stages)]:
         raise ValueError(
@@ -324,9 +323,8 @@ def analyze_seed(policy, groups, samples, seed, args):
 
 
 def run(args):
-    import torch
-
     stages = resolve_stages(args)
+    reference = prepare_reference(args, stages)
     print("Checkpoint timeline (completed updates):")
     for stage in stages:
         print(
@@ -335,6 +333,8 @@ def run(args):
         )
     if args.dry_run:
         return
+    import torch
+
     if not args.dataset_repo_id or not args.dataset_root:
         raise ValueError("--dataset-repo-id and --dataset-root are required")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -365,6 +365,7 @@ def run(args):
         "dataset_root": str(Path(args.dataset_root).resolve()),
         "sample_indices": indices,
         "sample_digest": fingerprint_samples(samples),
+        "measurement_digest": measurement_digest(),
         "source_digest": hashlib.sha256(
             Path(__file__).read_bytes()
             + b"".join(
@@ -382,6 +383,10 @@ def run(args):
             for stage in stages
         ],
     }
+    if args.schedule == "prompt-only":
+        manifest["schedule"] = "prompt-only"
+    if reference:
+        validate_measurement_pair(reference["manifest"], manifest)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.json"
@@ -398,6 +403,10 @@ def run(args):
             current_signature = {
                 group: [[name, list(p.shape)] for name, p in members] for group, members in groups.items()
             }
+            if reference and any(
+                record.get("parameter_groups") != current_signature for record in reference["records"]
+            ):
+                raise ValueError("Parameter groups differ from the reference NTK measurements")
             if signature is not None and signature != current_signature:
                 raise ValueError("Parameter groups differ across checkpoints")
             signature = current_signature
@@ -426,9 +435,77 @@ def run(args):
             signature = record["parameter_groups"]
             records.append(record)
     write_json(output_dir / "results.json", {"manifest": manifest, "records": records})
-    from lerobot.scripts.plot_pi05_ntk_stages import plot_results
+    plot_outputs(args)
 
-    plot_results(output_dir / "results.json")
+
+def prepare_reference(args, stages):
+    """Inherit probes/indices from real staged results before loading any models."""
+    if not args.reference_results:
+        return None
+    reference = read_json(args.reference_results)
+    manifest = reference["manifest"]
+    if not reference.get("records") or not manifest.get("stages"):
+        raise ValueError("Reference results must contain actual NTK records and checkpoint metadata")
+    if measurement_identity(manifest) != measurement_digest():
+        raise ValueError(
+            "Reference NTK numerical source is different or unaudited; remeasure it with this code"
+        )
+    reference_steps = {stage["total_step"] for stage in manifest["stages"]}
+    if any(stage["total_step"] not in reference_steps for stage in stages):
+        raise ValueError("Reference results do not contain every requested cumulative checkpoint")
+    for stage in stages:
+        for field in COMPARABLE_FIELDS:
+            if stage["config"].get(field) != manifest["stages"][0]["config"].get(field):
+                raise ValueError(f"Checkpoint differs from reference configuration: {field}")
+    # Locations may change across machines; actual processed input tensors are
+    # compared by sample_digest after load_samples and before any Jacobian work.
+    args.dataset_root = args.dataset_root or manifest["dataset_root"]
+    args.dataset_repo_id = manifest["dataset_repo_id"]
+    args.indices = ",".join(map(str, manifest["sample_indices"]))
+    args.seeds = ",".join(map(str, manifest["seeds"]))
+    for name in ("scope", "output_probes", "probe_seed", "sketch_dim", "sketch_seed"):
+        setattr(args, name, manifest[name])
+    logging.info("Using paired measurement settings from %s", args.reference_results)
+    return reference
+
+
+def plot_outputs(args):
+    results_path = Path(args.output_dir) / "results.json"
+    if args.schedule == "prompt-only":
+        from lerobot.scripts.plot_pi05_ntk_comparison import plot_comparison
+
+        manifest = read_json(results_path)["manifest"]
+        steps = tuple(stage["total_step"] for stage in manifest["stages"])
+        label = (
+            "Prompt learning + CPC (no stages)"
+            if manifest["stages"][0]["config"].get("cabo_enabled", False)
+            else "Plain prompt learning"
+        )
+        # Keep separate figure directories so offline replotting cannot overwrite
+        # the standalone control when a paired comparison is requested as well.
+        scope = "prompts" if manifest["scope"] == "prompts" else "backbone"
+        plot_comparison(
+            results_path,
+            Path(args.output_dir) / "scatter",
+            steps=steps,
+            scope=scope,
+            control_label=label,
+            font_path=args.font_path,
+        )
+        if args.reference_results:
+            plot_comparison(
+                results_path,
+                Path(args.output_dir) / "comparison",
+                staged_results=args.reference_results,
+                steps=steps,
+                scope=scope,
+                control_label=label,
+                font_path=args.font_path,
+            )
+    else:
+        from lerobot.scripts.plot_pi05_ntk_stages import plot_results
+
+        plot_results(results_path)
 
 
 def make_parser():
@@ -436,6 +513,24 @@ def make_parser():
     parser.add_argument(
         "--run-dir", help="Formal-flow output directory; auto-resolves its pretraining sibling"
     )
+    parser.add_argument(
+        "--schedule",
+        choices=("staged", "prompt-only"),
+        default="staged",
+        help="prompt-only uses one uninterrupted 4000-update run with 0/750/1000/4000 snapshots",
+    )
+    parser.add_argument(
+        "--through-step",
+        type=int,
+        choices=(0, 750, 1000, 4000),
+        default=4000,
+        help="Last cumulative checkpoint for --schedule=prompt-only; 1000 supports unfinished runs",
+    )
+    parser.add_argument(
+        "--reference-results",
+        help="Reuse a staged results.json's samples/probes and plot both methods",
+    )
+    parser.add_argument("--font-path", help="Font file for prompt-only/comparison scatter figures")
     parser.add_argument(
         "--through-stage",
         choices=STAGES,
@@ -479,9 +574,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = make_parser().parse_args()
     if args.plot_only:
-        from lerobot.scripts.plot_pi05_ntk_stages import plot_results
-
-        plot_results(Path(args.output_dir) / "results.json")
+        plot_outputs(args)
     else:
         run(args)
 

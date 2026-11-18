@@ -20,6 +20,8 @@ full_reference automatically saves exact initialization and priming-end snapshot
 and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000).
 Set NTK_SAVE_STAGE_SNAPSHOTS=false to disable extra stage snapshots, or SAVE_FREQ
 to override the flow checkpoint interval. Other variants keep their existing defaults.
+Set FLOW_STEPS=4000 SAVE_STEPS='[0,750,1000,4000]' for exact flow-update checkpoints;
+0 saves the actual initialized model and processors before its first update.
 Set RUN_NAME to isolate tasks, or DRY_RUN=true to print the command without training.
 EOF
 }
@@ -102,6 +104,7 @@ GPU_IDS="${GPU_IDS:-0}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 SAVE_FREQ="${SAVE_FREQ:-${SAVE_FREQ_DEFAULT}}"
+SAVE_STEPS="${SAVE_STEPS:-[]}"
 NTK_SAVE_STAGE_SNAPSHOTS="${NTK_SAVE_STAGE_SNAPSHOTS:-${NTK_SNAPSHOTS_DEFAULT}}"
 CABO_RATIO="${CABO_RATIO:-2.0}"
 MASKED_STEPS="${MASKED_STEPS:-40}"
@@ -173,6 +176,7 @@ TRAIN_ARGS=(
   --seed="${SEED}"
   --save_checkpoint=true
   --save_freq="${SAVE_FREQ}"
+  --save_steps="${SAVE_STEPS}"
 )
 
 LAUNCH_ARGS=(
@@ -188,6 +192,7 @@ echo "variant=${VARIANT} seed=${SEED} GPUs=${GPU_IDS} processes=${NUM_PROCESSES}
 echo "prompts=${VLM_PROMPT_TOKENS}+${ACTION_PROMPT_TOKENS} pretrain=${PRETRAIN_STEPS} bridge=${BRIDGE_STEPS} flow=${FLOW_STEPS} CABO=${CABO_ENABLED}"
 echo "output=${OUTPUT_DIR}"
 echo "NTK stage snapshots=${NTK_SAVE_STAGE_SNAPSHOTS} flow checkpoint interval=${SAVE_FREQ}"
+echo "Additional exact flow checkpoints=${SAVE_STEPS}"
 if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then
   PRETRAIN_OUTPUT_DIR="${OUTPUT_DIR}_next_action_pretrain"
   printf 'NTK before training: %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" 0

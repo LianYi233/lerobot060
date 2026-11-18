@@ -403,6 +403,9 @@ def _make_pi05_next_action_pretraining_config(cfg: TrainPipelineConfig) -> Train
     pretrain_cfg.sample_weighting = None
     pretrain_cfg.save_checkpoint = True
     pretrain_cfg.save_freq = pretrain_steps
+    # Explicit steps refer to the requested flow run, not its isolated pretraining sibling.
+    # The legacy NTK stage flag independently saves initialization and the bridge boundary.
+    pretrain_cfg.save_steps = []
     pretrain_cfg.save_checkpoint_to_hub = False
     pretrain_cfg.wandb = dataclasses.replace(pretrain_cfg.wandb, enable=False, run_id=None)
     pretrain_cfg.job = dataclasses.replace(pretrain_cfg.job, target="local")
@@ -424,6 +427,13 @@ def _pi05_next_action_pretrained_model_dir(pretrain_cfg: TrainPipelineConfig) ->
     return checkpoint_dir / PRETRAINED_MODEL_DIR
 
 
+def _is_scheduled_checkpoint_step(cfg: TrainPipelineConfig, step: int) -> bool:
+    """Check completed updates without changing the optimizer or scheduler timeline."""
+    return step in cfg.save_steps or (
+        step > 0 and ((cfg.save_freq > 0 and step % cfg.save_freq == 0) or step == cfg.steps)
+    )
+
+
 def _save_pi05_ntk_initial_snapshot(
     cfg, policy, optimizer, scheduler, preprocessor, postprocessor, accelerator, step
 ) -> None:
@@ -431,7 +441,7 @@ def _save_pi05_ntk_initial_snapshot(
     from accelerate import DistributedType
 
     if not (
-        getattr(cfg.policy, "ntk_save_stage_snapshots", False)
+        (getattr(cfg.policy, "ntk_save_stage_snapshots", False) or 0 in cfg.save_steps)
         and cfg.save_checkpoint
         and not cfg.resume
         and step == 0
@@ -1041,7 +1051,7 @@ def _train_single_stage(
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_saving_step = _is_scheduled_checkpoint_step(cfg, step)
         if ntk_snapshots and step == pi05_stage1_bridge_start_step:
             # `step` counts completed updates: 750 here is after priming, before bridge update 1.
             is_saving_step = True

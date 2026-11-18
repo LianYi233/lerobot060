@@ -1,5 +1,8 @@
 # PI05 四时间点 NTK 分析
 
+新增的普通 Prompt learning 对照（单次连续训练 4000 步、0/750/1000/4000 快照及两行散点图）见
+[README_pi05_ntk_prompt_control.md](README_pi05_ntk_prompt_control.md)。
+
 比较 **VLM 与 action expert** 在训练前、750 步 priming 后、1000 步 bridge（论文 stage 2）后、最终训练后的局部敏感性。
 `backbone` 与 `prompts` 分开绘图，默认两者都测。这里 action backbone 包含 Gemma expert、action 输入/输出投影和 time MLP；不包含只用于 inpainting 的 role embedding。VLM 包含完整 PaliGemma，包括视觉编码器。参数按对象去重，未参与输出的参数贡献零梯度，但仍计入该组参数总数。
 
