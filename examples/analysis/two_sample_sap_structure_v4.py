@@ -209,8 +209,14 @@ def _choose_candidates(rows: list[dict], count: int, seed: int, horizon: int) ->
 
 
 def _read_action_windows(dataset_root: Path, candidates: list[dict], info: dict,
-                         stats: dict, horizon: int) -> np.ndarray:
-    """Read grouped Parquet shards in memory without building an HF Arrow cache."""
+                         stats: dict, horizon: int) -> tuple[np.ndarray, list[dict], list[str]]:
+    """Read episode-relative contiguous windows, rejecting malformed candidates.
+
+    dataset_from_index in metadata is not guaranteed to match the index values
+    within every Parquet shard. Prefer episode-local frame_index where present;
+    otherwise use sorted within-episode index order. Never mix episodes or
+    silently accept discontinuous frames.
+    """
     import pyarrow.dataset as pa_ds
 
     result = [None] * len(candidates)
@@ -220,30 +226,47 @@ def _read_action_windows(dataset_root: Path, candidates: list[dict], info: dict,
             chunk_index=int(row["data/chunk_index"]), file_index=int(row["data/file_index"])
         )
         groups[str(path)].append((i, row))
+    rejected = []
     for path, entries in groups.items():
         if not Path(path).is_file():
             raise FileNotFoundError(f"Missing action file: {path}")
         wanted = [int(row["episode_index"]) for _, row in entries]
         dataset = pa_ds.dataset(path, format="parquet")
+        sequence_key = "frame_index" if "frame_index" in dataset.schema.names else "index"
+        if sequence_key not in dataset.schema.names:
+            raise ValueError(f"{path} has neither frame_index nor index for ordering")
         table = dataset.to_table(
-            columns=["episode_index", "index", "action"],
+            columns=["episode_index", sequence_key, "action"],
             filter=pa_ds.field("episode_index").isin(wanted),
         ).to_pydict()
         by_episode: dict[int, list[tuple[int, object]]] = defaultdict(list)
-        for ep, index, action in zip(table["episode_index"], table["index"],
+        for ep, index, action in zip(table["episode_index"], table[sequence_key],
                                      table["action"], strict=True):
             by_episode[int(ep)].append((int(index), action))
         for i, row in entries:
-            start = int(row["dataset_from_index"]) + int(row["offset"])
-            selected = sorted((index, action) for index, action in
-                              by_episode[int(row["episode_index"])]
-                              if start <= index < start + horizon)
+            episode_id = int(row["episode_index"])
+            offset = int(row["offset"])
+            episode_rows = sorted(by_episode[episode_id], key=lambda item: item[0])
+            selected = episode_rows[offset:offset + horizon]
             indices = [index for index, _ in selected]
-            if indices != list(range(start, start + horizon)):
-                raise ValueError(f"Episode {row['episode_index']}: incomplete {horizon}-step window at {start}")
+            if (len(indices) != horizon
+                    or indices != list(range(indices[0], indices[0] + horizon))):
+                rejected.append(
+                    f"episode={episode_id}, file={Path(path).name}, "
+                    f"key={sequence_key}, offset={offset}, rows={len(episode_rows)}, "
+                    f"selected={len(indices)}, first_indices={indices[:5]}"
+                )
+                continue
             result[i] = np.asarray([action for _, action in selected], dtype=np.float32)
-    raw = np.stack(result, axis=0)
-    return quantile_normalize(raw, stats["action"]["q01"], stats["action"]["q99"])
+    valid_indices = [i for i, value in enumerate(result) if value is not None]
+    if not valid_indices:
+        raise ValueError(f"No valid {horizon}-step action chunks; examples: {rejected[:3]}")
+    raw = np.stack([result[i] for i in valid_indices], axis=0)
+    return (
+        quantile_normalize(raw, stats["action"]["q01"], stats["action"]["q99"]),
+        [candidates[i] for i in valid_indices],
+        rejected,
+    )
 
 
 def prepare(args) -> None:
@@ -264,8 +287,24 @@ def prepare(args) -> None:
     test_pool_size = min(len(test_pool), max(args.test_chunks, math.ceil(args.test_chunks * args.candidate_multiplier)))
     train_candidates = _choose_candidates(train_pool, train_pool_size, args.seed + 23, args.horizon)
     test_candidates = _choose_candidates(test_pool, test_pool_size, args.seed + 47, args.horizon)
-    train_all = _read_action_windows(dataset_root, train_candidates, info, stats, args.horizon)
-    test_all = _read_action_windows(dataset_root, test_candidates, info, stats, args.horizon)
+    train_all, train_candidates, train_rejected = _read_action_windows(
+        dataset_root, train_candidates, info, stats, args.horizon
+    )
+    test_all, test_candidates, test_rejected = _read_action_windows(
+        dataset_root, test_candidates, info, stats, args.horizon
+    )
+    if train_rejected or test_rejected:
+        print(f"[PREPARE] Excluded incomplete/noncontiguous episodes: "
+              f"train={len(train_rejected)}, test={len(test_rejected)}", flush=True)
+        for issue in (train_rejected + test_rejected)[:5]:
+            print(f"[PREPARE]   {issue}", flush=True)
+    if len(train_candidates) < max_size or len(test_candidates) < args.test_chunks:
+        raise ValueError(
+            f"After excluding invalid windows, only {len(train_candidates)} train "
+            f"and {len(test_candidates)} test episodes remain; need "
+            f"{max_size} and {args.test_chunks}. Increase candidate_multiplier "
+            f"or inspect the reported Parquet data."
+        )
     train_labels = action_strata(train_all)
     test_labels = action_strata(test_all)
     train_order = balanced_order(train_labels, args.seed + 71)[:max_size]
@@ -287,7 +326,12 @@ def prepare(args) -> None:
         "test_sha256": hashlib.sha256(test.tobytes()).hexdigest(),
         "train": train_meta, "test": test_meta,
         "selection": "one offset per episode, task-round-robin candidate sampling, "
-                     "movement/transition/steady interleaving; nested train subsets",
+                     "movement/transition/steady interleaving; nested train subsets; "
+                     "ordered by episode-local frame_index or within-episode index",
+        "excluded_candidate_windows": {
+            "train": len(train_rejected), "test": len(test_rejected),
+            "examples": (train_rejected + test_rejected)[:10],
+        },
         "disclaimer": "Episodes are held out from SAP, not necessarily from pi05_libero_base pretraining",
     }
     output.mkdir(parents=True)

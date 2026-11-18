@@ -282,6 +282,14 @@ Every experiment evaluates on the same **200 independent test episodes**
 (provided the dataset contains enough valid episodes). Repeated masks/noise and
 flow times are *not* counted as independent test episodes.
 
+The grouped Parquet reader uses the per-episode `frame_index` if available,
+falling back to ordered `index` values within each episode. It does not assume
+that the global `dataset_from_index` value must match the physical Parquet
+`index` field for every episode. Incomplete or noncontiguous episode windows
+are excluded with explicit diagnostics; preparation stops if fewer than 512
+valid train windows or 200 valid held-out windows remain. This also handles
+some merged LIBERO datasets whose later episode indices are remapped.
+
 **Training design:** The PI0.5 LIBERO checkpoint, action Prompt initialization,
 number of trainable parameters (16 × 1024), 750 optimization steps, batch size
 of 2, 40/50 randomly masked training timesteps, and model optimizer/scheduler

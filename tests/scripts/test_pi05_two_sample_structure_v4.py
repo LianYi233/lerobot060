@@ -4,8 +4,10 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -15,6 +17,7 @@ sys.path.insert(0, str(ROOT / "examples" / "analysis"))
 
 from two_sample_sap_structure_v4 import (  # noqa: E402
     _choose_candidates,
+    _read_action_windows,
     action_strata,
     aggregate_by_episode,
     balanced_order,
@@ -61,6 +64,68 @@ class SapStructureV4Test(unittest.TestCase):
         self.assertGreaterEqual(len({r["task"] for r in chosen[:4]}), 3)
         with self.assertRaises(ValueError):
             _choose_candidates(records, 81, seed=0, horizon=50)
+
+    def test_grouped_reader_uses_episode_relative_frames_not_global_indices(self):
+        # Simulates a merged dataset whose episode metadata start index does
+        # not agree with the per-Parquet index column. This broke episode 1571.
+        with tempfile.TemporaryDirectory() as temp:
+            dataset_root = Path(temp)
+            action_file = dataset_root / "data" / "chunk-000" / "file-000.parquet"
+            action_file.parent.mkdir(parents=True)
+            action_file.touch()
+            action_rows = [
+                {"episode_index": 1571, "index": j, "frame_index": j,
+                 "action": [float(j), float(2 * j)]} for j in range(100)
+            ]
+            # A second episode is actually truncated despite its metadata.
+            action_rows += [
+                {"episode_index": 1572, "index": j, "frame_index": j,
+                 "action": [float(j), float(2 * j)]} for j in range(30)
+            ]
+
+            class FakeTable:
+                def __init__(self, values):
+                    self.values = values
+
+                def to_pydict(self):
+                    return self.values
+
+            class FakeDataset:
+                schema = types.SimpleNamespace(names=["episode_index", "frame_index", "index", "action"])
+
+                def to_table(self, columns, filter):
+                    self.requested_columns = columns
+                    return FakeTable({
+                        column: [row[column] for row in action_rows]
+                        for column in columns
+                    })
+
+            pa = types.ModuleType("pyarrow")
+            pa.__path__ = []
+            pa_dataset = types.ModuleType("pyarrow.dataset")
+            pa_dataset.dataset = lambda path, format: FakeDataset()
+            pa_dataset.field = lambda name: types.SimpleNamespace(isin=lambda ids: (name, ids))
+            pa.dataset = pa_dataset
+            candidates = [
+                {"episode_index": 1571, "offset": 10,
+                 "dataset_from_index": 258505,
+                 "data/chunk_index": 0, "data/file_index": 0},
+                {"episode_index": 1572, "offset": 10,
+                 "dataset_from_index": 258605,
+                 "data/chunk_index": 0, "data/file_index": 0},
+            ]
+            with patch.dict(sys.modules, {"pyarrow": pa, "pyarrow.dataset": pa_dataset}):
+                normalized, accepted, rejected = _read_action_windows(
+                    dataset_root, candidates,
+                    {"data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"},
+                    {"action": {"q01": [0, 0], "q99": [100, 200]}},
+                    horizon=50,
+                )
+            self.assertEqual(normalized.shape, (1, 50, 2))
+            self.assertEqual(accepted[0]["episode_index"], 1571)
+            self.assertAlmostEqual(float(normalized[0, 0, 0]), -.8, places=5)
+            self.assertEqual(len(rejected), 1)
+            self.assertIn("episode=1572", rejected[0])
 
     def test_strata_and_nested_balancing(self):
         chunks = np.zeros((6, 50, 7), dtype=np.float32)
