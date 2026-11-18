@@ -130,6 +130,11 @@ def validate_manifest_extension(previous, current):
         for protocol in (previous_protocol, current_protocol):
             protocol.pop("source_digest", None)
             protocol["measurement_digest"] = identity
+        # A moved processor or an older manifest lacking its path is fine only
+        # when the actual inputs are identical. All checkpoint checks still apply.
+        if previous.get("sample_digest") and previous["sample_digest"] == current.get("sample_digest"):
+            previous_protocol.pop("sample_preprocessor", None)
+            current_protocol.pop("sample_preprocessor", None)
     old_stages, new_stages = previous["stages"], current["stages"]
     if previous_protocol != current_protocol or old_stages != new_stages[: len(old_stages)]:
         raise ValueError(
@@ -322,6 +327,49 @@ def analyze_seed(policy, groups, samples, seed, args):
     return result
 
 
+def load_paired_samples(args, stages, reference):
+    """Replay the reference input pipeline, independently of the weights under test."""
+    manifest = reference["manifest"] if reference else {}
+    explicit = args.reference_preprocessor
+    recorded = None
+    if reference:
+        recorded = manifest.get("sample_preprocessor") or manifest["stages"][0].get("checkpoint")
+    processor_path = checkpoint_dir(stages[0]["checkpoint"])
+    if explicit or recorded:
+        requested = checkpoint_dir(explicit or recorded)
+        if all((requested / name).is_file() for name in ("config.json", "policy_preprocessor.json")):
+            processor_path = requested
+        elif explicit:
+            raise FileNotFoundError(f"Missing config.json or policy_preprocessor.json in {requested}")
+        else:
+            logging.warning(
+                "Recorded reference processor unavailable at %s; trying %s with strict digest validation. "
+                "Use --reference-preprocessor if the reference checkpoint moved.",
+                requested, processor_path,
+            )
+    print(f"NTK input preprocessor: {processor_path}", flush=True)
+    # Only load_samples sees this path. load_policy still sees the original
+    # stage list, i.e. the actual control model at each requested update.
+    samples, indices = load_samples(args, [{"checkpoint": str(processor_path)}])
+    digest = fingerprint_samples(samples)
+    if reference:
+        if indices != manifest["sample_indices"]:
+            raise ValueError("Loaded sample indices do not match the reference indices/order")
+        expected = manifest["sample_digest"]
+        if digest != expected:
+            raise ValueError(
+                f"Processed sample_digest mismatch:\n  expected (reference): {expected}\n"
+                f"  actual (current):     {digest}\n  processor: {processor_path}\n"
+                f"  dataset: {args.dataset_root} (reference: {manifest.get('dataset_root')})\n"
+                f"  tokenizer override: {args.tokenizer_path}; video backend: {args.video_backend}\n"
+                "The old digest cannot identify which input changed. Restore the original data, "
+                "preprocessor, tokenizer and decoding environment, or remeasure the staged checkpoints "
+                "in a NEW output directory on the current inputs and use those new results as reference."
+            )
+    print(f"NTK sample_digest: {digest}" + (" (matches reference)" if reference else ""), flush=True)
+    return samples, indices, digest, str(processor_path)
+
+
 def run(args):
     stages = resolve_stages(args)
     reference = prepare_reference(args, stages)
@@ -337,7 +385,7 @@ def run(args):
 
     if not args.dataset_repo_id or not args.dataset_root:
         raise ValueError("--dataset-repo-id and --dataset-root are required")
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
+    if not args.check_inputs_only and args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is unavailable; activate the training environment and check the selected GPU"
         )
@@ -348,7 +396,10 @@ def run(args):
         raise ValueError("Seeds must be distinct nonnegative integers")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    samples, indices = load_samples(args, stages)
+    samples, indices, digest, processor_path = load_paired_samples(args, stages, reference)
+    if args.check_inputs_only:
+        print("Input check complete. No model weights loaded or NTK results written.")
+        return
     manifest = {
         "schema": 1,
         "protocol": "shared-Rademacher output NTK; full conditioned velocity at all stages; entropy rank",
@@ -364,7 +415,8 @@ def run(args):
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_root": str(Path(args.dataset_root).resolve()),
         "sample_indices": indices,
-        "sample_digest": fingerprint_samples(samples),
+        "sample_digest": digest,
+        "sample_preprocessor": processor_path,
         "measurement_digest": measurement_digest(),
         "source_digest": hashlib.sha256(
             Path(__file__).read_bytes()
@@ -530,6 +582,11 @@ def make_parser():
         "--reference-results",
         help="Reuse a staged results.json's samples/probes and plot both methods",
     )
+    parser.add_argument(
+        "--reference-preprocessor",
+        help="Input processor checkpoint (directory or its pretrained_model); defaults to the "
+        "processor used by the reference results. Does not select model weights.",
+    )
     parser.add_argument("--font-path", help="Font file for prompt-only/comparison scatter figures")
     parser.add_argument(
         "--through-stage",
@@ -561,10 +618,15 @@ def make_parser():
     parser.add_argument("--sketch-dim", type=int, default=8192)
     parser.add_argument("--sketch-seed", type=int, default=2026)
     parser.add_argument("--output-dir", default="outputs/ntk_stages")
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--dry-run", action="store_true", help="Verify checkpoint files and step metadata only"
     )
-    parser.add_argument(
+    modes.add_argument(
+        "--check-inputs-only", action="store_true",
+        help="Process samples on CPU and check their digest; no model weights, Jacobians or output writes",
+    )
+    modes.add_argument(
         "--plot-only", action="store_true", help="Replot output-dir/results.json without models"
     )
     return parser

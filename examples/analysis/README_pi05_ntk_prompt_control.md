@@ -59,12 +59,46 @@ bash examples/analysis/analyze_pi05_ntk_prompt_control.sh \
 ```
 
 The reference `results.json` supplies the exact sample indices, probe seeds,
-output probes, CountSketch settings and measured parameter scope. A relocated
+output probes, CountSketch settings and measured parameter scope. Paired analysis
+uses the reference run's saved input processor (stage 0 in older manifests) for
+all four control models: a new training run may have saved different normalization
+statistics, even when initialized from identical weights. A relocated
 dataset or tokenizer may be supplied with `DATASET_ROOT` / `TOKENIZER_PATH`.
 Analysis verifies the **processed sample fingerprint**, model/probe configuration,
 parameter signatures, PyTorch version, device family and numerical measurement
 source before accepting a paired comparison. Incompatible measurements fail
 explicitly instead of being silently combined.
+
+To check the sample digest on CPU without loading model weights or writing results:
+
+```bash
+bash examples/analysis/analyze_pi05_ntk_prompt_control.sh \
+  "$CONTROL_RUN" "$STAGED_RESULTS" 0 --check-inputs-only
+```
+
+If necessary, add `--reference-preprocessor=/new/path/to/000000/pretrained_model`
+after the GPU argument. This is the **original staged** input pipeline, not a
+replacement for any control weights. The error prints expected and actual hashes;
+a single historical hash cannot identify which input field differs. Check the
+original raw data, tokenizer files and video decoding environment, including the
+backend. Changing a directory name alone does not change the processed hash.
+
+If the historical inputs cannot be reproduced, remeasure both methods on one
+current dataset using the existing checkpoints, with fresh output directories.
+For the paper's default probe settings and 4000 cumulative steps:
+
+```bash
+STAGED_NEW="$STAGED_RUN/ntk_current_inputs_4000"
+CONTROL_NEW="$CONTROL_RUN/ntk_current_inputs_4000"
+FINAL_FLOW_STEPS=3000 NTK_OUTPUT_DIR="$STAGED_NEW" \
+  bash examples/analysis/analyze_pi05_ntk_stages.sh "$STAGED_RUN" 0 &&
+NTK_OUTPUT_DIR="$CONTROL_NEW" bash examples/analysis/analyze_pi05_ntk_prompt_control.sh \
+  "$CONTROL_RUN" "$STAGED_NEW/results.json" 0
+```
+
+Keep the same `DATASET_ROOT`, `TOKENIZER_PATH`, video backend and environment
+for both commands. This produces a **new paired measurement**, leaving the old
+paper results intact; it does not retroactively validate them on the current dataset.
 
 The numerical NTK functions are unchanged. A recorded measurement digest now
 separates that numerical code from CLI/layout changes. The original paper results
