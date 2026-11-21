@@ -7,6 +7,7 @@ Usage: bash train_pi05_prompt_ablation.sh VARIANT [SEED] [extra lerobot-train ar
 
 Variants:
   full_reference    750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO
+  no_sap_matched    750 joint flow (CABO off) + 250 bridge + 3000 flow (CABO on)
   no_bridge         1000 inpainting + 0 bridge + 3000 flow, dual prompts, CABO
   direct_dual       0 pretraining + 3000 flow, dual prompts, CABO
   dual_prompt_only  0 pretraining + 3000 flow, dual prompts, CABO off
@@ -15,7 +16,10 @@ Variants:
   no_cabo           750 inpainting + 250 bridge + 3000 flow, dual prompts, CABO off
 
 All variants use 3000 flow updates by default. Set FLOW_STEPS to override this
-for a one-off run.
+for a one-off run, except for no_sap_matched, whose schedule is fixed.
+no_sap_matched starts from the reference's saved step-0 weights, keeps its 1000-step
+first-phase LR schedule and collects the four NTK checkpoints. Set STAGED_RUN to
+the reference run directory, or PRETRAINED_PATH to its exact step-0 pretrained_model.
 full_reference automatically saves exact initialization and priming-end snapshots,
 and saves flow checkpoints every 1000 updates (including flow 2000 = total 3000).
 Set NTK_SAVE_STAGE_SNAPSHOTS=false to disable extra stage snapshots, or SAVE_FREQ
@@ -58,6 +62,20 @@ case "${VARIANT}" in
     SAVE_FREQ_DEFAULT=1000
     NTK_SNAPSHOTS_DEFAULT=true
     ;;
+  no_sap_matched)
+    NTK_SNAPSHOTS_DEFAULT=true
+    if [[ "${FLOW_STEPS_OVERRIDE:-3000}" != 3000 || "${NTK_SAVE_STAGE_SNAPSHOTS:-true}" != true ]]; then
+      echo "no_sap_matched requires FLOW_STEPS=3000 and NTK_SAVE_STAGE_SNAPSHOTS=true." >&2
+      exit 2
+    fi
+    # Do not silently allow free-form CLI flags to replace the reference protocol.
+    for arg in "${EXTRA_ARGS[@]}"; do
+      case "${arg}" in
+        --wandb.*=*|--log_freq=*) ;;
+        *) echo "Unsupported no_sap_matched override: ${arg}. Use environment variables for paths and hardware." >&2; exit 2 ;;
+      esac
+    done
+    ;;
   no_bridge)
     BRIDGE_STEPS=0
     ;;
@@ -96,7 +114,6 @@ FLOW_STEPS="${FLOW_STEPS_OVERRIDE:-${FLOW_STEPS_DEFAULT}}"
 
 DATASET_REPO_ID="${DATASET_REPO_ID:-libero}"
 DATASET_ROOT="${DATASET_ROOT:-/root/autodl-tmp/datasets/libero}"
-PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-tmp/models/pi05_libero_base}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/root/autodl-tmp/models/google/paligemma-3b-pt-224}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/autodl-tmp/chkpt/2601-lerobot/prompt-ablation}"
 LOG_ROOT="${LOG_ROOT:-/root/autodl-tmp/logs/prompt-ablation}"
@@ -114,7 +131,35 @@ VIDEO_BACKEND="${VIDEO_BACKEND:-pyav}"
 COMPILE_MODEL="${COMPILE_MODEL:-true}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 
-RUN_NAME="${RUN_NAME:-pi05-${VARIANT}-seed${SEED}}"
+if [[ "${VARIANT}" == no_sap_matched ]]; then
+  STAGED_RUN="${STAGED_RUN:-${OUTPUT_ROOT}/pi05-full-reference-ntk-seed${SEED}}"
+  PRETRAINED_PATH="${PRETRAINED_PATH:-${STAGED_RUN}_next_action_pretrain/checkpoints/000000/pretrained_model}"
+  RUN_NAME="${RUN_NAME:-pi05-no-sap-matched-ntk-seed${SEED}}"
+  if [[ ! -s "${PRETRAINED_PATH}/model.safetensors" || ! -s "${PRETRAINED_PATH}/config.json" ]]; then
+    echo "Missing reference step-0 weights or config: ${PRETRAINED_PATH}" >&2
+    exit 1
+  fi
+  # Reject an accidentally inherited path to the base model or a later checkpoint.
+  python - "${PRETRAINED_PATH}" "${SEED}" "${NUM_PROCESSES}" "${BATCH_SIZE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+model = Path(sys.argv[1])
+try:
+    state = json.loads((model.parent / "training_state/training_step.json").read_text())
+    cfg = json.loads((model / "train_config.json").read_text())
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Cannot verify the reference step-0 checkpoint: {exc}")
+expected = (0, int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
+actual = (state.get("step"), cfg.get("seed"), state.get("num_processes"), cfg.get("batch_size"))
+if actual != expected:
+    raise SystemExit(f"Reference (step, seed, num_processes, batch_size): {actual}; expected {expected}")
+PY
+else
+  PRETRAINED_PATH="${PRETRAINED_PATH:-/root/autodl-tmp/models/pi05_libero_base}"
+  RUN_NAME="${RUN_NAME:-pi05-${VARIANT}-seed${SEED}}"
+fi
 DRY_RUN="${DRY_RUN:-false}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 LOG_FILE="${LOG_ROOT}/${RUN_NAME}.log"
@@ -178,6 +223,9 @@ TRAIN_ARGS=(
   --save_freq="${SAVE_FREQ}"
   --save_steps="${SAVE_STEPS}"
 )
+if [[ "${VARIANT}" == no_sap_matched ]]; then
+  TRAIN_ARGS+=(--policy.next_action_joint_flow_before_bridge=true)
+fi
 
 LAUNCH_ARGS=(
   launch
@@ -197,7 +245,9 @@ if [[ "${NTK_SAVE_STAGE_SNAPSHOTS}" == true ]] && (( PRETRAIN_STEPS > 0 )); then
   PRETRAIN_OUTPUT_DIR="${OUTPUT_DIR}_next_action_pretrain"
   printf 'NTK before training: %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" 0
   if (( BRIDGE_STEPS > 0 )); then
-    printf 'NTK after priming:  %s/checkpoints/%06d/pretrained_model\n' \
+    BOUNDARY_LABEL="after priming"
+    if [[ "${VARIANT}" == no_sap_matched ]]; then BOUNDARY_LABEL="before bridge"; fi
+    printf 'NTK %s:  %s/checkpoints/%06d/pretrained_model\n' "${BOUNDARY_LABEL}" \
       "${PRETRAIN_OUTPUT_DIR}" "$((PRETRAIN_STEPS - BRIDGE_STEPS))"
   fi
   printf 'NTK after stage 2:  %s/checkpoints/%06d/pretrained_model\n' "${PRETRAIN_OUTPUT_DIR}" "${PRETRAIN_STEPS}"
